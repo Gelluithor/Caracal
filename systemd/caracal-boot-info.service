@@ -1,0 +1,19 @@
+[Unit]
+Description=CARACAL startup IP address screen
+Requires=caracal-display.service
+After=caracal-display.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=caracal
+Group=caracal
+Environment=HOME=/home/caracal
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/caracal/.Xauthority
+ExecStartPre=/bin/sh -c 'until [ -S /tmp/.X11-unix/X0 ]; do sleep 1; done'
+ExecStart=/usr/bin/python3 /opt/caracal/player/boot-info.py
+TimeoutStartSec=90
+
+[Install]
+WantedBy=graphical.target

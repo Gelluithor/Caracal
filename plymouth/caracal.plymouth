@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=CARACAL
+Description=CARACAL boot splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/caracal
+ScriptFile=/usr/share/plymouth/themes/caracal/caracal.script

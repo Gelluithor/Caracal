@@ -1,0 +1,10 @@
+.git
+.github
+**/__pycache__
+*.pyc
+.venv
+Caracal fleet
+plymouth
+systemd
+system-config
+*.zip

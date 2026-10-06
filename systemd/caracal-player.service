@@ -1,0 +1,25 @@
+[Unit]
+Description=CARACAL Player
+Requires=caracal.service caracal-display.service
+After=network-online.target caracal.service caracal-display.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=caracal
+Group=caracal
+
+Environment=HOME=/home/caracal
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/caracal/.Xauthority
+Environment=CARACAL_BASE=http://127.0.0.1:8080
+Environment=CARACAL_PROFILE=/var/lib/caracal/chromium
+
+WorkingDirectory=/opt/caracal
+ExecStart=/opt/caracal/player/launch.sh
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

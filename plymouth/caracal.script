@@ -1,0 +1,12 @@
+Window.SetBackgroundTopColor(0.02, 0.03, 0.05);
+Window.SetBackgroundBottomColor(0.02, 0.03, 0.05);
+image = Image("splash.png");
+sprite = Sprite(image);
+scale_x = Window.GetWidth() / image.GetWidth();
+scale_y = Window.GetHeight() / image.GetHeight();
+scale = Math.Max(scale_x, scale_y);
+scaled_image = image.Scale(image.GetWidth() * scale, image.GetHeight() * scale);
+sprite.SetImage(scaled_image);
+sprite.SetX((Window.GetWidth() - scaled_image.GetWidth()) / 2);
+sprite.SetY((Window.GetHeight() - scaled_image.GetHeight()) / 2);
+sprite.SetZ(-100);

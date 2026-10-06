@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application class="Chromium*" name="*">
+      <decor>no</decor>
+      <fullscreen>yes</fullscreen>
+      <maximized>yes</maximized>
+      <position force="yes"><x>0</x><y>0</y></position>
+      <focus>yes</focus>
+      <desktop>all</desktop>
+    </application>
+  </applications>
+</openbox_config>

@@ -1,0 +1,16 @@
+#!/bin/sh
+
+export DISPLAY=:0
+export XAUTHORITY=/home/caracal/.Xauthority
+
+xset -dpms
+xset s off
+xset s noblank
+xsetroot -solid black
+
+# Aktivuje připojený HDMI výstup v jeho doporučeném rozlišení.
+xrandr --auto
+
+unclutter -idle 1 -root &
+
+exec openbox-session
