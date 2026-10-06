@@ -1,0 +1,4 @@
+# Shell scripts, systemd units and X configuration break with CRLF line endings on the node.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

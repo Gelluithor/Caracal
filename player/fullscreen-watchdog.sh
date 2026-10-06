@@ -1,26 +1,24 @@
 #!/bin/bash
-export DISPLAY=:0
-export XAUTHORITY=/home/caracal/.Xauthority
+# Keeps the Chromium player fullscreen. The player switches Chromium to fullscreen itself over DevTools; this watchdog
+# only tells the window manager (EWMH) when a window is not fullscreen and never sends keys: F11 toggles fullscreen,
+# so pressing it on a window that was already fullscreen brought the ordinary window back.
+# The countdown overlay keeps itself above the player (overlay.py).
+export DISPLAY=${DISPLAY:-:0}
+export XAUTHORITY=${XAUTHORITY:-/home/caracal/.Xauthority}
 sleep 3
 LAST=""
 while true; do
   IDS=$(xdotool search --onlyvisible --class 'chromium' 2>/dev/null || true)
   for W in $IDS; do
-    wmctrl -i -r "$W" -b remove,above,hidden 2>/dev/null || true
-    wmctrl -i -r "$W" -b add,fullscreen,maximized_vert,maximized_horz 2>/dev/null || true
-    xdotool windowmove "$W" 0 0 2>/dev/null || true
-    xdotool windowsize "$W" 100% 100% 2>/dev/null || true
+    if ! xprop -id "$W" _NET_WM_STATE 2>/dev/null | grep -q _NET_WM_STATE_FULLSCREEN; then
+      # wmctrl changes at most two properties per call
+      wmctrl -i -r "$W" -b remove,above,hidden 2>/dev/null || true
+      wmctrl -i -r "$W" -b add,fullscreen 2>/dev/null || true
+    fi
     if [ "$W" != "$LAST" ]; then
-      xdotool windowactivate --sync "$W" 2>/dev/null || true
-      sleep 1
-      xdotool key --window "$W" F11 2>/dev/null || true
+      xdotool windowactivate "$W" 2>/dev/null || true
       LAST="$W"
     fi
-  done
-  OIDS=$(xdotool search --name 'CARACAL Countdown' 2>/dev/null || true)
-  for O in $OIDS; do
-    wmctrl -i -r "$O" -b add,above,sticky,skip_taskbar 2>/dev/null || true
-    xdotool windowraise "$O" 2>/dev/null || true
   done
   sleep 2
 done

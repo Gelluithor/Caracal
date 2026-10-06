@@ -642,6 +642,25 @@ def _caracal_version():
  try:return (Path(__file__).resolve().parent.parent/'VERSION').read_text().strip()
  except OSError:return os.getenv('CARACAL_VERSION','')
 def _fleet_position(c):return c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0]
+# login profiles of web pages; the credentials never leave the node
+_FLEET_PROFILE_COLUMNS='SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector FROM auth_profiles'
+_FLEET_SELECTORS={'user_selector':'input[name="name"],input[name="username"]','pass_selector':'input[name="password"]','submit_selector':'button[type="submit"],input[type="submit"]'}
+def _fleet_profile_id(value):
+ # None, '' and 0 mean "without login"; 400 rather than 404 so the agent does not report a missing endpoint
+ if value in (None,'','null',0,'0'):return None
+ try:profile_id=int(value)
+ except (TypeError,ValueError):raise HTTPException(400,'Invalid login profile')
+ if not rows('SELECT id FROM auth_profiles WHERE id=?',(profile_id,)):raise HTTPException(400,'Login profile not found')
+ return profile_id
+def _fleet_profile_fields(d,current=None):
+ current=current or {};out={}
+ for key,limit in (('name',200),('login_url',4000),('target_url',4000)):
+  out[key]=str(d.get(key,current.get(key,''))).strip()[:limit]
+ if not out['name']:raise HTTPException(400,'Name must not be empty')
+ if not out['login_url'].startswith(('http://','https://')) or not out['target_url'].startswith(('http://','https://')):raise HTTPException(400,'URL must start with http:// or https://')
+ for key,default in _FLEET_SELECTORS.items():
+  out[key]=str(d.get(key) or current.get(key) or default).strip()[:1000]
+ return out
 def _fleet_grafana_config(d,current=None):
  current=current or {}
  url=str(d.get('grafana_url',current.get('grafana_url',''))).strip().rstrip('/');tag=str(d.get('tag',current.get('tag',''))).strip()
@@ -654,7 +673,7 @@ def fleet_snapshot(req:Request):
  _fleet_auth(req);state=_cc2_read();state['player_online']=(time.time()-float(state.get('updated') or 0))<8
  player={k:state.get(k) for k in ('current_id','current_name','frozen','collection_frozen','collection_id','remaining','duration','updated','player_online')}
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
- return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows('SELECT id,name FROM auth_profiles ORDER BY name'),'player':player}
+ return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -679,8 +698,8 @@ async def fleet_control(req:Request):
 async def fleet_add_web(req:Request):
  _fleet_auth(req);d=await req.json();name=str(d.get('name','')).strip();source=str(d.get('source','')).strip()
  if not name or not source.startswith(('http://','https://')):raise HTTPException(400,'Invalid name or URL')
- duration=_fleet_duration(d.get('duration',30));scale=_fleet_scale(d.get('scale',1))
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,scale) VALUES(?,?,?,?,?,?)',(name,'web',source,duration,_fleet_position(c),scale));c.commit();c.close()
+ duration=_fleet_duration(d.get('duration',30));scale=_fleet_scale(d.get('scale',1));profile_id=_fleet_profile_id(d.get('auth_profile_id'))
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,scale,auth_profile_id) VALUES(?,?,?,?,?,?,?)',(name,'web',source,duration,_fleet_position(c),scale,profile_id));c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.post('/api/fleet/v1/assets/grafana-tag')
@@ -723,15 +742,16 @@ def fleet_asset_file(asset_id:int,req:Request):
 async def fleet_update_asset(asset_id:int,req:Request):
  _fleet_auth(req);d=await req.json();r=rows('SELECT * FROM assets WHERE id=?',(asset_id,))
  if not r:raise HTTPException(404,'Item not found')
- a=r[0];name=str(d.get('name',a['name'])).strip() or a['name'];duration=_fleet_duration(d.get('duration',a['duration']));scale=_fleet_scale(d.get('scale',a.get('scale') or 1));source=a['source']
+ a=r[0];name=str(d.get('name',a['name'])).strip() or a['name'];duration=_fleet_duration(d.get('duration',a['duration']));scale=_fleet_scale(d.get('scale',a.get('scale') or 1));source=a['source'];profile_id=a['auth_profile_id']
  if a['kind']=='web' and 'source' in d:
   source=str(d['source']).strip()
   if not source.startswith(('http://','https://')):raise HTTPException(400,'URL must start with http:// or https://')
+ if a['kind']=='web' and 'auth_profile_id' in d:profile_id=_fleet_profile_id(d['auth_profile_id'])
  if a['kind']=='grafana-tag' and any(k in d for k in ('grafana_url','tag','kiosk')):
   try:current=_grafana_json.loads(a['source'] or '{}')
   except ValueError:current={}
   source=_grafana_json.dumps(_fleet_grafana_config(d,current),ensure_ascii=False)
- c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=? WHERE id=?',(name,source,duration,scale,asset_id));c.commit();c.close()
+ c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=?,auth_profile_id=? WHERE id=?',(name,source,duration,scale,profile_id,asset_id));c.commit();c.close()
  return {'ok':True}
 
 @app.delete('/api/fleet/v1/assets/{asset_id}')
@@ -749,3 +769,28 @@ async def fleet_reorder(req:Request):
  c=con()
  for position,asset_id in enumerate(ids):c.execute('UPDATE assets SET position=? WHERE id=?',(position,asset_id))
  c.commit();c.close();return {'ok':True}
+
+@app.post('/api/fleet/v1/profiles')
+async def fleet_add_profile(req:Request):
+ _fleet_auth(req);d=await req.json();f=_fleet_profile_fields(d);username=str(d.get('username') or '');password=str(d.get('password') or '')
+ if not username.strip() or not password:raise HTTPException(400,'Username and password are required')
+ c=con();q=c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector) VALUES(?,?,?,?,?,?,?,?)',(f['name'],f['login_url'],f['target_url'],vault.encrypt(username.encode()),vault.encrypt(password.encode()),f['user_selector'],f['pass_selector'],f['submit_selector']));c.commit();c.close()
+ return {'ok':True,'id':q.lastrowid}
+
+@app.put('/api/fleet/v1/profiles/{profile_id}')
+async def fleet_update_profile(profile_id:int,req:Request):
+ # empty username or password = keep the stored one
+ _fleet_auth(req);d=await req.json();r=rows('SELECT * FROM auth_profiles WHERE id=?',(profile_id,))
+ if not r:raise HTTPException(404,'Login profile not found')
+ f=_fleet_profile_fields(d,r[0]);username=str(d.get('username') or '');password=str(d.get('password') or '')
+ ue=vault.encrypt(username.encode()) if username.strip() else r[0]['username_enc'];pe=vault.encrypt(password.encode()) if password else r[0]['password_enc']
+ c=con();c.execute('UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,pass_selector=?,submit_selector=? WHERE id=?',(f['name'],f['login_url'],f['target_url'],ue,pe,f['user_selector'],f['pass_selector'],f['submit_selector'],profile_id));c.commit();c.close()
+ return {'ok':True}
+
+@app.delete('/api/fleet/v1/profiles/{profile_id}')
+def fleet_delete_profile(profile_id:int,req:Request):
+ # pages that used the profile stay in the playlist without automatic login
+ _fleet_auth(req)
+ if not rows('SELECT id FROM auth_profiles WHERE id=?',(profile_id,)):raise HTTPException(404,'Login profile not found')
+ c=con();n=c.execute('UPDATE assets SET auth_profile_id=NULL WHERE auth_profile_id=?',(profile_id,)).rowcount;c.execute('DELETE FROM auth_profiles WHERE id=?',(profile_id,));c.commit();c.close()
+ return {'ok':True,'unassigned':n}

@@ -4,7 +4,7 @@ The CARACAL node image contains the web admin and API (`app`), the Chromium play
 overlay (`overlay`). The host only provides Docker and the X display (Xorg + Openbox on tty1), which the
 containers use through `/tmp/.X11-unix`.
 
-Images: `ghcr.io/taurannun/caracal-node:<version>` for `linux/arm64` (Raspberry Pi 4/5) and `linux/amd64`, built by
+Images: `ghcr.io/gelluithor/caracal-node:<version>` for `linux/arm64` (Raspberry Pi 4/5) and `linux/amd64`, built by
 `.github/workflows/docker-image.yml`:
 
 | Git event | Image tags |

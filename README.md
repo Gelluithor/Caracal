@@ -2,7 +2,7 @@
 
 Digital signage for Raspberry Pi 4/5 and PCs: a fullscreen Chromium player for web pages, Grafana dashboards,
 images and videos with a web admin. Many screens can be managed centrally with
-[CARACAL Fleet](https://github.com/TaurAnnun/caracal-fleet).
+[CARACAL Fleet](https://github.com/Gelluithor/Caracal-Fleet).
 
 - Czech and English admin UI with dark mode and built-in help
 - web pages, images and videos in one playlist, drag-and-drop ordering
@@ -17,7 +17,7 @@ images and videos with a web admin. Many screens can be managed centrally with
 
 ### Docker (recommended)
 
-The app, the player and the overlay run as containers from `ghcr.io/taurannun/caracal-node` (arm64 and amd64).
+The app, the player and the overlay run as containers from `ghcr.io/gelluithor/caracal-node` (arm64 and amd64).
 The device only runs Docker, the X display and, optionally, the CARACAL Fleet Agent.
 
 - **With CARACAL Fleet:** prepare an SD card in Fleet (zero-touch) or let Fleet install a Raspberry Pi over SSH.
@@ -29,7 +29,7 @@ The device only runs Docker, the X display and, optionally, the CARACAL Fleet Ag
 On Raspberry Pi OS Lite or DietPi (Raspberry Pi 4/5):
 
 ```bash
-git clone https://github.com/TaurAnnun/caracal.git
+git clone https://github.com/Gelluithor/Caracal.git
 cd caracal
 sudo bash install.sh
 ```

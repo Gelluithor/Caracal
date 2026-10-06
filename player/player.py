@@ -13,11 +13,22 @@ def display_size():
   if m:return int(m.group(1)),int(m.group(2))
  except Exception:pass
  return 1920,1080
+# Fullscreen is requested from Chromium itself over DevTools (the session is opened in run()). Playwright must not
+# emulate a viewport: it then resizes the window to the viewport and current Chromium versions leave fullscreen
+# for that, which showed the page in an ordinary window on Docker nodes (Debian Chromium).
+CDP=None
 def fullscreen():
+ if CDP is not None:
+  try:
+   wid=CDP.send('Browser.getWindowForTarget')['windowId']
+   if CDP.send('Browser.getWindowBounds',{'windowId':wid})['bounds'].get('windowState')!='fullscreen':
+    CDP.send('Browser.setWindowBounds',{'windowId':wid,'bounds':{'windowState':'fullscreen'}});print('Chromium window switched to fullscreen',flush=True)
+  except Exception as e:print('fullscreen',e,flush=True)
+ # the window manager is told as well (EWMH); wmctrl changes at most two properties per call
  env=dict(os.environ,DISPLAY=':0',XAUTHORITY='/home/caracal/.Xauthority')
  try:
   for wid in subprocess.check_output(['xdotool','search','--onlyvisible','--class','chromium'],text=True,env=env,stderr=subprocess.DEVNULL).split():
-   subprocess.run(['wmctrl','-i','-r',wid,'-b','remove,above,hidden'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);subprocess.run(['wmctrl','-i','-r',wid,'-b','add,fullscreen,maximized_vert,maximized_horz'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   subprocess.run(['wmctrl','-i','-r',wid,'-b','remove,above,hidden'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);subprocess.run(['wmctrl','-i','-r',wid,'-b','add,fullscreen'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  except Exception:pass
 
 
@@ -69,12 +80,15 @@ def show(page,a):
   if pr:
    page.goto(pr['login_url'],wait_until='domcontentloaded',timeout=45000);pw=page.locator(pr['pass_selector'])
    if pw.count():
-    page.locator(pr['user_selector']).first.fill(pr['username']);pw.first.fill(pr['password'])
-    try:pw.first.press('Enter')
-    except Exception:page.locator(pr['submit_selector']).first.click(force=True)
-    try:page.wait_for_load_state('domcontentloaded',timeout=15000)
-    except Exception:pass
-    page.wait_for_timeout(1500)
+    # a wrong selector must not stop the player: the target page is shown anyway and the error is logged
+    try:
+     page.locator(pr['user_selector']).first.fill(pr['username'],timeout=10000);pw.first.fill(pr['password'],timeout=10000)
+     try:pw.first.press('Enter',timeout=5000)
+     except Exception:page.locator(pr['submit_selector']).first.click(force=True,timeout=5000)
+     try:page.wait_for_load_state('domcontentloaded',timeout=15000)
+     except Exception:pass
+     page.wait_for_timeout(1500)
+    except Exception as e:print('Login',pr.get('name'),'failed:',e,flush=True)
    page.goto(pr['target_url'],wait_until='domcontentloaded',timeout=45000)
   else:page.goto(a['source'],wait_until='domcontentloaded',timeout=45000)
   z=float(a.get('scale') or 1);page.evaluate("z=>{document.documentElement.style.zoom=String(z);document.body.style.zoom=String(z)}",z)
@@ -82,10 +96,11 @@ def show(page,a):
  elif a['kind']=='image':page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><img src="{BASE+a["source"]}" style="width:100vw;height:100vh;object-fit:contain"></body>')
  else:page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><video src="{BASE+a["source"]}" autoplay muted loop style="width:100vw;height:100vh;object-fit:contain"></video></body>')
 def run():
- w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
+ global CDP
+ CDP=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
  with sync_playwright() as pw:
-  ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],viewport={'width':w,'height':h},screen={'width':w,'height':h},ignore_https_errors=True,args=['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}','--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox'])
-  page=ctx.pages[0] if ctx.pages else ctx.new_page();time.sleep(2);fullscreen();idx=0;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None
+  ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}','--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox'])
+  page=ctx.pages[0] if ctx.pages else ctx.new_page();CDP=ctx.new_cdp_session(page);time.sleep(2);fullscreen();idx=0;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None
   while True:
    items=get('/api/player/playlist-expanded',[]) or [];cmd=get('/api/v6/player/command',{}) or {};cid=int(cmd.get('command_id') or 0)
    # a restart requested from the admin UI (Docker: the container restarts the player after it exits)
