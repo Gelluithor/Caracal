@@ -63,3 +63,20 @@ body{background:var(--page);color:var(--text);transition:background .2s ease,col
 
 /* CARACAL_PROGRESS_BAR_UI_V1 */
 .overlay-settings-v6:after{content:"Lišta se plynule plní zleva doprava a při konci přepne na další položku.";width:100%;font-size:11px;color:var(--muted,#667085)}html[lang="en"] .overlay-settings-v6:after{content:"The bar fills smoothly from left to right and switches at the end."}
+/* CARACAL_NOTIFY_UI_V1 */
+.badge.ntf-level{background:color-mix(in srgb,var(--ntf) 16%,transparent);color:var(--ntf);font-weight:800}
+.ntf-message{white-space:pre-line}
+.ntf-settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;padding:15px 19px;align-items:end}
+.ntf-settings p{grid-column:1/-1;margin:0}
+.ntf-check{display:flex;gap:8px;align-items:center;font-weight:700}
+.ntf-check input{width:auto}
+.ntf-body{padding:4px 19px 17px}
+.ntf-code{display:flex;gap:8px;align-items:flex-start;margin:10px 0}
+.ntf-code pre{flex:1;min-width:0;margin:0;padding:10px 12px;border-radius:10px;background:var(--surface-3,#eef2f7);color:var(--text,#101827);font-size:12px;line-height:1.5;overflow-x:auto;white-space:pre}
+.ntf-new{border:2px solid #22c55e}
+/* CARACAL_NOTIFY_WATCHERS_UI_V1 */
+#df [hidden]{display:none!important}
+.wch-wide{grid-column:1/-1}
+.wch-sample{margin-top:8px}
+.wch-error{color:#c0392b!important}
+.badge.wch-error{background:#fdecea;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
