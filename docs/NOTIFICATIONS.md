@@ -53,13 +53,14 @@ Old entries are removed once a minute. API: `POST /api/notify/history/clear`, `G
 The device can play a short chime when a notification appears, a different one for each level (info and OK a soft
 chime, warning two beeps, critical urgent beeping). In **Notifications → Settings**:
 
-- **Sound**: off (default), critical only, warning and critical, or all notifications,
+- **Sound**: which levels play by themselves: none (default, only notifications sent with `sound: true`),
+  critical only, warning and critical, or all notifications,
 - **Volume**: 0–100 %,
 - **Sound output (ALSA)**: empty for the default output, or a device such as `hdmi:CARD=vc4hdmi0,DEV=0` (Raspberry Pi
   HDMI 0) or `plughw:1,0`. `aplay -L` on the device lists the names.
 
 A single notification can override the setting with `"sound": true` or `"sound": false` (header `X-Sound: yes/no`);
-nothing plays while sound is off. The chime plays when the notification appears, not again when the overlay restarts.
+`"sound": true` always plays; volume 0 mutes the screen completely. The chime plays when the notification appears, not again when the overlay restarts.
 
 The overlay plays the sound with `aplay` (ALSA), or `paplay` / `pw-play` when those are available. The Docker image
 and `install.sh` install `alsa-utils`. In Docker, the `overlay` service in `docker/compose.yml` gets `/dev/snd` and the

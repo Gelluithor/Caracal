@@ -40,9 +40,10 @@ SOUND_DIR=Path(tempfile.gettempdir())/'caracal-sounds'
 CHIMES={'info':[(880,0,.18),(1175,.14,.32)],'success':[(660,0,.14),(880,.11,.14),(1320,.22,.36)],
  'warning':[(740,0,.16),(740,.26,.22)],'critical':[(988,0,.12),(988,.17,.12),(988,.34,.12),(988,.62,.12),(988,.79,.12),(988,.96,.16)]}
 def sound_file(level,volume):
- path=SOUND_DIR/f'{level}-{volume}.wav'
+ path=SOUND_DIR/f'{level}-{volume}-s48.wav'
  if path.exists():return path
- SOUND_DIR.mkdir(parents=True,exist_ok=True);rate=44100;notes=CHIMES.get(level,CHIMES['info'])
+ # stereo 48 kHz: the Raspberry Pi HDMI output (vc4-hdmi) does not take mono 44.1 kHz on every ALSA device
+ SOUND_DIR.mkdir(parents=True,exist_ok=True);rate=48000;notes=CHIMES.get(level,CHIMES['info'])
  length=int(rate*(max(start+dur for _,start,dur in notes)+.05));samples=[0.0]*length
  for freq,start,dur in notes:
   first=int(start*rate);count=int(dur*rate)
@@ -53,20 +54,48 @@ def sound_file(level,volume):
  peak=max(1e-6,max(abs(x) for x in samples));gain=.85*(volume/100)**2*32767/peak   # squared: closer to perceived loudness
  tmp=path.with_suffix('.tmp')
  with wave.open(str(tmp),'wb') as out:
-  out.setnchannels(1);out.setsampwidth(2);out.setframerate(rate)
-  out.writeframes(b''.join(struct.pack('<h',int(x*gain)) for x in samples))
+  out.setnchannels(2);out.setsampwidth(2);out.setframerate(rate)
+  out.writeframes(b''.join(struct.pack('<hh',int(x*gain),int(x*gain)) for x in samples))
  tmp.replace(path);return path
+sound_device_found=None   # ALSA device that worked when none is set in the settings
+def alsa_candidates():
+ # without a configured device: the default first, then the HDMI and other hardware outputs aplay -L lists
+ out=['']
+ try:
+  listed=subprocess.run(['aplay','-L'],env=ENV,capture_output=True,text=True,timeout=10).stdout.splitlines()
+  names=[x.strip() for x in listed if x and not x[0].isspace()]
+  out+=[x for x in names if x.startswith('hdmi:')]+[x for x in names if x.startswith(('plughw:','sysdefault:'))]
+ except Exception:pass
+ return list(dict.fromkeys(out))
+def aplay(path,device):
+ r=subprocess.run(['aplay','-q']+(['-D',device] if device else [])+[str(path)],env=ENV,capture_output=True,text=True,timeout=15)
+ if r.returncode:print(f"notification sound: aplay {'-D '+device if device else '(default device)'} failed: {(r.stderr or '').strip()[:300]}",flush=True)
+ return r.returncode==0
 def play_sound(level,volume,device):
  def run():
+  global sound_device_found
   try:
    volume_pct=max(0,min(100,int(volume)))
+   print('notification sound:',level,f'{volume_pct} %',device or 'automatic output',flush=True)
    if volume_pct==0:return
    path=sound_file(level,volume_pct)
    if os.name=='nt':
     import winsound;winsound.PlaySound(str(path),winsound.SND_FILENAME);return
-   for player in (['aplay','-q']+(['-D',device] if device else []),['paplay'],['pw-play']):
+   if shutil.which('aplay'):
+    if device:
+     aplay(path,device);return
+    if sound_device_found is not None and aplay(path,sound_device_found):return
+    for candidate in alsa_candidates():
+     if candidate!=sound_device_found and aplay(path,candidate):
+      if candidate:print('notification sound: playing through',candidate,'(set it in the notification settings to skip the search)',flush=True)
+      sound_device_found=candidate;return
+    print('notification sound: no ALSA output worked; check that /dev/snd is available (aplay -l) and the TV is not muted',flush=True)
+    return
+   for player in (['paplay'],['pw-play']):
     if shutil.which(player[0]):
-     subprocess.run(player+[str(path)],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10);return
+     r=subprocess.run(player+[str(path)],env=ENV,capture_output=True,text=True,timeout=15)
+     if r.returncode:print('notification sound:',player[0],'failed:',(r.stderr or '').strip()[:300],flush=True)
+     return
    print('notification sound: no aplay, paplay or pw-play found',flush=True)
   except Exception as error:print('notification sound error',error,flush=True)
  threading.Thread(target=run,daemon=True).start()

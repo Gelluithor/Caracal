@@ -825,7 +825,8 @@ _NTF_WARNING={'warning','warn','average','degraded','major','4'}
 _NTF_SUCCESS={'success','ok','resolved','up','good','recovered'}
 _NTF_POSITIONS=('top-right','top-left','top','bottom-right','bottom-left','bottom','center')
 _NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'20','scale':'100','sound':'off','volume':'70','sound_device':'','history_max':'500','history_days':'7'}
-# sound: off, critical (critical only), warning (warning and critical), all; the overlay plays a chime per level
+# sound: which levels play a chime by themselves - off (none), critical, warning (and critical), all.
+# A notification sent with sound=true always plays; volume 0 mutes the screen completely.
 _NTF_SOUNDS={'off':99,'critical':3,'warning':2,'all':1}
 _NTF_TTL={1:900,2:1800,3:3600}   # seconds a notification may wait in the queue, by priority
 _NTF_PER_SOURCE=10               # waiting notifications per token, so one chatty app cannot fill the queue
@@ -836,7 +837,7 @@ c=con();c.executescript("""CREATE TABLE IF NOT EXISTS notify_tokens(id INTEGER P
 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY,token_id INTEGER,source TEXT,title TEXT,message TEXT,level TEXT,priority INTEGER,key TEXT,duration INTEGER,created REAL,shown_at REAL,done INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS notifications_queue ON notifications(done,priority,id);
 CREATE TABLE IF NOT EXISTS notify_settings(key TEXT PRIMARY KEY,value TEXT);""")
-# notifications.sound: NULL = by the sound setting, 0 = silent, 1 = always (unless sound is off)
+# notifications.sound: NULL = by the sound setting, 0 = silent, 1 = always
 if 'sound' not in [r[1] for r in c.execute('PRAGMA table_info(notifications)').fetchall()]:c.execute('ALTER TABLE notifications ADD COLUMN sound INTEGER')
 c.commit();c.close()
 # notifications.done: 0 waiting or on screen, 1 shown, 2 dropped or expired, 3 removed by the administrator
@@ -1025,7 +1026,7 @@ def notify_overlay(req:Request):
  current=None
  if cur and s['enabled']:
   current={k:cur[k] for k in ('id','title','message','level','source','duration')};current['remaining']=max(0.0,cur['shown_at']+cur['duration']-now)
-  current['sound']=s['sound']!='off' and cur['sound']!=0 and (cur['sound']==1 or (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
+  current['sound']=cur['sound']==1 or (cur['sound']!=0 and (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
  return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'current':current,'waiting':waiting}
 
 # administration
