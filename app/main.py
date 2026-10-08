@@ -1078,6 +1078,21 @@ def _wch_credentials(row):
  try:return _grafana_json.loads(vault.decrypt(row['credentials_enc']).decode()) if row and row['credentials_enc'] else {}
  except Exception:return {}
 
+def _wch_error_text(error):
+ # the most useful part of an error response: RFC 6749 fields, common JSON shapes, or the text of a page
+ try:raw=error.read(65536).decode('utf-8','replace')
+ except Exception:return ''
+ try:
+  d=_grafana_json.loads(raw)
+  if isinstance(d,dict):
+   nested=d.get('error') if isinstance(d.get('error'),dict) else {}
+   parts=[d.get('error') if isinstance(d.get('error'),str) else None,d.get('error_description'),nested.get('message'),d.get('message'),d.get('detail'),d.get('title')]
+   text=' – '.join(dict.fromkeys(str(x) for x in parts if x))
+   if text:return text[:300]
+ except ValueError:pass
+ text=_ntf_re.sub(r'\s+',' ',_ntf_re.sub(r'<(script|style)[^>]*>.*?</\1>|<[^>]+>',' ',raw,flags=_ntf_re.S|_ntf_re.I)).strip()
+ return text[:300]
+
 # OAuth2 access tokens, kept in memory until shortly before they expire: (watcher id, revision) -> (token, valid until)
 _wch_tokens={}
 def _wch_oauth_token(w,creds,watcher_id=None,fresh=False):
@@ -1104,10 +1119,9 @@ def _wch_oauth_token(w,creds,watcher_id=None,fresh=False):
   request=_grafana_urlrequest.Request(w['oauth_token_url'],data=_ntf_urlparse.urlencode(data).encode(),headers=headers,method='POST')
   with _grafana_urlrequest.urlopen(request,timeout=20,context=context) as response:body=response.read(1024**2)
  except _grafana_urlrequest.HTTPError as error:
-  # e.g. "invalid_client – Client authentication failed"
-  try:detail=_grafana_json.loads(error.read(65536).decode('utf-8','replace'));reason=' – '.join(str(detail[k]) for k in ('error','error_description') if detail.get(k))
-  except Exception:reason=''
-  raise ValueError(f'OAuth2 token: HTTP {error.code} {reason or error.reason}')
+  # e.g. "invalid_client – Client authentication failed"; servers that do not follow RFC 6749 get their text shown
+  sent=', '.join(sorted(data))+(', Basic' if 'Authorization' in headers else '')
+  raise ValueError(f'OAuth2 token: HTTP {error.code} {_wch_error_text(error) or error.reason} (odesláno: {sent})')
  except Exception as error:raise ValueError(f'OAuth2 token nedostupný: {getattr(error,"reason",None) or error}')
  try:answer=_grafana_json.loads(body.decode('utf-8','replace'));token=str(answer['access_token'])
  except (ValueError,KeyError,TypeError):raise ValueError('OAuth2: odpověď neobsahuje access_token')
@@ -1141,7 +1155,7 @@ def _wch_fetch(w,creds,watcher_id=None):
    if error.code!=401 or w['auth_type']!='oauth2':raise
    raw=get(fresh=True)
  except ValueError:raise
- except _grafana_urlrequest.HTTPError as error:raise ValueError(f'HTTP {error.code} {error.reason}')
+ except _grafana_urlrequest.HTTPError as error:raise ValueError(f'HTTP {error.code} {_wch_error_text(error) or error.reason}')
  except Exception as error:raise ValueError(f'Nedostupné: {getattr(error,"reason",None) or error}')
  if len(raw)>_WCH_RESPONSE_MAX:raise ValueError('Odpověď je větší než 5 MB')
  try:data=_grafana_json.loads(raw.decode('utf-8',errors='replace'))

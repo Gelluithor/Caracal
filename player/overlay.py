@@ -83,7 +83,10 @@ def toast_place(position,progress,bar_height):
  elif position.startswith('top'):y-=offset
  elif position.startswith('bottom'):y+=offset
  geometry=f'{w}x{h}+{x}+{y}'
- if geometry!=toast_geometry:toast.geometry(geometry);toast_geometry=geometry
+ if geometry!=toast_geometry:
+  # apply now: a mapped override-redirect window is otherwise only moved when Tk next runs idle tasks,
+  # which nothing else does while the countdown bar is off, so the toast stayed at the animation start
+  toast.geometry(geometry);toast.update_idletasks();toast_geometry=geometry
  try:toast.attributes('-alpha',.96*max(0.0,min(1.0,progress)))
  except Exception:pass
 
