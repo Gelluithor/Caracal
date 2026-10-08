@@ -23,7 +23,11 @@ columns=[row[1] for row in c.execute("PRAGMA table_info(assets)").fetchall()]
 if "scale" not in columns:
  c.execute("ALTER TABLE assets ADD COLUMN scale REAL DEFAULT 1.0")
 c.execute("UPDATE assets SET scale=1.0 WHERE scale IS NULL")
+# login profiles: 'form' fills in the page's log-in form, 'http' answers the browser's HTTP Basic/Digest pop-up
+if "auth_type" not in [row[1] for row in c.execute("PRAGMA table_info(auth_profiles)").fetchall()]:
+ c.execute("ALTER TABLE auth_profiles ADD COLUMN auth_type TEXT DEFAULT 'form'")
 c.commit();c.close()
+def _profile_type(value):return 'http' if str(value or '').strip().lower()=='http' else 'form'
 def rows(q,a=()):c=con();r=[dict(x) for x in c.execute(q,a).fetchall()];c.close();return r
 def _local_only(req:Request):
  if not req.client or req.client.host not in ('127.0.0.1','::1'):raise HTTPException(403)
@@ -93,10 +97,12 @@ def delete(i:int,u=Depends(auth)):
  if r:_remove_media(r[0]['source'])
  return {'ok':1}
 @app.get('/api/profiles')
-def profiles(u=Depends(auth)):return rows('SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector FROM auth_profiles')
+def profiles(u=Depends(auth)):return rows("SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector,COALESCE(auth_type,'form') AS auth_type FROM auth_profiles")
 @app.post('/api/profiles')
-def profile(name:str=Form(...),login_url:str=Form(...),target_url:str=Form(...),username:str=Form(...),password:str=Form(...),user_selector:str=Form('input[name="name"],input[name="username"]'),pass_selector:str=Form('input[name="password"]'),submit_selector:str=Form('button[type="submit"],input[type="submit"]'),u=Depends(auth)):
- c=con();c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector) VALUES(?,?,?,?,?,?,?,?)',(name,login_url,target_url,vault.encrypt(username.encode()),vault.encrypt(password.encode()),user_selector,pass_selector,submit_selector));c.commit();c.close();return {'ok':1}
+def profile(name:str=Form(...),login_url:str=Form(''),target_url:str=Form(...),username:str=Form(...),password:str=Form(...),user_selector:str=Form('input[name="name"],input[name="username"]'),pass_selector:str=Form('input[name="password"]'),submit_selector:str=Form('button[type="submit"],input[type="submit"]'),auth_type:str=Form('form'),u=Depends(auth)):
+ auth_type=_profile_type(auth_type);login_url=login_url.strip() or (target_url.strip() if auth_type=='http' else '')
+ if not target_url.strip().startswith(('http://','https://')) or not login_url.startswith(('http://','https://')):raise HTTPException(400,'URL musí začínat http:// nebo https://')
+ c=con();c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector,auth_type) VALUES(?,?,?,?,?,?,?,?,?)',(name,login_url,target_url.strip(),vault.encrypt(username.encode()),vault.encrypt(password.encode()),user_selector,pass_selector,submit_selector,auth_type));c.commit();c.close();return {'ok':1}
 @app.get('/api/player/profile/{i}')
 def player_profile(i:int,req:Request):
  if req.client.host not in ('127.0.0.1','::1'):raise HTTPException(403)
@@ -228,11 +234,18 @@ async def edit_profile_v4(profile_id: int, request: Request, u=Depends(auth)):
         c.close()
         raise HTTPException(404, "Profil nebyl nalezen")
     name = str(data.get("name", "")).strip()
+    auth_type = _profile_type(data.get("auth_type", r["auth_type"]))
     login = str(data.get("login_url", "")).strip()
     target = str(data.get("target_url", "")).strip()
     us = str(data.get("user_selector", "")).strip()
     ps = str(data.get("pass_selector", "")).strip()
     ss = str(data.get("submit_selector", "")).strip()
+    if auth_type == "http":
+        # the browser's pop-up has no page and no form: only the address and the credentials matter
+        login = login or target
+        us = us or r["user_selector"] or 'input[name="username"]'
+        ps = ps or r["pass_selector"] or 'input[name="password"]'
+        ss = ss or r["submit_selector"] or 'button[type="submit"]'
     if not name or not login.startswith(("http://", "https://")) or not target.startswith(("http://", "https://")) or not us or not ps or not ss:
         c.close()
         raise HTTPException(400, "Zkontroluj povinna pole a URL")
@@ -240,7 +253,7 @@ async def edit_profile_v4(profile_id: int, request: Request, u=Depends(auth)):
     password = str(data.get("password", ""))
     ue = vault.encrypt(username.encode()) if username.strip() else r["username_enc"]
     pe = vault.encrypt(password.encode()) if password else r["password_enc"]
-    c.execute("UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,pass_selector=?,submit_selector=? WHERE id=?", (name,login,target,ue,pe,us,ps,ss,profile_id))
+    c.execute("UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,pass_selector=?,submit_selector=?,auth_type=? WHERE id=?", (name,login,target,ue,pe,us,ps,ss,auth_type,profile_id))
     c.commit()
     c.close()
     return {"ok": True}
@@ -643,7 +656,7 @@ def _caracal_version():
  except OSError:return os.getenv('CARACAL_VERSION','')
 def _fleet_position(c):return c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0]
 # login profiles of web pages; the credentials never leave the node
-_FLEET_PROFILE_COLUMNS='SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector FROM auth_profiles'
+_FLEET_PROFILE_COLUMNS="SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector,COALESCE(auth_type,'form') AS auth_type FROM auth_profiles"
 _FLEET_SELECTORS={'user_selector':'input[name="name"],input[name="username"]','pass_selector':'input[name="password"]','submit_selector':'button[type="submit"],input[type="submit"]'}
 def _fleet_profile_id(value):
  # None, '' and 0 mean "without login"; 400 rather than 404 so the agent does not report a missing endpoint
@@ -656,6 +669,8 @@ def _fleet_profile_fields(d,current=None):
  current=current or {};out={}
  for key,limit in (('name',200),('login_url',4000),('target_url',4000)):
   out[key]=str(d.get(key,current.get(key,''))).strip()[:limit]
+ out['auth_type']=_profile_type(d.get('auth_type',current.get('auth_type')))
+ if out['auth_type']=='http' and not out['login_url']:out['login_url']=out['target_url']
  if not out['name']:raise HTTPException(400,'Name must not be empty')
  if not out['login_url'].startswith(('http://','https://')) or not out['target_url'].startswith(('http://','https://')):raise HTTPException(400,'URL must start with http:// or https://')
  for key,default in _FLEET_SELECTORS.items():
@@ -774,7 +789,7 @@ async def fleet_reorder(req:Request):
 async def fleet_add_profile(req:Request):
  _fleet_auth(req);d=await req.json();f=_fleet_profile_fields(d);username=str(d.get('username') or '');password=str(d.get('password') or '')
  if not username.strip() or not password:raise HTTPException(400,'Username and password are required')
- c=con();q=c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector) VALUES(?,?,?,?,?,?,?,?)',(f['name'],f['login_url'],f['target_url'],vault.encrypt(username.encode()),vault.encrypt(password.encode()),f['user_selector'],f['pass_selector'],f['submit_selector']));c.commit();c.close()
+ c=con();q=c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector,auth_type) VALUES(?,?,?,?,?,?,?,?,?)',(f['name'],f['login_url'],f['target_url'],vault.encrypt(username.encode()),vault.encrypt(password.encode()),f['user_selector'],f['pass_selector'],f['submit_selector'],f['auth_type']));c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.put('/api/fleet/v1/profiles/{profile_id}')
@@ -784,7 +799,7 @@ async def fleet_update_profile(profile_id:int,req:Request):
  if not r:raise HTTPException(404,'Login profile not found')
  f=_fleet_profile_fields(d,r[0]);username=str(d.get('username') or '');password=str(d.get('password') or '')
  ue=vault.encrypt(username.encode()) if username.strip() else r[0]['username_enc'];pe=vault.encrypt(password.encode()) if password else r[0]['password_enc']
- c=con();c.execute('UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,pass_selector=?,submit_selector=? WHERE id=?',(f['name'],f['login_url'],f['target_url'],ue,pe,f['user_selector'],f['pass_selector'],f['submit_selector'],profile_id));c.commit();c.close()
+ c=con();c.execute('UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,pass_selector=?,submit_selector=?,auth_type=? WHERE id=?',(f['name'],f['login_url'],f['target_url'],ue,pe,f['user_selector'],f['pass_selector'],f['submit_selector'],f['auth_type'],profile_id));c.commit();c.close()
  return {'ok':True}
 
 @app.delete('/api/fleet/v1/profiles/{profile_id}')
@@ -809,7 +824,9 @@ _NTF_CRITICAL={'critical','crit','error','err','fatal','emergency','alert','disa
 _NTF_WARNING={'warning','warn','average','degraded','major','4'}
 _NTF_SUCCESS={'success','ok','resolved','up','good','recovered'}
 _NTF_POSITIONS=('top-right','top-left','top','bottom-right','bottom-left','bottom','center')
-_NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'20','scale':'100'}
+_NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'20','scale':'100','sound':'off','volume':'70','sound_device':'','history_max':'500','history_days':'7'}
+# sound: off, critical (critical only), warning (warning and critical), all; the overlay plays a chime per level
+_NTF_SOUNDS={'off':99,'critical':3,'warning':2,'all':1}
 _NTF_TTL={1:900,2:1800,3:3600}   # seconds a notification may wait in the queue, by priority
 _NTF_PER_SOURCE=10               # waiting notifications per token, so one chatty app cannot fill the queue
 _NTF_BODY_MAX=65536;_NTF_BATCH_MAX=5
@@ -818,13 +835,16 @@ _ntf_hits={};_ntf_fails={}
 c=con();c.executescript("""CREATE TABLE IF NOT EXISTS notify_tokens(id INTEGER PRIMARY KEY,name TEXT,token_hash TEXT UNIQUE,prefix TEXT,rate_per_min INTEGER DEFAULT 30,enabled INTEGER DEFAULT 1,created REAL,last_used REAL);
 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY,token_id INTEGER,source TEXT,title TEXT,message TEXT,level TEXT,priority INTEGER,key TEXT,duration INTEGER,created REAL,shown_at REAL,done INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS notifications_queue ON notifications(done,priority,id);
-CREATE TABLE IF NOT EXISTS notify_settings(key TEXT PRIMARY KEY,value TEXT);""");c.commit();c.close()
+CREATE TABLE IF NOT EXISTS notify_settings(key TEXT PRIMARY KEY,value TEXT);""")
+# notifications.sound: NULL = by the sound setting, 0 = silent, 1 = always (unless sound is off)
+if 'sound' not in [r[1] for r in c.execute('PRAGMA table_info(notifications)').fetchall()]:c.execute('ALTER TABLE notifications ADD COLUMN sound INTEGER')
+c.commit();c.close()
 # notifications.done: 0 waiting or on screen, 1 shown, 2 dropped or expired, 3 removed by the administrator
 
 def _ntf_hash(token):return _ntf_hashlib.sha256(token.encode()).hexdigest()
 def _ntf_settings():
  s=dict(_NTF_DEFAULTS);s.update({r['key']:r['value'] for r in rows('SELECT key,value FROM notify_settings')})
- return {'enabled':s['enabled']=='1','position':s['position'] if s['position'] in _NTF_POSITIONS else 'top-right','duration':int(s['duration']),'max_queue':int(s['max_queue']),'scale':int(s['scale'])}
+ return {'enabled':s['enabled']=='1','position':s['position'] if s['position'] in _NTF_POSITIONS else 'top-right','duration':int(s['duration']),'max_queue':int(s['max_queue']),'scale':int(s['scale']),'sound':s['sound'] if s['sound'] in _NTF_SOUNDS else 'off','volume':int(s['volume']),'sound_device':s['sound_device'],'history_max':int(s['history_max']),'history_days':int(s['history_days'])}
 def _ntf_text(value,limit):
  text=_ntf_re.sub(r'[\x00-\x08\x0b-\x1f\x7f]','',str(value if value is not None else '')).strip()
  text=_ntf_re.sub(r'\n{3,}','\n\n',text)
@@ -835,6 +855,14 @@ def _ntf_level(value,default='info'):
  if v in _NTF_WARNING:return 'warning'
  if v in _NTF_SUCCESS:return 'success'
  return 'info' if v in ('info','information','notice','low','min','default','1','2','3') else default
+def _ntf_sound(value):
+ # per-notification override: true / false, or None for the screen's sound setting
+ if value is None or value=='':return None
+ if isinstance(value,bool):return int(value)
+ v=str(value).strip().lower()
+ if v in ('1','true','yes','on','ano'):return 1
+ if v in ('0','false','no','off','ne','none','silent'):return 0
+ return None
 def _ntf_duration(value):
  if value in (None,''):return None
  try:return max(3,min(120,int(float(value))))
@@ -847,7 +875,7 @@ def _ntf_item(d,headers=None):
  message=_ntf_text(next((d[k] for k in ('message','text','body','msg','description','content') if d.get(k) not in (None,'')),''),600)
  if not title and not message:raise HTTPException(400,'Notification needs a title or a message')
  level=_ntf_level(d.get('level') or d.get('severity') or d.get('priority') or d.get('type') or headers.get('x-level') or headers.get('priority') or headers.get('x-priority'))
- return {'title':title,'message':message,'level':level,'key':_ntf_text(d.get('key') or d.get('dedup_key') or d.get('tag') or headers.get('x-key'),200) or None,'duration':_ntf_duration(d.get('duration') or headers.get('x-duration')),'source':_ntf_text(d.get('source') or d.get('app'),60) or None}
+ return {'title':title,'message':message,'level':level,'key':_ntf_text(d.get('key') or d.get('dedup_key') or d.get('tag') or headers.get('x-key'),200) or None,'duration':_ntf_duration(d.get('duration') or headers.get('x-duration')),'source':_ntf_text(d.get('source') or d.get('app'),60) or None,'sound':_ntf_sound(d['sound'] if 'sound' in d else headers.get('x-sound'))}
 
 def _ntf_from_alerts(p):
  # Grafana alerting and Prometheus Alertmanager webhooks
@@ -856,11 +884,11 @@ def _ntf_from_alerts(p):
   labels=a.get('labels') or {};ann=a.get('annotations') or {};resolved=str(a.get('status') or p.get('status'))=='resolved'
   name=str(labels.get('alertname') or p.get('title') or 'Alert');where=str(labels.get('instance') or labels.get('host') or labels.get('job') or '')
   message=str(ann.get('summary') or ann.get('description') or ann.get('message') or '')
-  out.append({'title':_ntf_text(name,120),'message':_ntf_text((where+' · ' if where and where not in message else '')+message,600),'level':'success' if resolved else _ntf_level(labels.get('severity'),'warning'),'key':'alert:'+str(a.get('fingerprint') or name+where)[:180],'duration':None,'source':None})
+  out.append({'title':_ntf_text(name,120),'message':_ntf_text((where+' · ' if where and where not in message else '')+message,600),'level':'success' if resolved else _ntf_level(labels.get('severity'),'warning'),'key':'alert:'+str(a.get('fingerprint') or name+where)[:180],'duration':None,'source':None,'sound':None})
  if len(out)>_NTF_BATCH_MAX:
   # a large alert group becomes one notification instead of a flood
   worst=max(out,key=lambda x:_NTF_LEVELS[x['level']])['level'];names=sorted({x['title'] for x in out})
-  return [{'title':_ntf_text(p.get('title') or f'{len(out)} alerts',120),'message':_ntf_text(', '.join(names[:12])+(' …' if len(names)>12 else ''),600),'level':worst,'key':'alertgroup:'+str(p.get('groupKey') or '')[:180],'duration':None,'source':None}]
+  return [{'title':_ntf_text(p.get('title') or f'{len(out)} alerts',120),'message':_ntf_text(', '.join(names[:12])+(' …' if len(names)>12 else ''),600),'level':worst,'key':'alertgroup:'+str(p.get('groupKey') or '')[:180],'duration':None,'source':None,'sound':None}]
  return out
 
 def _ntf_parse(payload,headers):
@@ -868,7 +896,7 @@ def _ntf_parse(payload,headers):
  if isinstance(payload,dict) and isinstance(payload.get('heartbeat'),dict):
   # Uptime Kuma: heartbeat.status 1 = up, 0 = down
   hb=payload['heartbeat'];mon=payload.get('monitor') or {};name=mon.get('name') or 'Monitor';up=hb.get('status')==1
-  return [{'title':_ntf_text(f"{name}: {'UP' if up else 'DOWN'}",120),'message':_ntf_text(hb.get('msg'),600),'level':'success' if up else 'critical','key':'kuma:'+str(mon.get('id') or name),'duration':None,'source':None}]
+  return [{'title':_ntf_text(f"{name}: {'UP' if up else 'DOWN'}",120),'message':_ntf_text(hb.get('msg'),600),'level':'success' if up else 'critical','key':'kuma:'+str(mon.get('id') or name),'duration':None,'source':None,'sound':None}]
  batch=payload.get('notifications') if isinstance(payload,dict) and isinstance(payload.get('notifications'),list) else payload if isinstance(payload,list) else None
  if batch is not None:
   if not batch or len(batch)>_NTF_BATCH_MAX or not all(isinstance(x,dict) for x in batch):raise HTTPException(400,f'Send 1 to {_NTF_BATCH_MAX} notifications at once')
@@ -876,9 +904,28 @@ def _ntf_parse(payload,headers):
  if isinstance(payload,dict):return [_ntf_item(payload,headers)]
  raise HTTPException(400,'Unsupported notification format')
 
+_NTF_AUDIT_MAX=2000;_NTF_AUDIT_DAYS=90;_ntf_cleaned=[0.0]
+c=con();c.execute('CREATE TABLE IF NOT EXISTS notify_audit(id INTEGER PRIMARY KEY,ts REAL,actor TEXT,ip TEXT,action TEXT,detail TEXT)');c.commit();c.close()
+def _ntf_audit(req,actor,action,detail=''):
+ # who did what with notifications: administrators' changes and refused senders; never tokens or secrets
+ name=actor.get('username') if isinstance(actor,dict) else str(actor or '')
+ ip=req.client.host if req is not None and req.client else ''
+ c=con();c.execute('INSERT INTO notify_audit(ts,actor,ip,action,detail) VALUES(?,?,?,?,?)',(time.time(),name,ip,action,_ntf_text(detail,500)));c.commit();c.close()
 def _ntf_expire(c,now):
  for priority,ttl in _NTF_TTL.items():c.execute('UPDATE notifications SET done=2 WHERE done=0 AND shown_at IS NULL AND priority=? AND created<?',(priority,now-ttl))
- c.execute('DELETE FROM notifications WHERE done>0 AND created<?',(now-7*86400,))
+ # history (shown, dropped, removed) and the audit log are limited by age and count, so the SD card stays small;
+ # trimmed once a minute rather than on every overlay poll
+ if now-_ntf_cleaned[0]<60:return
+ _ntf_cleaned[0]=now;s=_ntf_settings()
+ c.execute('DELETE FROM notifications WHERE done>0 AND created<?',(now-s['history_days']*86400,))
+ c.execute('DELETE FROM notifications WHERE done>0 AND id<=(SELECT id FROM notifications WHERE done>0 ORDER BY id DESC LIMIT 1 OFFSET ?)',(s['history_max'],))
+ c.execute('DELETE FROM notify_audit WHERE ts<?',(now-_NTF_AUDIT_DAYS*86400,))
+ c.execute('DELETE FROM notify_audit WHERE id<=(SELECT id FROM notify_audit ORDER BY id DESC LIMIT 1 OFFSET ?)',(_NTF_AUDIT_MAX,))
+ # in-memory counters of addresses and tokens that were not used for a while (copied: requests change them)
+ for store,age in ((_ntf_fails,300),(_ntf_hits,60),(_ntf_rate_logged,60)):
+  for key,value in list(store.items()):
+   last=value[-1] if isinstance(value,list) and value else value if isinstance(value,float) else 0
+   if last<now-age:store.pop(key,None)
 def _ntf_evict(c,priority,token_id=None):
  # drops the oldest waiting notification of the lowest level, but never one more important than the new one
  own=' AND COALESCE(token_id,0)=?' if token_id is not None else '';args=(token_id,) if token_id is not None else ()
@@ -907,7 +954,7 @@ def _ntf_enqueue(token_id,source,items):
     waiting=lambda:c.execute('SELECT COUNT(*) FROM notifications WHERE done=0 AND shown_at IS NULL').fetchone()[0]
     while waiting()>=s['max_queue'] and _ntf_evict(c,priority):pass
     if waiting()>=s['max_queue']:result['dropped']+=1;continue
-    q=c.execute('INSERT INTO notifications(token_id,source,title,message,level,priority,key,duration,created) VALUES(?,?,?,?,?,?,?,?,?)',(token_id,src,it['title'],it['message'],it['level'],priority,it['key'],duration,now))
+    q=c.execute('INSERT INTO notifications(token_id,source,title,message,level,priority,key,duration,created,sound) VALUES(?,?,?,?,?,?,?,?,?,?)',(token_id,src,it['title'],it['message'],it['level'],priority,it['key'],duration,now,it.get('sound')))
     result['queued']+=1;result['ids'].append(q.lastrowid)
    c.commit()
   finally:c.close()
@@ -925,11 +972,17 @@ def _ntf_token(req:Request):
  token=token or req.headers.get('x-caracal-token','').strip() or req.query_params.get('token','').strip()
  r=rows('SELECT * FROM notify_tokens WHERE token_hash=?',(_ntf_hash(token),)) if token else []
  if not r or not r[0]['enabled']:
+  # logged for the first refusal from an address and when it gets blocked, not for every attempt
+  if not recent or len(recent)==19:_ntf_audit(req,'','Odmítnutý token' if recent==[] else 'Adresa zablokována na 5 minut','chybí token' if not token else 'neplatný nebo zakázaný token')
   _ntf_fails[ip]=recent+[now];raise HTTPException(401,'Invalid or missing notification token',headers={'WWW-Authenticate':'Bearer'})
  _ntf_fails.pop(ip,None);return r[0]
-def _ntf_rate(key,limit):
+_ntf_rate_logged={}
+def _ntf_rate(key,limit,label='',req=None):
  now=time.time();hits=[t for t in _ntf_hits.get(key,[]) if t>now-60]
- if len(hits)>=limit:_ntf_hits[key]=hits;raise HTTPException(429,'Too many notifications, slow down',headers={'Retry-After':str(int(60-(now-hits[0]))+1)})
+ if len(hits)>=limit:
+  _ntf_hits[key]=hits
+  if now-_ntf_rate_logged.get(key,0.0)>60:_ntf_rate_logged[key]=now;_ntf_audit(req,label,'Překročen limit oznámení',f'{limit} za minutu')
+  raise HTTPException(429,'Too many notifications, slow down',headers={'Retry-After':str(int(60-(now-hits[0]))+1)})
  _ntf_hits[key]=hits+[now]
 async def _ntf_payload(req:Request):
  try:length=int(req.headers.get('content-length') or 0)
@@ -950,7 +1003,7 @@ async def _ntf_receive(req:Request,token_id,source):
 
 @app.post('/api/notify/v1')
 async def notify_send(req:Request):
- token=_ntf_token(req);_ntf_rate(token['token_hash'],int(token['rate_per_min'] or 30))
+ token=_ntf_token(req);_ntf_rate(token['token_hash'],int(token['rate_per_min'] or 30),token['name'],req)
  c=con();c.execute('UPDATE notify_tokens SET last_used=? WHERE id=?',(time.time(),token['id']));c.commit();c.close()
  return await _ntf_receive(req,token['id'],token['name'])
 
@@ -972,7 +1025,8 @@ def notify_overlay(req:Request):
  current=None
  if cur and s['enabled']:
   current={k:cur[k] for k in ('id','title','message','level','source','duration')};current['remaining']=max(0.0,cur['shown_at']+cur['duration']-now)
- return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'current':current,'waiting':waiting}
+  current['sound']=s['sound']!='off' and cur['sound']!=0 and (cur['sound']==1 or (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
+ return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'current':current,'waiting':waiting}
 
 # administration
 @app.get('/api/notify/settings')
@@ -983,14 +1037,25 @@ async def notify_settings_save(req:Request,u=Depends(auth)):
  try:
   s['enabled']=bool(d.get('enabled',s['enabled']));s['position']=str(d.get('position',s['position']))
   s['duration']=int(d.get('duration',s['duration']));s['max_queue']=int(d.get('max_queue',s['max_queue']));s['scale']=int(d.get('scale',s['scale']))
+  s['sound']=str(d.get('sound',s['sound']));s['volume']=int(d.get('volume',s['volume']));s['sound_device']=str(d.get('sound_device',s['sound_device']) or '').strip()
+  s['history_max']=int(d.get('history_max',s['history_max']));s['history_days']=int(d.get('history_days',s['history_days']))
  except (TypeError,ValueError):raise HTTPException(400,'Neplatné nastavení')
  if s['position'] not in _NTF_POSITIONS:raise HTTPException(400,'Neplatná pozice')
  if not 3<=s['duration']<=120:raise HTTPException(400,'Doba zobrazení musí být 3 až 120 s')
  if not 1<=s['max_queue']<=200:raise HTTPException(400,'Fronta musí mít 1 až 200 míst')
  if not 50<=s['scale']<=300:raise HTTPException(400,'Velikost musí být 50 až 300 %')
- c=con()
+ if s['sound'] not in _NTF_SOUNDS:raise HTTPException(400,'Neplatné nastavení zvuku')
+ if not 0<=s['volume']<=100:raise HTTPException(400,'Hlasitost musí být 0 až 100 %')
+ # ALSA device name passed to aplay -D, e.g. default, hdmi:CARD=vc4hdmi0,DEV=0, plughw:1,0
+ if not _ntf_re.fullmatch(r'[A-Za-z0-9:=,._-]{0,100}',s['sound_device']):raise HTTPException(400,'Neplatný název zvukového zařízení')
+ if not 50<=s['history_max']<=5000:raise HTTPException(400,'Historie musí mít 50 až 5000 záznamů')
+ if not 1<=s['history_days']<=90:raise HTTPException(400,'Historii jde držet 1 až 90 dní')
+ before=_ntf_settings();c=con()
  for k in _NTF_DEFAULTS:c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',(k,('1' if s[k] else '0') if k=='enabled' else str(s[k])))
- c.commit();c.close();return s
+ c.commit();c.close()
+ changes=', '.join(f'{k}: {before[k]} → {s[k]}' for k in _NTF_DEFAULTS if before[k]!=s[k])
+ if changes:_ntf_audit(req,u,'Nastavení změněno',changes)
+ return s
 @app.get('/api/notify/tokens')
 def notify_tokens(u=Depends(auth)):return rows('SELECT id,name,prefix,rate_per_min,enabled,created,last_used FROM notify_tokens ORDER BY name COLLATE NOCASE,id')
 @app.post('/api/notify/tokens')
@@ -1001,6 +1066,7 @@ async def notify_token_create(req:Request,u=Depends(auth)):
  except (TypeError,ValueError):raise HTTPException(400,'Neplatný limit')
  token='crc_'+secrets.token_urlsafe(32)
  c=con();q=c.execute('INSERT INTO notify_tokens(name,token_hash,prefix,rate_per_min,enabled,created) VALUES(?,?,?,?,1,?)',(name,_ntf_hash(token),token[:10],rate,time.time()));c.commit();c.close()
+ _ntf_audit(req,u,'Token vytvořen',f'{name} ({token[:10]}…), {rate}/min')
  # the token is returned only now; the node keeps just its hash
  return {'ok':True,'id':q.lastrowid,'token':token}
 @app.put('/api/notify/tokens/{token_id}')
@@ -1010,37 +1076,60 @@ async def notify_token_update(token_id:int,req:Request,u=Depends(auth)):
  name=_ntf_text(d.get('name',r[0]['name']),60) or r[0]['name']
  try:rate=max(1,min(600,int(d.get('rate_per_min',r[0]['rate_per_min']))))
  except (TypeError,ValueError):raise HTTPException(400,'Neplatný limit')
- c=con();c.execute('UPDATE notify_tokens SET name=?,rate_per_min=?,enabled=? WHERE id=?',(name,rate,1 if d.get('enabled',r[0]['enabled']) else 0,token_id));c.commit();c.close();return {'ok':True}
+ enabled=1 if d.get('enabled',r[0]['enabled']) else 0
+ c=con();c.execute('UPDATE notify_tokens SET name=?,rate_per_min=?,enabled=? WHERE id=?',(name,rate,enabled,token_id));c.commit();c.close()
+ _ntf_audit(req,u,'Token '+('povolen' if enabled and not r[0]['enabled'] else 'zakázán' if r[0]['enabled'] and not enabled else 'upraven'),f"{name} ({r[0]['prefix']}…), {rate}/min")
+ return {'ok':True}
 @app.delete('/api/notify/tokens/{token_id}')
-def notify_token_delete(token_id:int,u=Depends(auth)):
- c=con();c.execute('DELETE FROM notify_tokens WHERE id=?',(token_id,));c.commit();c.close();return {'ok':True}
+def notify_token_delete(token_id:int,req:Request,u=Depends(auth)):
+ r=rows('SELECT name,prefix FROM notify_tokens WHERE id=?',(token_id,))
+ c=con();c.execute('DELETE FROM notify_tokens WHERE id=?',(token_id,));c.commit();c.close()
+ if r:_ntf_audit(req,u,'Token smazán',f"{r[0]['name']} ({r[0]['prefix']}…)")
+ return {'ok':True}
 @app.get('/api/notify/queue')
 def notify_queue(u=Depends(auth)):
  now=time.time();columns='id,source,title,message,level,priority,duration,created,shown_at,done'
  current=rows(f'SELECT {columns} FROM notifications WHERE done=0 AND shown_at IS NOT NULL AND shown_at+duration>? LIMIT 1',(now,))
  return {'now':now,'current':current[0] if current else None,
   'waiting':rows(f'SELECT {columns} FROM notifications WHERE done=0 AND shown_at IS NULL ORDER BY priority DESC,id LIMIT 200'),
-  'history':rows(f'SELECT {columns} FROM notifications WHERE done>0 ORDER BY id DESC LIMIT 20')}
+  'history':rows(f'SELECT {columns} FROM notifications WHERE done>0 ORDER BY id DESC LIMIT 20'),
+  'history_count':rows('SELECT COUNT(*) AS n FROM notifications WHERE done>0')[0]['n']}
 @app.post('/api/notify/test')
 async def notify_test(req:Request,u=Depends(auth)):
- d=await req.json();return _ntf_enqueue(None,'CARACAL',[_ntf_item(d)])
+ d=await req.json();result=_ntf_enqueue(None,'CARACAL',[_ntf_item(d)]);_ntf_audit(req,u,'Testovací oznámení',str(d.get('title') or d.get('message') or ''));return result
 @app.post('/api/notify/skip')
-def notify_skip(u=Depends(auth)):
- with _NTF_LOCK:c=con();c.execute('UPDATE notifications SET done=3 WHERE done=0 AND shown_at IS NOT NULL');c.commit();c.close()
+def notify_skip(req:Request,u=Depends(auth)):
+ with _NTF_LOCK:c=con();n=c.execute('UPDATE notifications SET done=3 WHERE done=0 AND shown_at IS NOT NULL').rowcount;c.commit();c.close()
+ if n:_ntf_audit(req,u,'Oznámení přeskočeno')
  return {'ok':True}
 @app.post('/api/notify/clear')
-def notify_clear(u=Depends(auth)):
+def notify_clear(req:Request,u=Depends(auth)):
  with _NTF_LOCK:c=con();n=c.execute('UPDATE notifications SET done=3 WHERE done=0').rowcount;c.commit();c.close()
+ _ntf_audit(req,u,'Fronta vyprázdněna',f'{n} oznámení')
  return {'ok':True,'cleared':n}
 @app.delete('/api/notify/queue/{notification_id}')
-def notify_remove(notification_id:int,u=Depends(auth)):
- with _NTF_LOCK:c=con();c.execute('UPDATE notifications SET done=3 WHERE id=? AND done=0',(notification_id,));c.commit();c.close()
+def notify_remove(notification_id:int,req:Request,u=Depends(auth)):
+ with _NTF_LOCK:c=con();n=c.execute('UPDATE notifications SET done=3 WHERE id=? AND done=0',(notification_id,)).rowcount;c.commit();c.close()
+ if n:_ntf_audit(req,u,'Oznámení odebráno z fronty',f'#{notification_id}')
  return {'ok':True}
+@app.post('/api/notify/history/clear')
+def notify_history_clear(req:Request,u=Depends(auth)):
+ with _NTF_LOCK:c=con();n=c.execute('DELETE FROM notifications WHERE done>0').rowcount;c.commit();c.close()
+ _ntf_audit(req,u,'Historie oznámení smazána',f'{n} záznamů')
+ return {'ok':True,'deleted':n}
+@app.get('/api/notify/audit')
+def notify_audit_log(limit:int=200,u=Depends(auth)):
+ return {'count':rows('SELECT COUNT(*) AS n FROM notify_audit')[0]['n'],'max':_NTF_AUDIT_MAX,'days':_NTF_AUDIT_DAYS,'entries':rows('SELECT * FROM notify_audit ORDER BY id DESC LIMIT ?',(max(1,min(_NTF_AUDIT_MAX,limit)),))}
+@app.post('/api/notify/audit/clear')
+def notify_audit_clear(req:Request,u=Depends(auth)):
+ # the clearing itself stays in the log, so it is visible who removed the rest
+ c=con();n=c.execute('DELETE FROM notify_audit').rowcount;c.commit();c.close()
+ _ntf_audit(req,u,'Audit log smazán',f'{n} záznamů');return {'ok':True,'deleted':n}
 
 @app.post('/api/fleet/v1/notify')
 async def fleet_notify(req:Request):
  # same formats as /api/notify/v1, authenticated with the Fleet key
- _fleet_auth(req);_ntf_rate('fleet',120);return await _ntf_receive(req,0,'CARACAL Fleet')
+ _fleet_auth(req);_ntf_rate('fleet',120,'CARACAL Fleet',req);return await _ntf_receive(req,0,'CARACAL Fleet')
 
 
 # CARACAL_NOTIFY_WATCHERS_V1
@@ -1175,7 +1264,7 @@ def _wch_fetch(w,creds,watcher_id=None):
 def _wch_note(w,iid,item):
  title=_ntf_text(_wch_render(w['title_template'],item),120) or f"{w['name']}: {iid}"
  level=_ntf_level(_wch_get(item,w['level_field']),w['level']) if w['level_field'] else w['level']
- return {'title':title,'message':_ntf_text(_wch_render(w['message_template'],item),600),'level':level,'key':_ntf_text(iid,180),'duration':None,'source':None}
+ return {'title':title,'message':_ntf_text(_wch_render(w['message_template'],item),600),'level':level,'key':_ntf_text(iid,180),'duration':None,'source':None,'sound':None}
 
 def _wch_check(w):
  # one check of one watcher; returns a short status for the admin UI
@@ -1194,11 +1283,13 @@ def _wch_check(w):
    notes=[_wch_note(w,i,it) for i,it in new]
    if len(notes)>_NTF_BATCH_MAX:
     # many new items at once (e.g. after an outage) become one notification
-    notes=[{'title':_ntf_text(f"{w['name']}: {len(notes)} nových",120),'message':_ntf_text('\n'.join(x['title'] for x in notes[:8])+('\n…' if len(notes)>8 else ''),600),'level':max((x['level'] for x in notes),key=lambda x:_NTF_LEVELS[x]),'key':None,'duration':None,'source':None}]
+    notes=[{'title':_ntf_text(f"{w['name']}: {len(notes)} nových",120),'message':_ntf_text('\n'.join(x['title'] for x in notes[:8])+('\n…' if len(notes)>8 else ''),600),'level':max((x['level'] for x in notes),key=lambda x:_NTF_LEVELS[x]),'key':None,'duration':None,'source':None,'sound':None}]
    try:sent=_ntf_enqueue(-w['id'],w['name'],notes)['queued']
    except HTTPException:pass   # notifications are turned off on this screen
   current=[i for i,_ in items];current_set=set(current)
-  seen=(current+[x for x in seen if x not in current_set])[:_WCH_SEEN_MAX]
+  # every ID in the current list is kept (dropping one would announce it again next time); IDs that left the list
+  # are remembered only up to the limit, so a ticket that comes back (reopened) is not announced again soon
+  seen=current+[x for x in seen if x not in current_set][:max(0,_WCH_SEEN_MAX-len(current))]
   # a watcher edited during the check keeps its reset state (revision check)
   c=con();c.execute('UPDATE notify_watchers SET seen=?,initialized=1,last_check=?,last_error=NULL,last_count=?,last_new=? WHERE id=? AND revision=?',(_grafana_json.dumps(seen),now,len(items),len(new) if w['initialized'] else 0,w['id'],w['revision']));c.commit();c.close()
   return {'ok':True,'count':len(items),'new':len(new) if w['initialized'] else 0,'sent':sent,'first':not w['initialized']}
@@ -1250,19 +1341,25 @@ def notify_watchers(u=Depends(auth)):return rows(f'SELECT {_WCH_COLUMNS} FROM no
 async def notify_watcher_create(req:Request,u=Depends(auth)):
  f=_wch_fields(await req.json());keys=list(f)
  c=con();q=c.execute(f'INSERT INTO notify_watchers({",".join(keys)},created) VALUES({",".join("?"*len(keys))},?)',(*f.values(),time.time()));c.commit();c.close()
+ _ntf_audit(req,u,'Hlídač vytvořen',f"{f['name']} – {f['url'].split('?')[0]}")
  return {'ok':True,'id':q.lastrowid}
 @app.put('/api/notify/watchers/{watcher_id}')
 async def notify_watcher_update(watcher_id:int,req:Request,u=Depends(auth)):
  r=rows('SELECT * FROM notify_watchers WHERE id=?',(watcher_id,))
  if not r:raise HTTPException(404,'Hlídač nebyl nalezen')
- f=_wch_fields(await req.json(),r[0])
+ d=await req.json();f=_wch_fields(d,r[0])
  # another URL or list means other items: start again without notifying about the existing ones
  reset=any(f[k]!=r[0][k] for k in ('url','list_path','id_field'))
  c=con();c.execute(f'UPDATE notify_watchers SET {",".join(k+"=?" for k in f)},revision=revision+1'+(",seen='[]',initialized=0,last_check=NULL" if reset else '')+' WHERE id=?',(*f.values(),watcher_id));c.commit();c.close()
+ changed=[k for k in f if k!='credentials_enc' and f[k]!=r[0][k]]+(['přihlašovací údaje'] if f['credentials_enc']!=r[0]['credentials_enc'] and any(str(d.get(k) or '').strip() for k in _WCH_SECRETS) else [])
+ if changed:_ntf_audit(req,u,'Hlídač '+('zapnut' if changed==['enabled'] and f['enabled'] else 'vypnut' if changed==['enabled'] else 'upraven'),f"{f['name']}: "+', '.join(changed))
  return {'ok':True,'reset':reset}
 @app.delete('/api/notify/watchers/{watcher_id}')
-def notify_watcher_delete(watcher_id:int,u=Depends(auth)):
- c=con();c.execute('DELETE FROM notify_watchers WHERE id=?',(watcher_id,));c.commit();c.close();return {'ok':True}
+def notify_watcher_delete(watcher_id:int,req:Request,u=Depends(auth)):
+ r=rows('SELECT name FROM notify_watchers WHERE id=?',(watcher_id,))
+ c=con();c.execute('DELETE FROM notify_watchers WHERE id=?',(watcher_id,));c.commit();c.close()
+ if r:_ntf_audit(req,u,'Hlídač smazán',r[0]['name'])
+ return {'ok':True}
 @app.post('/api/notify/watchers/{watcher_id}/check')
 def notify_watcher_check(watcher_id:int,u=Depends(auth)):
  r=rows('SELECT * FROM notify_watchers WHERE id=?',(watcher_id,))

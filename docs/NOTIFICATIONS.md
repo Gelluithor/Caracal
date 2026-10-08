@@ -22,7 +22,44 @@ There are two ways to get notifications to the screen:
 - One app can have at most 10 waiting notifications, and every token has a rate limit (30 requests per minute by
   default, HTTP 429 above it).
 - Waiting notifications expire: `info`/`success` after 15 minutes, `warning` after 30, `critical` after 60.
+- History and audit log are limited, see [History and audit log](#history-and-audit-log).
 - A large alert group (more than 5 alerts in one webhook) becomes a single notification.
+
+## History and audit log
+
+The node keeps only a limited amount of data, so the SD card does not fill up:
+
+- **Waiting notifications**: at most the queue limit (20 by default, up to 200), and they expire (see above).
+- **History** of shown, dropped and removed notifications: at most **500 entries and 7 days** by default, whichever
+  comes first. Both limits can be set in **Notifications → Settings** (50–5000 entries, 1–90 days). **Clear history**
+  deletes it at once; waiting notifications stay.
+- **Audit log**: at most 2000 entries and 90 days. It records who changed the settings, created, edited, disabled or
+  deleted a token or a watcher, sent a test, skipped or removed notifications or cleared the queue, the history or the
+  audit log, with the time and the IP address. It also records refused tokens (the first one from an address and
+  when the address gets blocked) and apps over their rate limit (at most once a minute). It never contains tokens,
+  passwords or the query part of watcher URLs. **Clear audit log** deletes it; the clearing itself stays recorded.
+- **Watchers** remember the IDs of the items in the current list and at most 5000 older ones.
+
+Old entries are removed once a minute. API: `POST /api/notify/history/clear`, `GET /api/notify/audit?limit=200`,
+`POST /api/notify/audit/clear` (administrator session).
+
+## Sound
+
+The device can play a short chime when a notification appears, a different one for each level (info and OK a soft
+chime, warning two beeps, critical urgent beeping). In **Notifications → Settings**:
+
+- **Sound**: off (default), critical only, warning and critical, or all notifications,
+- **Volume**: 0–100 %,
+- **Sound output (ALSA)**: empty for the default output, or a device such as `hdmi:CARD=vc4hdmi0,DEV=0` (Raspberry Pi
+  HDMI 0) or `plughw:1,0`. `aplay -L` on the device lists the names.
+
+A single notification can override the setting with `"sound": true` or `"sound": false` (header `X-Sound: yes/no`);
+nothing plays while sound is off. The chime plays when the notification appears, not again when the overlay restarts.
+
+The overlay plays the sound with `aplay` (ALSA), or `paplay` / `pw-play` when those are available. The Docker image
+and `install.sh` install `alsa-utils`. In Docker, the `overlay` service in `docker/compose.yml` gets `/dev/snd` and the
+host `audio` group (`CARACAL_AUDIO_GID`, 29 on Raspberry Pi OS and Debian). Nodes installed by CARACAL Fleet need this
+compose file too. A TV usually plays HDMI audio only when it is not muted and HDMI audio is enabled on the Raspberry Pi.
 
 ## Security
 
@@ -105,6 +142,7 @@ API (administrator session): `GET/POST /api/notify/watchers`, `PUT/DELETE /api/n
 | `duration` | seconds on screen, 3–120 (default from the settings; `critical` at least 15) |
 | `key` | deduplication key, e.g. `backup-db01` |
 | `source` | name shown on the notification (default: the token's app name) |
+| `sound` | `true` / `false`: play or do not play a sound regardless of the level (default: by the sound setting) |
 
 At least `title` or `message` is required. Up to 5 notifications can be sent at once as a JSON array or as
 `{"notifications": [...]}`.
@@ -118,7 +156,7 @@ Accepted bodies:
 - **Grafana alerting / Prometheus Alertmanager** webhooks (`alerts` array): one notification per alert, `severity`
   label sets the level, resolved alerts are `success`,
 - **Uptime Kuma** webhooks (`heartbeat` + `monitor`): DOWN is `critical`, UP is `success`,
-- **plain text** (the body is the message; `Title`, `X-Level` or `Priority`, `X-Duration`, `X-Key` headers),
+- **plain text** (the body is the message; `Title`, `X-Level` or `Priority`, `X-Duration`, `X-Key`, `X-Sound` headers),
 - **form data** (`application/x-www-form-urlencoded`) with the fields above.
 
 CARACAL Fleet can send the same bodies to `POST /api/fleet/v1/notify` with its `X-Fleet-Key`.

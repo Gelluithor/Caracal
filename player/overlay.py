@@ -31,6 +31,46 @@ NOTIFY_URL=os.getenv('CARACAL_BASE','http://127.0.0.1:8080').rstrip('/')+'/api/n
 LEVELS={'info':('ℹ','#3b82f6'),'success':('✓','#22c55e'),'warning':('⚠','#f59e0b'),'critical':('✖','#ef4444')}
 TOAST_BG='#111926';TOAST_FG='#f8fafc';TOAST_MUTED='#94a3b8';ANIM=0.25
 notify_data={}
+
+# Notification sounds: a short chime per level, generated here (no sound files), played with ALSA aplay
+# (or paplay / pw-play). The app decides whether a notification has a sound; volume and device come with it.
+import math,shutil,struct,tempfile,wave
+SOUND_DIR=Path(tempfile.gettempdir())/'caracal-sounds'
+# (frequency Hz, start s, length s) notes per level
+CHIMES={'info':[(880,0,.18),(1175,.14,.32)],'success':[(660,0,.14),(880,.11,.14),(1320,.22,.36)],
+ 'warning':[(740,0,.16),(740,.26,.22)],'critical':[(988,0,.12),(988,.17,.12),(988,.34,.12),(988,.62,.12),(988,.79,.12),(988,.96,.16)]}
+def sound_file(level,volume):
+ path=SOUND_DIR/f'{level}-{volume}.wav'
+ if path.exists():return path
+ SOUND_DIR.mkdir(parents=True,exist_ok=True);rate=44100;notes=CHIMES.get(level,CHIMES['info'])
+ length=int(rate*(max(start+dur for _,start,dur in notes)+.05));samples=[0.0]*length
+ for freq,start,dur in notes:
+  first=int(start*rate);count=int(dur*rate)
+  for i in range(count):
+   if first+i>=length:break
+   t=i/rate;env=min(1.0,t/.008)*math.exp(-t*(9 if level in ('info','success') else 4))
+   samples[first+i]+=env*(math.sin(2*math.pi*freq*t)+.25*math.sin(4*math.pi*freq*t))
+ peak=max(1e-6,max(abs(x) for x in samples));gain=.85*(volume/100)**2*32767/peak   # squared: closer to perceived loudness
+ tmp=path.with_suffix('.tmp')
+ with wave.open(str(tmp),'wb') as out:
+  out.setnchannels(1);out.setsampwidth(2);out.setframerate(rate)
+  out.writeframes(b''.join(struct.pack('<h',int(x*gain)) for x in samples))
+ tmp.replace(path);return path
+def play_sound(level,volume,device):
+ def run():
+  try:
+   volume_pct=max(0,min(100,int(volume)))
+   if volume_pct==0:return
+   path=sound_file(level,volume_pct)
+   if os.name=='nt':
+    import winsound;winsound.PlaySound(str(path),winsound.SND_FILENAME);return
+   for player in (['aplay','-q']+(['-D',device] if device else []),['paplay'],['pw-play']):
+    if shutil.which(player[0]):
+     subprocess.run(player+[str(path)],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10);return
+   print('notification sound: no aplay, paplay or pw-play found',flush=True)
+  except Exception as error:print('notification sound error',error,flush=True)
+ threading.Thread(target=run,daemon=True).start()
+
 def poll_notifications():
  global notify_data
  while True:
@@ -103,6 +143,8 @@ def notify_tick(now,bar_height):
   if now-toast_phase_start>=ANIM:toast.withdraw();toast_shown=None;toast_phase='hidden';toast_content_reset()
  if toast_shown is None and cur:
   toast_build(cur,data);toast_shown=want;toast_phase='in';toast_phase_start=now;toast.update_idletasks();toast_place(data.get('position') or 'top-right',0,bar_height);toast.deiconify()
+  # only for a notification that has just appeared, not when the overlay restarts in the middle of one
+  if cur.get('sound') and remaining>=float(cur.get('duration') or 0)-3:play_sound(cur.get('level') or 'info',data.get('volume',70),data.get('sound_device') or '')
  elif cur and toast_shown==want and toast_content!=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),int(data.get('waiting') or 0),data.get('scale'),data.get('position')):
   toast_build(cur,data);toast.update_idletasks()   # the sender updated it (same key) or the queue length changed
  if toast_shown is None:return

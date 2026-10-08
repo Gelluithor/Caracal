@@ -346,6 +346,7 @@ window.addUrl=async function(){
  const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
  const LEVELS={info:['Info','Info','#3b82f6'],success:['OK','OK','#22c55e'],warning:['Varování','Warning','#f59e0b'],critical:['Kritické','Critical','#ef4444']};
  const POSITIONS=[['top-right','Vpravo nahoře','Top right'],['top','Nahoře uprostřed','Top centre'],['top-left','Vlevo nahoře','Top left'],['bottom-right','Vpravo dole','Bottom right'],['bottom','Dole uprostřed','Bottom centre'],['bottom-left','Vlevo dole','Bottom left'],['center','Uprostřed','Centre']];
+ const SOUNDS=[['off','Vypnuto','Off'],['critical','Jen kritická','Critical only'],['warning','Varování a kritická','Warning and critical'],['all','Všechna oznámení','All notifications']];
  const STATES={1:['Zobrazeno','Shown'],2:['Zahozeno / vypršelo','Dropped / expired'],3:['Odebráno','Removed']};
  const send=(method,body)=>({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  const when=t=>t?new Date(t*1000).toLocaleString(en()?'en-GB':'cs-CZ'):L('nikdy','never');
@@ -365,7 +366,7 @@ window.addUrl=async function(){
   const current=q.current?note(q.current,`<span class="badge auth">${L('Na obrazovce','On screen')} · ${Math.max(0,Math.ceil(q.current.shown_at+q.current.duration-q.now))} s</span>`,`<button class=secondary onclick=ntfSkip()>${L('Přeskočit','Skip')}</button>`):'';
   const waiting=q.waiting.map(n=>note(n,'',`<button class=danger onclick=ntfRemove(${n.id})>${L('Odebrat','Remove')}</button>`)).join('');
   return `<div class=panel-head><h2>${L('Fronta na obrazovce','Screen queue')}</h2><div class=toolbar><span class=badge>${q.waiting.length} ${L('čeká','waiting')}</span><button class=secondary onclick=ntfTest()>${L('Poslat test','Send test')}</button><button class=danger-outline onclick=ntfClear()>${L('Vyprázdnit','Clear')}</button></div></div>${current+waiting||`<div class=list-empty>${L('Nic nečeká. Oznámení se zobrazují po jednom, důležitější mají přednost.','Nothing is waiting. Notifications are shown one at a time, more important ones first.')}</div>`}`
-   +`<div class=panel-head><h2>${L('Poslední oznámení','Recent notifications')}</h2></div>${q.history.map(n=>note(n,`<span class=badge>${L(...(STATES[n.done]||STATES[1]))}</span>`)).join('')||`<div class=list-empty>${L('Zatím žádná.','None yet.')}</div>`}`;
+   +`<div class=panel-head><h2>${L('Poslední oznámení','Recent notifications')}</h2><div class=toolbar><span class=badge>${q.history_count} ${L('záznamů v historii','entries in history')}</span><button class=danger-outline onclick=ntfClearHistory()>${L('Smazat historii','Clear history')}</button></div></div>${q.history.map(n=>note(n,`<span class=badge>${L(...(STATES[n.done]||STATES[1]))}</span>`)).join('')||`<div class=list-empty>${L('Zatím žádná.','None yet.')}</div>`}`;
  }
  window.ntfRefreshQueue=async function(){const box=document.getElementById('ntfQueue');if(!box||document.hidden)return;try{box.innerHTML=await queuePanel()}catch(e){console.warn(e)}};
  window.notifications=async function(){
@@ -381,14 +382,20 @@ window.addUrl=async function(){
    +`<label>${L('Doba zobrazení (s)','Display time (s)')}<input id=ntfDuration type=number min=3 max=120 value=${s.duration}></label>`
    +`<label>${L('Velikost (%)','Size (%)')}<input id=ntfScale type=number min=50 max=300 step=10 value=${s.scale}></label>`
    +`<label>${L('Max. ve frontě','Max. in queue')}<input id=ntfMaxQueue type=number min=1 max=200 value=${s.max_queue}></label>`
-   +`<p class=muted>${L('Kritická oznámení zůstávají nejméně 15 s. Plná fronta zahodí nejstarší méně důležité oznámení, oznámení se stejným klíčem (key) se nahrazují místo hromadění.','Critical notifications stay at least 15 s. A full queue drops the oldest less important notification; notifications with the same key replace each other instead of piling up.')}</p></div></div>`
+   +`<label>${L('Zvuk','Sound')}<select id=ntfSound>${SOUNDS.map(x=>`<option value=${x[0]} ${s.sound===x[0]?'selected':''}>${L(x[1],x[2])}</option>`).join('')}</select></label>`
+   +`<label>${L('Hlasitost (%)','Volume (%)')}<input id=ntfVolume type=number min=0 max=100 step=10 value=${s.volume}></label>`
+   +`<label>${L('Historie: max. záznamů','History: max. entries')}<input id=ntfHistoryMax type=number min=50 max=5000 step=50 value=${s.history_max}></label>`
+   +`<label>${L('Historie: max. dní','History: max. days')}<input id=ntfHistoryDays type=number min=1 max=90 value=${s.history_days}></label>`
+   +`<label>${L('Zvukový výstup (ALSA)','Sound output (ALSA)')}<input id=ntfSoundDevice value="${esc(s.sound_device||'')}" placeholder="${L('prázdné = výchozí, např. hdmi:CARD=vc4hdmi0,DEV=0','empty = default, e.g. hdmi:CARD=vc4hdmi0,DEV=0')}"></label>`
+   +`<p class=muted>${L('Kritická oznámení zůstávají nejméně 15 s. Zvuk hraje zařízení přes HDMI nebo zvukový výstup, jinou znělkou pro každou úroveň. Plná fronta zahodí nejstarší méně důležité oznámení, oznámení se stejným klíčem (key) se nahrazují místo hromadění.','Critical notifications stay at least 15 s. The device plays the sound through HDMI or its audio output, with a different chime per level. A full queue drops the oldest less important notification; notifications with the same key replace each other instead of piling up.')}</p></div></div>`
    +`<div class=panel><div class=panel-head><h2>${L('Aplikace a tokeny','Apps and tokens')}</h2><button class=primary onclick=ntfTokenAdd()>${L('Nový token','New token')}</button></div>${tokenRows||`<div class=list-empty>${L('Zatím žádná aplikace. Každá aplikace dostane vlastní token, který jde kdykoli zakázat nebo smazat.','No apps yet. Every app gets its own token that can be disabled or deleted at any time.')}</div>`}</div>`
    +`<div class=panel><div class=panel-head><h2>${L('Jak posílat oznámení','How to send notifications')}</h2></div><div class=ntf-body><p class=muted>${L('POST na adresu níže s tokenem v hlavičce Authorization: Bearer (nebo X-Caracal-Token, nebo jako heslo v Basic auth). Pole: title, message, level (info, success, warning, critical), duration, key. Přímo rozumí webhookům z Grafany, Alertmanageru a Uptime Kuma – stačí jim zadat tuto URL a token.','POST to the address below with the token in the Authorization: Bearer header (or X-Caracal-Token, or as the Basic auth password). Fields: title, message, level (info, success, warning, critical), duration, key. Webhooks from Grafana, Alertmanager and Uptime Kuma work as they are: give them this URL and the token.')}</p>${code(endpoint())}${examples()}</div></div>`;
  };
  window.ntfCopy=async function(button){const text=button.previousElementSibling.textContent;try{await navigator.clipboard.writeText(text)}catch{const area=document.createElement('textarea');area.value=text;document.body.append(area);area.select();document.execCommand('copy');area.remove()}toast(L('Zkopírováno','Copied'))};
  window.ntfHideToken=function(){newToken=null;notifications()};
- window.ntfSaveSettings=async function(){try{await api('/api/notify/settings',send('PUT',{enabled:$('#ntfEnabled').checked,position:$('#ntfPosition').value,duration:Number($('#ntfDuration').value),scale:Number($('#ntfScale').value),max_queue:Number($('#ntfMaxQueue').value)}));toast(L('Nastavení oznámení uloženo','Notification settings saved'))}catch(e){alert(e.message)}};
- window.ntfTest=function(){modal(L('Testovací oznámení','Test notification'),`<label>${L('Nadpis','Title')}<input name=title value="${esc(L('Test oznámení','Test notification'))}"></label><label>${L('Text','Message')}<input name=message value="${esc(L('Takhle vypadá oznámení na obrazovce.','This is how a notification looks on screen.'))}"></label><label>${L('Úroveň','Level')}<select name=level>${Object.entries(LEVELS).map(([k,v])=>`<option value=${k}>${L(v[0],v[1])}</option>`).join('')}</select></label><label>${L('Doba zobrazení (s, prázdné = výchozí)','Display time (s, empty = default)')}<input name=duration type=number min=3 max=120></label>`,f=>api('/api/notify/test',send('POST',Object.fromEntries(f.entries()))))};
+ window.ntfSaveSettings=async function(){try{await api('/api/notify/settings',send('PUT',{enabled:$('#ntfEnabled').checked,position:$('#ntfPosition').value,duration:Number($('#ntfDuration').value),scale:Number($('#ntfScale').value),max_queue:Number($('#ntfMaxQueue').value),sound:$('#ntfSound').value,volume:Number($('#ntfVolume').value),sound_device:$('#ntfSoundDevice').value.trim(),history_max:Number($('#ntfHistoryMax').value),history_days:Number($('#ntfHistoryDays').value)}));toast(L('Nastavení oznámení uloženo','Notification settings saved'))}catch(e){alert(e.message)}};
+ window.ntfTest=function(){modal(L('Testovací oznámení','Test notification'),`<label>${L('Nadpis','Title')}<input name=title value="${esc(L('Test oznámení','Test notification'))}"></label><label>${L('Text','Message')}<input name=message value="${esc(L('Takhle vypadá oznámení na obrazovce.','This is how a notification looks on screen.'))}"></label><label>${L('Úroveň','Level')}<select name=level>${Object.entries(LEVELS).map(([k,v])=>`<option value=${k}>${L(v[0],v[1])}</option>`).join('')}</select></label><label>${L('Doba zobrazení (s, prázdné = výchozí)','Display time (s, empty = default)')}<input name=duration type=number min=3 max=120></label><label>${L('Zvuk','Sound')}<select name=sound><option value=''>${L('Podle nastavení','By the settings')}</option><option value=1>${L('Zahrát','Play')}</option><option value=0>${L('Bez zvuku','Silent')}</option></select></label>`,f=>api('/api/notify/test',send('POST',Object.fromEntries(f.entries()))))};
+ window.ntfClearHistory=async function(){if(!confirm(L('Smazat celou historii oznámení? Čekající oznámení zůstanou.','Delete the whole notification history? Waiting notifications stay.')))return;const r=await api('/api/notify/history/clear',{method:'POST'});toast(L('Smazáno záznamů: ','Entries deleted: ')+r.deleted);ntfRefreshQueue()};
  window.ntfSkip=async function(){await api('/api/notify/skip',{method:'POST'});ntfRefreshQueue()};
  window.ntfRemove=async function(id){await api('/api/notify/queue/'+id,{method:'DELETE'});ntfRefreshQueue()};
  window.ntfClear=async function(){if(!confirm(L('Odebrat všechna čekající oznámení i to, které je právě na obrazovce?','Remove all waiting notifications and the one on screen?')))return;const r=await api('/api/notify/clear',{method:'POST'});toast(L('Odebráno: ','Removed: ')+r.cleared);ntfRefreshQueue()};
@@ -473,4 +480,46 @@ window.addUrl=async function(){
  }
  const notificationsBeforeWatchers=window.notifications;
  window.notifications=async function(){await notificationsBeforeWatchers();const queue=document.getElementById('ntfQueue');if(queue&&!document.getElementById('wchPanel'))queue.insertAdjacentHTML('afterend',await panel())};
+})();
+
+
+// CARACAL_NOTIFY_AUDIT_UI_V1
+// Audit log of the notification settings: who changed what, refused tokens and senders over their limit.
+(function(){
+ const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
+ const when=t=>new Date(t*1000).toLocaleString(en()?'en-GB':'cs-CZ');
+ async function panel(){
+  const a=await api('/api/notify/audit?limit=100');
+  const items=a.entries.map(x=>`<div class=row><div><div class=row-title>${esc(x.action)}</div>${x.detail?`<div class=muted>${esc(x.detail)}</div>`:''}<div class=meta><span class=badge>${when(x.ts)}</span>${x.actor?`<span class="badge auth">${esc(x.actor)}</span>`:''}${x.ip?`<span class=badge>${esc(x.ip)}</span>`:''}</div></div></div>`).join('');
+  return `<div class=panel id=ntfAudit><div class=panel-head><h2>${L('Audit log','Audit log')}</h2><div class=toolbar><span class=badge>${a.count} / ${a.max} ${L('záznamů','entries')} · ${a.days} ${L('dní','days')}</span><button class=danger-outline onclick=ntfClearAudit()>${L('Smazat audit','Clear audit log')}</button></div></div>${items||`<div class=list-empty>${L('Zatím žádné záznamy.','No entries yet.')}</div>`}${a.count>a.entries.length?`<div class=list-empty>${L('Zobrazeno posledních ','Showing the last ')}${a.entries.length}.</div>`:''}</div>`;
+ }
+ window.ntfClearAudit=async function(){if(!confirm(L('Smazat audit log? Samotné smazání v něm zůstane zapsané.','Clear the audit log? The clearing itself stays in it.')))return;const r=await api('/api/notify/audit/clear',{method:'POST'});toast(L('Smazáno záznamů: ','Entries deleted: ')+r.deleted);notifications()};
+ const notificationsBeforeAudit=window.notifications;
+ window.notifications=async function(){await notificationsBeforeAudit();const content=document.getElementById('content');if(content&&!document.getElementById('ntfAudit'))content.insertAdjacentHTML('beforeend',await panel())};
+})();
+
+
+// CARACAL_HTTP_AUTH_UI_V1
+// Login profiles of two types: a log-in form on the page (selectors), or HTTP Basic/Digest log-in, the browser's
+// own user name / password pop-up, which needs only the address and the credentials.
+(function(){
+ const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
+ window.profileTypeChanged=function(){const form=document.getElementById('df'),type=form&&form.querySelector('[name=auth_type]');if(!type)return;const http=type.value==='http';form.querySelectorAll('[data-form-only]').forEach(x=>{x.hidden=http;x.querySelectorAll('input[data-req]').forEach(i=>i.required=!http)});form.querySelectorAll('[data-http-only]').forEach(x=>x.hidden=!http)};
+ window.profileForm=function(p={}){
+  const type=p.auth_type||'form',keep=L('Prázdné = beze změny','Empty = unchanged');
+  return `<label>${L('Typ přihlášení','Login type')}<select name=auth_type onchange=profileTypeChanged()><option value=form ${type==='form'?'selected':''}>${L('Přihlašovací formulář na stránce','Log-in form on the page')}</option><option value=http ${type==='http'?'selected':''}>${L('HTTP přihlášení (vyskakovací okno prohlížeče)','HTTP log-in (the browser pop-up)')}</option></select></label>`
+   +`<div class=dialog-note data-http-only hidden>${L('Pro weby, kde prohlížeč sám ukáže okno se jménem a heslem (HTTP Basic/Digest). Přihlášení platí jen pro server z adresy níže; položka playlistu na stejném serveru se otevře na své vlastní adrese.','For websites where the browser itself asks for a user name and password (HTTP Basic/Digest). The log-in is used only for the server in the address below; a playlist item on the same server opens at its own address.')}</div>`
+   +`<label>${L('Název','Name')}<input name=name value="${esc(p.name||'')}" required></label>`
+   +`<label data-form-only>Login URL<input name=login_url data-req=1 value="${esc(p.login_url||'')}" required></label>`
+   +`<label>${L('Cílová URL (u HTTP přihlášení adresa serveru)','Target URL (for HTTP log-in the server address)')}<input name=target_url value="${esc(p.target_url||'')}" required placeholder="https://…"></label>`
+   +`<label>${L('Uživatel','User')}<input name=username autocomplete=off placeholder="${p.id?keep:L('Uživatel','User')}" ${p.id?'':'required'}></label>`
+   +`<label>${L('Heslo','Password')}<input name=password type=password autocomplete=new-password placeholder="${p.id?keep:L('Heslo','Password')}" ${p.id?'':'required'}></label>`
+   +`<label data-form-only>${L('Selektor uživatele','User selector')}<input name=user_selector data-req=1 value="${esc(p.user_selector||'#name')}" required></label>`
+   +`<label data-form-only>${L('Selektor hesla','Password selector')}<input name=pass_selector data-req=1 value="${esc(p.pass_selector||'#password')}" required></label>`
+   +`<label data-form-only>${L('Selektor tlačítka','Button selector')}<input name=submit_selector data-req=1 value="${esc(p.submit_selector||'#enter')}" required></label>`;
+ };
+ const addProfileBeforeHttp=window.addProfile;window.addProfile=function(){addProfileBeforeHttp();setTimeout(profileTypeChanged,0)};
+ const editProfileBeforeHttp=window.editProfile;window.editProfile=async function(id){await editProfileBeforeHttp(id);setTimeout(profileTypeChanged,0)};
+ const profilesBeforeHttp=window.profiles;
+ window.profiles=async function(){await profilesBeforeHttp();try{for(const x of await api('/api/profiles')){if(x.auth_type!=='http')continue;const row=document.querySelector(`button[onclick="editProfile(${x.id})"]`)?.closest('.row');const meta=row&&row.querySelector('.meta');if(!meta)continue;meta.innerHTML=`<span class="badge auth">${L('Šifrováno','Encrypted')}</span><span class="badge web">${L('HTTP přihlášení','HTTP log-in')}</span>`;const url=row.querySelector('.muted');if(url)url.textContent=x.target_url}}catch(e){console.warn(e)}};
 })();

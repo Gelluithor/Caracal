@@ -5,7 +5,7 @@ BASE=$(cd "$(dirname "$0")" && pwd)
 
 echo '[1/10] Instaluji systémové balíčky...'
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-tk chromium xserver-xorg xserver-xorg-core xserver-xorg-legacy xinit openbox unclutter dbus-x11 x11-xserver-utils xdotool wmctrl x11-utils curl ca-certificates fonts-dejavu-core plymouth plymouth-themes initramfs-tools
+DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-tk chromium xserver-xorg xserver-xorg-core xserver-xorg-legacy xinit openbox unclutter dbus-x11 x11-xserver-utils xdotool wmctrl x11-utils alsa-utils curl ca-certificates fonts-dejavu-core plymouth plymouth-themes initramfs-tools
 
 echo '[2/10] Připravuji uživatele a datové adresáře...'
 id caracal >/dev/null 2>&1 || useradd -m -s /bin/bash caracal

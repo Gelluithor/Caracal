@@ -74,10 +74,44 @@ def auto_accept_all_cookies(page):
  return False
 
 
+# CARACAL_HTTP_AUTH_V1
+# HTTP Basic/Digest log-in (the browser's own user name / password pop-up). The credentials go into the address
+# (https://user:password@server/...): Chromium answers the server's challenge itself, no pop-up appears, and it keeps
+# them for the further requests of that server. They are used only for the server of the profile.
+from urllib.parse import quote as _quote,urlsplit as _urlsplit,urlunsplit as _urlunsplit
+def _origin(url):
+ p=_urlsplit(url);return (p.scheme.lower(),(p.hostname or '').lower(),p.port or (443 if p.scheme.lower()=='https' else 80))
+def _with_credentials(url,user,password):
+ p=_urlsplit(url);host=p.netloc.rsplit('@',1)[-1]
+ return _urlunsplit((p.scheme,f"{_quote(user or '',safe='')}:{_quote(password or '',safe='')}@{host}",p.path,p.query,p.fragment))
+def show_http_auth(page,a,pr):
+ # the playlist item's own address when it is on the profile's server, otherwise the profile's address
+ url=a['source'] if _origin(a['source'])==_origin(pr['target_url']) else pr['target_url']
+ secret=_with_credentials(url,pr['username'],pr['password'])
+ try:
+  # 1) the address with the credentials only logs Chromium in ('commit' = the server accepted them);
+  # 2) the page itself is then opened without them: a page whose address contains credentials cannot make
+  #    requests to relative addresses (fetch fails), which breaks dashboards. Chromium reuses the log-in.
+  page.goto(secret,wait_until='commit',timeout=45000)
+  page.goto(url,wait_until='domcontentloaded',timeout=45000)
+ except Exception as e:
+  message=str(e).replace(secret,url)   # never log the password
+  if 'ERR_INVALID_AUTH_CREDENTIALS' not in message:raise RuntimeError(message) from None
+  # wrong user name or password: an explanation on the screen instead of restarting the player over and over
+  print('HTTP login',pr.get('name'),'failed: wrong user name or password for',url,flush=True)
+  # Chromium loads its own error page right after the failure: wait for it, then replace it with ours
+  error_page='data:text/html;charset=utf-8,'+_quote('<body style="margin:0;background:#0b1018;color:#f8fafc;display:grid;place-items:center;height:100vh;font:28px DejaVu Sans,sans-serif;text-align:center"><div>CARACAL<br><small style="color:#94a3b8">HTTP přihlášení selhalo: špatné jméno nebo heslo v profilu</small></div></body>')
+  try:page.wait_for_url(lambda u:u.startswith('chrome-error:'),timeout=3000)
+  except Exception:pass
+  for _ in range(3):
+   try:page.goto(error_page,timeout=10000);break
+   except Exception:page.wait_for_timeout(500)
+
 def show(page,a):
  if a['kind']=='web':
   pid=a.get('auth_profile_id');pr=get('/api/player/profile/'+str(pid)) if pid else None
-  if pr:
+  if pr and pr.get('auth_type')=='http':show_http_auth(page,a,pr)
+  elif pr:
    page.goto(pr['login_url'],wait_until='domcontentloaded',timeout=45000);pw=page.locator(pr['pass_selector'])
    if pw.count():
     # a wrong selector must not stop the player: the target page is shown anyway and the error is logged

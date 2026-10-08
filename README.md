@@ -7,7 +7,7 @@ images and videos with a web admin. Many screens can be managed centrally with
 - Czech and English admin UI with dark mode and built-in help
 - web pages, images and videos in one playlist, drag-and-drop ordering
 - per-item duration and zoom (when adding, editing or live with a slider)
-- encrypted login profiles with automatic sign-in, automatic acceptance of common cookie banners
+- encrypted login profiles with automatic sign-in (log-in forms and HTTP Basic/Digest, the browser's pop-up), automatic acceptance of common cookie banners
 - Grafana collections: all dashboards with a tag, read through Grafana's guest access on every cycle
 - live control: show or freeze an item or a whole collection, skip to the next item, resume
 - smooth progress bar at the bottom of the screen, splash screen and boot screen with the IP address
