@@ -52,7 +52,7 @@ fails, it shows the HTTP error, or the keys found in the response so that the ri
 | Field | Meaning |
 |---|---|
 | API URL | GET address returning JSON, ideally only open or new items, newest first |
-| Authentication | none, `Bearer` token, Basic (user + password or API key), or a custom header (`X-API-Key: …`) |
+| Authentication | none, `Bearer` token, Basic (user + password or API key), a custom header (`X-API-Key: …`) or OAuth2 |
 | Path to the list | where the list is in the response, e.g. `issues`, `data.tickets`; empty when the response is the list |
 | Item ID field | `id` by default; nested paths work (`ticket.id`) |
 | Title, text | templates with item fields in braces: `New ticket #{id}: {subject}`, `{fields.reporter.displayName}` |
@@ -61,6 +61,34 @@ fails, it shows the HTTP error, or the keys found in the response so that the ri
 Credentials are encrypted with the node's vault key (the same as login profiles) and are never returned by the API.
 Leaving them empty when editing keeps the stored ones. Changing the URL, the list path or the ID field starts the watcher
 again without announcing the existing items.
+
+### OAuth2
+
+With **OAuth2** the watcher gets an access token from the token URL, uses it as `Authorization: Bearer`, keeps it
+until shortly before `expires_in` and then gets a new one. When the API answers 401, the watcher gets a new token and
+tries once more, in case the old token was revoked early.
+
+| Grant | Use | Fields |
+|---|---|---|
+| Client credentials | server to server: Microsoft Graph (Entra ID), Keycloak, Auth0, Zendesk, … | Client ID, Client Secret |
+| Password | a service user: ServiceNow, GLPI, … | Client ID, Client Secret if required, user, password |
+| Refresh token | access on behalf of a user (Jira OAuth, Google, …) | Client ID, Client Secret, refresh token |
+
+- **Scope** is sent when it is filled in (`https://graph.microsoft.com/.default`).
+- **Extra token parameters** are added to the token request, e.g. `audience=https://api.example.com` for Auth0.
+- **Client authentication**: the Client Secret is sent in the request body (`client_secret_post`, the default) or in a
+  Basic header (`client_secret_basic`).
+- **Refresh token**: you obtain it once (for example with the provider's OAuth playground or CLI) and paste it in.
+  When the server sends a new refresh token, CARACAL stores it in place of the old one. Save a watcher with a refresh
+  token before trying it, because the first token request may replace the pasted token.
+- **Token errors** from the server are shown in **Try it** and on the watcher, e.g.
+  `OAuth2 token: HTTP 401 invalid_client – Client authentication failed`.
+
+CARACAL does not open the provider's login page itself (the authorization code flow), because it runs on plain HTTP
+in the local network and most providers accept only HTTPS redirect addresses.
+
+Presets with OAuth2: **Microsoft 365** (new e-mails in a shared mailbox through Microsoft Graph; the app registration
+needs the `Mail.Read` application permission) and **ServiceNow** (new incidents, password grant).
 
 API (administrator session): `GET/POST /api/notify/watchers`, `PUT/DELETE /api/notify/watchers/{id}`,
 `POST /api/notify/watchers/{id}/check` (check now), `POST /api/notify/watchers/preview` (try a configuration).

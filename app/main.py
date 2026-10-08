@@ -1048,11 +1048,17 @@ async def fleet_notify(req:Request):
 # puts a notification into the queue for every item whose ID it has not seen yet. The first check only remembers
 # what is already there. Credentials are encrypted with the vault key and never returned by the API.
 _WCH_LOCK=_ntf_threading.Lock()
-_WCH_AUTH=('none','bearer','basic','header')
+_WCH_AUTH=('none','bearer','basic','header','oauth2')
+_WCH_GRANTS=('client_credentials','password','refresh_token')
+_WCH_SECRETS=('username','secret','client_secret','refresh_token')   # stored encrypted in credentials_enc
 _WCH_RESPONSE_MAX=5*1024**2;_WCH_SEEN_MAX=5000
 c=con();c.executescript("""CREATE TABLE IF NOT EXISTS notify_watchers(id INTEGER PRIMARY KEY,name TEXT,url TEXT,auth_type TEXT DEFAULT 'none',auth_header TEXT,credentials_enc BLOB,list_path TEXT,id_field TEXT,title_template TEXT,message_template TEXT,level TEXT DEFAULT 'info',level_field TEXT,interval INTEGER DEFAULT 60,verify_tls INTEGER DEFAULT 1,enabled INTEGER DEFAULT 1,
-seen TEXT DEFAULT '[]',initialized INTEGER DEFAULT 0,revision INTEGER DEFAULT 0,last_check REAL,last_error TEXT,last_count INTEGER,last_new INTEGER,created REAL);""");c.commit();c.close()
-_WCH_COLUMNS='id,name,url,auth_type,auth_header,list_path,id_field,title_template,message_template,level,level_field,interval,verify_tls,enabled,initialized,last_check,last_error,last_count,last_new,credentials_enc IS NOT NULL AS has_credentials'
+seen TEXT DEFAULT '[]',initialized INTEGER DEFAULT 0,revision INTEGER DEFAULT 0,last_check REAL,last_error TEXT,last_count INTEGER,last_new INTEGER,created REAL);""")
+_wch_existing=[r[1] for r in c.execute('PRAGMA table_info(notify_watchers)').fetchall()]
+for _column in ('oauth_token_url','oauth_grant','oauth_client_id','oauth_scope','oauth_extra','oauth_client_auth'):
+ if _column not in _wch_existing:c.execute(f'ALTER TABLE notify_watchers ADD COLUMN {_column} TEXT')
+c.commit();c.close()
+_WCH_COLUMNS='id,name,url,auth_type,auth_header,list_path,id_field,title_template,message_template,level,level_field,interval,verify_tls,enabled,initialized,last_check,last_error,last_count,last_new,oauth_token_url,oauth_grant,oauth_client_id,oauth_scope,oauth_extra,oauth_client_auth,credentials_enc IS NOT NULL AS has_credentials'
 
 def _wch_get(obj,path):
  # dot path into JSON: "data.tickets", "fields.summary", "items.0.id"
@@ -1072,14 +1078,69 @@ def _wch_credentials(row):
  try:return _grafana_json.loads(vault.decrypt(row['credentials_enc']).decode()) if row and row['credentials_enc'] else {}
  except Exception:return {}
 
-def _wch_fetch(w,creds):
- headers={'Accept':'application/json','User-Agent':'CARACAL/1.0'};secret=str(creds.get('secret') or '')
- if w['auth_type']=='bearer':headers['Authorization']='Bearer '+secret
- elif w['auth_type']=='basic':headers['Authorization']='Basic '+_ntf_base64.b64encode(f"{creds.get('username') or ''}:{secret}".encode()).decode()
- elif w['auth_type']=='header':headers[w['auth_header'] or 'Authorization']=secret
+# OAuth2 access tokens, kept in memory until shortly before they expire: (watcher id, revision) -> (token, valid until)
+_wch_tokens={}
+def _wch_oauth_token(w,creds,watcher_id=None,fresh=False):
+ cache=(watcher_id,w.get('revision')) if watcher_id and w.get('revision') is not None else None
+ hit=_wch_tokens.get(cache) if cache and not fresh else None
+ if hit and hit[1]>time.time():return hit[0]
+ grant=w['oauth_grant'] or 'client_credentials';data={'grant_type':grant}
+ if grant=='password':data.update(username=creds.get('username') or '',password=creds.get('secret') or '')
+ elif grant=='refresh_token':
+  if not creds.get('refresh_token'):raise ValueError('OAuth2: chybí refresh token')
+  data['refresh_token']=creds['refresh_token']
+ if w['oauth_scope']:data['scope']=w['oauth_scope']
+ for key,value in _ntf_urlparse.parse_qsl(w['oauth_extra'] or ''):data.setdefault(key,value)
+ headers={'Accept':'application/json','Content-Type':'application/x-www-form-urlencoded','User-Agent':'CARACAL/1.0'}
+ client_id=w['oauth_client_id'] or '';client_secret=creds.get('client_secret') or ''
+ if w['oauth_client_auth']=='basic':
+  q=lambda x:_ntf_urlparse.quote(x,safe='')
+  headers['Authorization']='Basic '+_ntf_base64.b64encode(f'{q(client_id)}:{q(client_secret)}'.encode()).decode()
+ else:
+  if client_id:data['client_id']=client_id
+  if client_secret:data['client_secret']=client_secret
  context=None if w['verify_tls'] else _grafana_ssl._create_unverified_context()
  try:
-  with _grafana_urlrequest.urlopen(_grafana_urlrequest.Request(w['url'],headers=headers),timeout=20,context=context) as response:raw=response.read(_WCH_RESPONSE_MAX+1)
+  request=_grafana_urlrequest.Request(w['oauth_token_url'],data=_ntf_urlparse.urlencode(data).encode(),headers=headers,method='POST')
+  with _grafana_urlrequest.urlopen(request,timeout=20,context=context) as response:body=response.read(1024**2)
+ except _grafana_urlrequest.HTTPError as error:
+  # e.g. "invalid_client – Client authentication failed"
+  try:detail=_grafana_json.loads(error.read(65536).decode('utf-8','replace'));reason=' – '.join(str(detail[k]) for k in ('error','error_description') if detail.get(k))
+  except Exception:reason=''
+  raise ValueError(f'OAuth2 token: HTTP {error.code} {reason or error.reason}')
+ except Exception as error:raise ValueError(f'OAuth2 token nedostupný: {getattr(error,"reason",None) or error}')
+ try:answer=_grafana_json.loads(body.decode('utf-8','replace'));token=str(answer['access_token'])
+ except (ValueError,KeyError,TypeError):raise ValueError('OAuth2: odpověď neobsahuje access_token')
+ try:expires=max(30,int(float(answer.get('expires_in') or 3600)))
+ except (TypeError,ValueError):expires=3600
+ if cache:_wch_tokens[cache]=(token,time.time()+expires-max(10,min(60,expires//10)))
+ rotated=answer.get('refresh_token')
+ if grant=='refresh_token' and rotated and rotated!=creds.get('refresh_token'):
+  # the server replaced the refresh token: store the new one, the old one may no longer work
+  creds['refresh_token']=rotated
+  if watcher_id:
+   r=rows('SELECT credentials_enc FROM notify_watchers WHERE id=?',(watcher_id,))
+   if r:
+    stored=_wch_credentials(r[0]);stored['refresh_token']=rotated
+    c=con();c.execute('UPDATE notify_watchers SET credentials_enc=? WHERE id=?',(vault.encrypt(_grafana_json.dumps(stored).encode()),watcher_id));c.commit();c.close()
+ return token
+
+def _wch_fetch(w,creds,watcher_id=None):
+ context=None if w['verify_tls'] else _grafana_ssl._create_unverified_context()
+ def get(fresh=False):
+  headers={'Accept':'application/json','User-Agent':'CARACAL/1.0'};secret=str(creds.get('secret') or '')
+  if w['auth_type']=='bearer':headers['Authorization']='Bearer '+secret
+  elif w['auth_type']=='basic':headers['Authorization']='Basic '+_ntf_base64.b64encode(f"{creds.get('username') or ''}:{secret}".encode()).decode()
+  elif w['auth_type']=='header':headers[w['auth_header'] or 'Authorization']=secret
+  elif w['auth_type']=='oauth2':headers['Authorization']='Bearer '+_wch_oauth_token(w,creds,watcher_id,fresh)
+  with _grafana_urlrequest.urlopen(_grafana_urlrequest.Request(w['url'],headers=headers),timeout=20,context=context) as response:return response.read(_WCH_RESPONSE_MAX+1)
+ try:
+  try:raw=get()
+  except _grafana_urlrequest.HTTPError as error:
+   # a cached OAuth2 token may have been revoked before it expired: one more try with a new one
+   if error.code!=401 or w['auth_type']!='oauth2':raise
+   raw=get(fresh=True)
+ except ValueError:raise
  except _grafana_urlrequest.HTTPError as error:raise ValueError(f'HTTP {error.code} {error.reason}')
  except Exception as error:raise ValueError(f'Nedostupné: {getattr(error,"reason",None) or error}')
  if len(raw)>_WCH_RESPONSE_MAX:raise ValueError('Odpověď je větší než 5 MB')
@@ -1109,7 +1170,7 @@ def _wch_check(w):
   r=rows('SELECT * FROM notify_watchers WHERE id=?',(w['id'],))
   if not r:return {'ok':False,'error':'Hlídač nebyl nalezen'}
   w=r[0];now=time.time()
-  try:items=_wch_fetch(w,_wch_credentials(w))
+  try:items=_wch_fetch(w,_wch_credentials(w),w['id'])
   except ValueError as error:
    c=con();c.execute('UPDATE notify_watchers SET last_check=?,last_error=? WHERE id=?',(now,str(error)[:300],w['id']));c.commit();c.close()
    return {'ok':False,'error':str(error)}
@@ -1142,6 +1203,11 @@ def _wch_fields(d,current=None):
  current=current or {};out={}
  for key,limit in (('name',60),('url',4000),('auth_header',100),('list_path',200),('id_field',200),('title_template',500),('message_template',1000),('level_field',200)):
   out[key]=str(d.get(key,current.get(key)) or '').strip()[:limit]
+ for key,limit in (('oauth_token_url',4000),('oauth_client_id',500),('oauth_scope',1000),('oauth_extra',1000)):
+  out[key]=str(d.get(key,current.get(key)) or '').strip()[:limit]
+ out['oauth_grant']=str(d.get('oauth_grant',current.get('oauth_grant')) or 'client_credentials')
+ out['oauth_client_auth']='basic' if d.get('oauth_client_auth',current.get('oauth_client_auth'))=='basic' else 'body'
+ if out['oauth_grant'] not in _WCH_GRANTS:raise HTTPException(400,'Neplatný typ OAuth2 grantu')
  if not out['name']:raise HTTPException(400,'Vyplň název')
  if not out['url'].startswith(('http://','https://')):raise HTTPException(400,'URL musí začínat http:// nebo https://')
  out['id_field']=out['id_field'] or 'id'
@@ -1154,8 +1220,13 @@ def _wch_fields(d,current=None):
  out['enabled']=1 if d.get('enabled',current.get('enabled',1)) not in (False,0,'0','false','') else 0
  # empty username / secret = keep the stored one
  creds=_wch_credentials(current) if current else {}
- for key in ('username','secret'):
+ for key in _WCH_SECRETS:
   if str(d.get(key) or '').strip():creds[key]=str(d[key]).strip()
+ if out['auth_type']=='oauth2':
+  if not out['oauth_token_url'].startswith(('http://','https://')):raise HTTPException(400,'Token URL musí začínat http:// nebo https://')
+  if out['oauth_grant']=='client_credentials' and not out['oauth_client_id']:raise HTTPException(400,'Vyplň Client ID')
+  if out['oauth_grant']=='password' and not (creds.get('username') and creds.get('secret')):raise HTTPException(400,'Vyplň uživatele a heslo')
+  if out['oauth_grant']=='refresh_token' and not creds.get('refresh_token'):raise HTTPException(400,'Vlož refresh token')
  out['credentials_enc']=vault.encrypt(_grafana_json.dumps(creds).encode()) if creds else None
  return out
 
@@ -1190,6 +1261,9 @@ async def notify_watcher_preview(req:Request,u=Depends(auth)):
  if d.get('id'):
   r=rows('SELECT * FROM notify_watchers WHERE id=?',(int(d['id']),));current=r[0] if r else None
  w=_wch_fields(d,current)
- try:items=_wch_fetch(w,_wch_credentials(w))
+ if w['auth_type']=='oauth2' and w['oauth_grant']=='refresh_token' and not current:
+  # trying it could replace the pasted refresh token before the watcher is saved
+  raise HTTPException(400,'S refresh tokenem hlídač nejdřív ulož a vyzkoušej tlačítkem Zkontrolovat teď')
+ try:items=_wch_fetch(w,_wch_credentials(w),current['id'] if current else None)
  except ValueError as error:raise HTTPException(400,str(error))
  return {'ok':True,'count':len(items),'samples':[_wch_note(w,i,it) for i,it in items[:3]]}
