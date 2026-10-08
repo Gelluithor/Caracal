@@ -688,7 +688,7 @@ def fleet_snapshot(req:Request):
  _fleet_auth(req);state=_cc2_read();state['player_online']=(time.time()-float(state.get('updated') or 0))<8
  player={k:state.get(k) for k in ('current_id','current_name','frozen','collection_frozen','collection_id','remaining','duration','updated','player_online')}
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
- return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player}
+ return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications()}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -1032,8 +1032,11 @@ def notify_overlay(req:Request):
 @app.get('/api/notify/settings')
 def notify_settings(u=Depends(auth)):return _ntf_settings()
 @app.put('/api/notify/settings')
-async def notify_settings_save(req:Request,u=Depends(auth)):
- d=await req.json();s=_ntf_settings()
+async def notify_settings_save(req:Request,u=Depends(auth)):return _ntf_save_settings(await req.json(),req,u)
+def _ntf_save_settings(d,req,actor):
+ # missing keys keep their value, so CARACAL Fleet can change only some of them
+ if not isinstance(d,dict):raise HTTPException(400,'Neplatné nastavení')
+ s=_ntf_settings()
  try:
   s['enabled']=bool(d.get('enabled',s['enabled']));s['position']=str(d.get('position',s['position']))
   s['duration']=int(d.get('duration',s['duration']));s['max_queue']=int(d.get('max_queue',s['max_queue']));s['scale']=int(d.get('scale',s['scale']))
@@ -1054,7 +1057,7 @@ async def notify_settings_save(req:Request,u=Depends(auth)):
  for k in _NTF_DEFAULTS:c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',(k,('1' if s[k] else '0') if k=='enabled' else str(s[k])))
  c.commit();c.close()
  changes=', '.join(f'{k}: {before[k]} → {s[k]}' for k in _NTF_DEFAULTS if before[k]!=s[k])
- if changes:_ntf_audit(req,u,'Nastavení změněno',changes)
+ if changes:_ntf_audit(req,actor,'Nastavení změněno',changes)
  return s
 @app.get('/api/notify/tokens')
 def notify_tokens(u=Depends(auth)):return rows('SELECT id,name,prefix,rate_per_min,enabled,created,last_used FROM notify_tokens ORDER BY name COLLATE NOCASE,id')
@@ -1103,9 +1106,10 @@ def notify_skip(req:Request,u=Depends(auth)):
  if n:_ntf_audit(req,u,'Oznámení přeskočeno')
  return {'ok':True}
 @app.post('/api/notify/clear')
-def notify_clear(req:Request,u=Depends(auth)):
+def notify_clear(req:Request,u=Depends(auth)):return _ntf_clear(req,u)
+def _ntf_clear(req,actor):
  with _NTF_LOCK:c=con();n=c.execute('UPDATE notifications SET done=3 WHERE done=0').rowcount;c.commit();c.close()
- _ntf_audit(req,u,'Fronta vyprázdněna',f'{n} oznámení')
+ _ntf_audit(req,actor,'Fronta vyprázdněna',f'{n} oznámení')
  return {'ok':True,'cleared':n}
 @app.delete('/api/notify/queue/{notification_id}')
 def notify_remove(notification_id:int,req:Request,u=Depends(auth)):
@@ -1338,27 +1342,31 @@ def _wch_fields(d,current=None):
 @app.get('/api/notify/watchers')
 def notify_watchers(u=Depends(auth)):return rows(f'SELECT {_WCH_COLUMNS} FROM notify_watchers ORDER BY name COLLATE NOCASE,id')
 @app.post('/api/notify/watchers')
-async def notify_watcher_create(req:Request,u=Depends(auth)):
- f=_wch_fields(await req.json());keys=list(f)
+async def notify_watcher_create(req:Request,u=Depends(auth)):return _wch_create(await req.json(),req,u)
+def _wch_create(d,req,actor):
+ f=_wch_fields(d);keys=list(f)
  c=con();q=c.execute(f'INSERT INTO notify_watchers({",".join(keys)},created) VALUES({",".join("?"*len(keys))},?)',(*f.values(),time.time()));c.commit();c.close()
- _ntf_audit(req,u,'Hlídač vytvořen',f"{f['name']} – {f['url'].split('?')[0]}")
+ _ntf_audit(req,actor,'Hlídač vytvořen',f"{f['name']} – {f['url'].split('?')[0]}")
  return {'ok':True,'id':q.lastrowid}
 @app.put('/api/notify/watchers/{watcher_id}')
-async def notify_watcher_update(watcher_id:int,req:Request,u=Depends(auth)):
+async def notify_watcher_update(watcher_id:int,req:Request,u=Depends(auth)):return _wch_update(watcher_id,await req.json(),req,u)
+def _wch_update(watcher_id,d,req,actor):
  r=rows('SELECT * FROM notify_watchers WHERE id=?',(watcher_id,))
  if not r:raise HTTPException(404,'Hlídač nebyl nalezen')
- d=await req.json();f=_wch_fields(d,r[0])
+ f=_wch_fields(d,r[0])
  # another URL or list means other items: start again without notifying about the existing ones
  reset=any(f[k]!=r[0][k] for k in ('url','list_path','id_field'))
  c=con();c.execute(f'UPDATE notify_watchers SET {",".join(k+"=?" for k in f)},revision=revision+1'+(",seen='[]',initialized=0,last_check=NULL" if reset else '')+' WHERE id=?',(*f.values(),watcher_id));c.commit();c.close()
  changed=[k for k in f if k!='credentials_enc' and f[k]!=r[0][k]]+(['přihlašovací údaje'] if f['credentials_enc']!=r[0]['credentials_enc'] and any(str(d.get(k) or '').strip() for k in _WCH_SECRETS) else [])
- if changed:_ntf_audit(req,u,'Hlídač '+('zapnut' if changed==['enabled'] and f['enabled'] else 'vypnut' if changed==['enabled'] else 'upraven'),f"{f['name']}: "+', '.join(changed))
+ if changed:_ntf_audit(req,actor,'Hlídač '+('zapnut' if changed==['enabled'] and f['enabled'] else 'vypnut' if changed==['enabled'] else 'upraven'),f"{f['name']}: "+', '.join(changed))
  return {'ok':True,'reset':reset}
 @app.delete('/api/notify/watchers/{watcher_id}')
-def notify_watcher_delete(watcher_id:int,req:Request,u=Depends(auth)):
+def notify_watcher_delete(watcher_id:int,req:Request,u=Depends(auth)):return _wch_delete(watcher_id,req,u)
+def _wch_delete(watcher_id,req,actor):
  r=rows('SELECT name FROM notify_watchers WHERE id=?',(watcher_id,))
+ if not r:raise HTTPException(404,'Hlídač nebyl nalezen')
  c=con();c.execute('DELETE FROM notify_watchers WHERE id=?',(watcher_id,));c.commit();c.close()
- if r:_ntf_audit(req,u,'Hlídač smazán',r[0]['name'])
+ _ntf_audit(req,actor,'Hlídač smazán',r[0]['name'])
  return {'ok':True}
 @app.post('/api/notify/watchers/{watcher_id}/check')
 def notify_watcher_check(watcher_id:int,u=Depends(auth)):
@@ -1378,3 +1386,41 @@ async def notify_watcher_preview(req:Request,u=Depends(auth)):
  try:items=_wch_fetch(w,_wch_credentials(w),current['id'] if current else None)
  except ValueError as error:raise HTTPException(400,str(error))
  return {'ok':True,'count':len(items),'samples':[_wch_note(w,i,it) for i,it in items[:3]]}
+
+
+# CARACAL_FLEET_NOTIFY_V1
+# Notifications managed by CARACAL Fleet: settings, the queue and watchers (agent contract: docs/LOCAL-API.md in the
+# CARACAL Fleet repository). Authenticated with the Fleet key; the node's audit log names "CARACAL Fleet".
+_FLEET_ACTOR='CARACAL Fleet'
+def _fleet_notifications():
+ # what the snapshot reports: never tokens, credentials or the IDs a watcher has seen
+ waiting=rows('SELECT COUNT(*) AS n FROM notifications WHERE done=0 AND shown_at IS NULL')[0]['n']
+ current=rows('SELECT title,message,level FROM notifications WHERE done=0 AND shown_at IS NOT NULL AND shown_at+duration>? LIMIT 1',(time.time(),))
+ return {'settings':_ntf_settings(),'waiting':waiting,'current':current[0] if current else None,
+  'watchers':rows(f'SELECT {_WCH_COLUMNS} FROM notify_watchers ORDER BY name COLLATE NOCASE,id'),
+  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n']}
+async def _fleet_json(req:Request):
+ try:d=await req.json()
+ except ValueError:raise HTTPException(400,'Invalid JSON')
+ if not isinstance(d,dict):raise HTTPException(400,'Invalid JSON')
+ return d
+@app.put('/api/fleet/v1/notify/settings')
+async def fleet_notify_settings(req:Request):
+ _fleet_auth(req);return _ntf_save_settings(await _fleet_json(req),req,_FLEET_ACTOR)
+@app.post('/api/fleet/v1/notify/clear')
+def fleet_notify_clear(req:Request):
+ _fleet_auth(req);return _ntf_clear(req,_FLEET_ACTOR)
+@app.post('/api/fleet/v1/notify/watchers')
+async def fleet_watcher_create(req:Request):
+ _fleet_auth(req);return _wch_create(await _fleet_json(req),req,_FLEET_ACTOR)
+@app.put('/api/fleet/v1/notify/watchers/{watcher_id}')
+async def fleet_watcher_update(watcher_id:int,req:Request):
+ _fleet_auth(req);return _wch_update(watcher_id,await _fleet_json(req),req,_FLEET_ACTOR)
+@app.delete('/api/fleet/v1/notify/watchers/{watcher_id}')
+def fleet_watcher_delete(watcher_id:int,req:Request):
+ _fleet_auth(req);return _wch_delete(watcher_id,req,_FLEET_ACTOR)
+@app.post('/api/fleet/v1/notify/watchers/{watcher_id}/check')
+def fleet_watcher_check(watcher_id:int,req:Request):
+ _fleet_auth(req);r=rows('SELECT * FROM notify_watchers WHERE id=?',(watcher_id,))
+ if not r:raise HTTPException(404,'Hlídač nebyl nalezen')
+ return _wch_check(r[0])

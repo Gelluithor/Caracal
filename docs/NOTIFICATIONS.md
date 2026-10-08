@@ -12,6 +12,11 @@ There are two ways to get notifications to the screen:
 - **pull**: CARACAL asks the app's API on its own every few seconds and announces new items, see [Watchers](#watchers).
   Use this for helpdesks and other systems that cannot send webhooks.
 
+With [CARACAL Fleet](https://github.com/Gelluithor/Caracal-Fleet) the same can be managed centrally: sending
+notifications to one or many screens, the settings and the watchers (tab *Notifications* of a device), and a
+notification API with one token for many screens. Fleet uses the node's Fleet API (`/api/fleet/v1/notify*`, see
+`docs/LOCAL-API.md` in the Fleet repository); changes made by Fleet appear in the audit log as "CARACAL Fleet".
+
 ## Queue rules
 
 - One notification is on screen at a time; more important ones go first (`critical` > `warning` > `info`/`success`),
