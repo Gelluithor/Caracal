@@ -24,7 +24,7 @@ The app, the player and the overlay run as containers from `ghcr.io/gelluithor/c
 The device only runs Docker, the X display and, optionally, the CARACAL Fleet Agent.
 
 - **With CARACAL Fleet:** prepare an SD card in Fleet (zero-touch) or let Fleet install a Raspberry Pi over SSH.
-  Fleet also updates the nodes.
+  Fleet also updates the nodes and can create the administrator of the admin UI during the installation.
 - **Without Fleet:** see [docker/README.md](docker/README.md).
 
 ### Classic installation
@@ -51,7 +51,8 @@ Chromium profile.
 The CARACAL Fleet Agent talks to the node only through its local Fleet API (`/api/fleet/v1/*`, section
 `CARACAL_FLEET_API_V2` in `app/main.py`). The API is protected by the key in `/etc/caracal-fleet-key` (classic) or
 `/var/lib/caracal/.fleet-key` (Docker), which the agent writes when it is enrolled. Without the key the API answers
-503 and exposes nothing.
+503 and exposes nothing. Everything the admin UI does is available through it as well, including the administrator
+account (`POST /api/fleet/v1/admin`: created, or a new name and password that end its current sessions).
 
 ## Security
 

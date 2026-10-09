@@ -1,4 +1,4 @@
-import os,sqlite3,secrets,time,socket,subprocess
+import os,sqlite3,secrets,time,socket,subprocess,hashlib
 from pathlib import Path
 from datetime import datetime,timedelta,timezone
 import jwt,psutil
@@ -46,13 +46,16 @@ def request_player_restart():
 def request_reboot():
  if RUNTIME!='docker':subprocess.Popen(['sudo','/bin/systemctl','reboot'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);return True
  state=_cc2_read();state['reboot_request']=int(state.get('reboot_request',0))+1;_cc2_write(state);return True
+def _pw_mark(password_hash):return hashlib.sha256(str(password_hash or '').encode()).hexdigest()[:16]
 def auth(req:Request):
- try:uid=int(jwt.decode(req.cookies.get('session',''),secret,algorithms=['HS256'])['sub'])
+ try:claims=jwt.decode(req.cookies.get('session',''),secret,algorithms=['HS256']);uid=int(claims['sub'])
  except:raise HTTPException(401)
- r=rows('SELECT id,username FROM users WHERE id=?',(uid,));
- if not r:raise HTTPException(401)
- return r[0]
-def tok(i):return jwt.encode({'sub':str(i),'exp':datetime.now(timezone.utc)+timedelta(days=1)},secret,algorithm='HS256')
+ r=rows('SELECT id,username,password_hash FROM users WHERE id=?',(uid,));
+ if not r or claims.get('pw')!=_pw_mark(r[0]['password_hash']):raise HTTPException(401)
+ return {'id':r[0]['id'],'username':r[0]['username']}
+def tok(i):
+ r=rows('SELECT password_hash FROM users WHERE id=?',(i,))
+ return jwt.encode({'sub':str(i),'pw':_pw_mark(r[0]['password_hash'] if r else ''),'exp':datetime.now(timezone.utc)+timedelta(days=1)},secret,algorithm='HS256')
 @app.get('/')
 def home():return FileResponse(Path(__file__).parent/'static/index.html')
 @app.get('/api/setup-status')
@@ -688,7 +691,8 @@ def fleet_snapshot(req:Request):
  _fleet_auth(req);state=_cc2_read();state['player_online']=(time.time()-float(state.get('updated') or 0))<8
  player={k:state.get(k) for k in ('current_id','current_name','frozen','collection_frozen','collection_id','remaining','duration','updated','player_online')}
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
- return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications()}
+ return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications(),
+  'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))}}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -1399,7 +1403,12 @@ def _fleet_notifications():
  current=rows('SELECT title,message,level FROM notifications WHERE done=0 AND shown_at IS NOT NULL AND shown_at+duration>? LIMIT 1',(time.time(),))
  return {'settings':_ntf_settings(),'waiting':waiting,'current':current[0] if current else None,
   'watchers':rows(f'SELECT {_WCH_COLUMNS} FROM notify_watchers ORDER BY name COLLATE NOCASE,id'),
-  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n'],'sounds':_snd_meta()}
+  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n'],'sounds':_snd_meta(),
+  # the queue (not the messages of the history: those stay on the node and are fetched on demand)
+  'queue':[{**x,'title':_ntf_text(x['title'],120),'message':_ntf_text(x['message'],200)} for x in rows('SELECT id,source,title,message,level,priority,created FROM notifications WHERE done=0 AND shown_at IS NULL ORDER BY priority DESC,id LIMIT 30')],
+  'history_count':rows('SELECT COUNT(*) AS n FROM notifications WHERE done>0')[0]['n'],
+  'audit_count':rows('SELECT COUNT(*) AS n FROM notify_audit')[0]['n'],
+  'token_list':rows('SELECT id,name,prefix,rate_per_min,enabled,created,last_used FROM notify_tokens ORDER BY name COLLATE NOCASE,id')}
 async def _fleet_json(req:Request):
  try:d=await req.json()
  except ValueError:raise HTTPException(400,'Invalid JSON')
@@ -1497,3 +1506,64 @@ async def fleet_notify_sound_upload(level:str,req:Request):
 @app.delete('/api/fleet/v1/notify/sounds/{level}')
 def fleet_notify_sound_delete(level:str,req:Request):
  _fleet_auth(req);return _snd_delete(level,req,_FLEET_ACTOR)
+
+
+# CARACAL_FLEET_PARITY_V1
+# What the node's web administration can do, CARACAL Fleet can do as well: the web administrator account, the
+# countdown on the TV, the notification queue, history and audit log, the node's notification tokens, trying a
+# watcher before saving it and trying a Grafana tag. Authenticated with the Fleet key.
+def _fleet_admin_state():
+ r=rows('SELECT username FROM users ORDER BY id LIMIT 1')
+ return {'configured':bool(r),'username':r[0]['username'] if r else ''}
+@app.post('/api/fleet/v1/admin')
+async def fleet_admin(req:Request):
+ # creates the web administrator (before the first-run setup) or sets a new name and password of the existing one
+ _fleet_auth(req);d=await _fleet_json(req);username=str(d.get('username') or '').strip();password=str(d.get('password') or '')
+ if not username or len(username)>64 or any(ch.isspace() for ch in username):raise HTTPException(400,'Invalid user name')
+ if not 10<=len(password)<=200:raise HTTPException(400,'Password must have 10 to 200 characters')
+ c=con();r=c.execute('SELECT id FROM users ORDER BY id LIMIT 1').fetchone()
+ if r and c.execute('SELECT 1 FROM users WHERE username=? AND id!=?',(username,r['id'])).fetchone():c.close();raise HTTPException(409,'User name already used')
+ if r:c.execute('UPDATE users SET username=?,password_hash=? WHERE id=?',(username,pwd.hash(password),r['id']))
+ else:c.execute('INSERT INTO users(username,password_hash) VALUES(?,?)',(username,pwd.hash(password)))
+ c.commit();c.close();_login_fails.clear()
+ print('CARACAL Fleet','changed' if r else 'created','the web administrator',username,flush=True)
+ return {'ok':True,'created':not r,'username':username}
+@app.put('/api/fleet/v1/player/overlay')
+async def fleet_overlay(req:Request):
+ # the countdown bar of the current page on the TV
+ _fleet_auth(req);d=await _fleet_json(req);state=_cc2_read()
+ enabled=bool(d.get('enabled',state.get('overlay_enabled',True)))
+ try:size=int(d.get('size',state.get('overlay_size',16)))
+ except (TypeError,ValueError):raise HTTPException(400,'Invalid size')
+ if not 4<=size<=200:raise HTTPException(400,'Size must be 4 to 200 px')
+ state['overlay_enabled']=enabled;state['overlay_size']=size;_cc2_write(state)
+ return {'ok':True,'enabled':enabled,'size':size}
+@app.post('/api/fleet/v1/notify/skip')
+def fleet_notify_skip(req:Request):_fleet_auth(req);return notify_skip(req,_FLEET_ACTOR)
+@app.delete('/api/fleet/v1/notify/queue/{notification_id}')
+def fleet_notify_remove(notification_id:int,req:Request):_fleet_auth(req);return notify_remove(notification_id,req,_FLEET_ACTOR)
+@app.get('/api/fleet/v1/notify/log')
+def fleet_notify_log(req:Request,limit:int=100):
+ # history and audit log on demand (they can hold message texts, so they are not part of every heartbeat)
+ _fleet_auth(req);limit=max(1,min(200,limit))
+ history=rows('SELECT id,source,title,message,level,priority,created,shown_at,done FROM notifications WHERE done>0 ORDER BY id DESC LIMIT ?',(limit,))
+ return {'history':history,'history_count':rows('SELECT COUNT(*) AS n FROM notifications WHERE done>0')[0]['n'],
+  'audit':rows('SELECT * FROM notify_audit ORDER BY id DESC LIMIT ?',(limit,)),'audit_count':rows('SELECT COUNT(*) AS n FROM notify_audit')[0]['n']}
+@app.post('/api/fleet/v1/notify/history/clear')
+def fleet_notify_history_clear(req:Request):_fleet_auth(req);return notify_history_clear(req,_FLEET_ACTOR)
+@app.post('/api/fleet/v1/notify/audit/clear')
+def fleet_notify_audit_clear(req:Request):_fleet_auth(req);return notify_audit_clear(req,_FLEET_ACTOR)
+@app.put('/api/fleet/v1/notify/tokens/{token_id}')
+async def fleet_notify_token_update(token_id:int,req:Request):
+ # name, limit and enabled; new tokens are created in the node's administration (a token is shown only once)
+ _fleet_auth(req);return await notify_token_update(token_id,req,_FLEET_ACTOR)
+@app.delete('/api/fleet/v1/notify/tokens/{token_id}')
+def fleet_notify_token_delete(token_id:int,req:Request):_fleet_auth(req);return notify_token_delete(token_id,req,_FLEET_ACTOR)
+@app.post('/api/fleet/v1/notify/watchers/preview')
+async def fleet_notify_watcher_preview(req:Request):_fleet_auth(req);return await notify_watcher_preview(req,_FLEET_ACTOR)
+@app.post('/api/fleet/v1/grafana/discover')
+async def fleet_grafana_discover(req:Request):
+ _fleet_auth(req);d=await _fleet_json(req);url=str(d.get('grafana_url') or '').strip().rstrip('/');tag=str(d.get('tag') or '').strip()
+ if not url.startswith(('http://','https://')):raise HTTPException(400,'Grafana URL must start with http:// or https://')
+ if not tag:raise HTTPException(400,'Tag must not be empty')
+ found=_grafana_discover(url,tag);return {'ok':True,'count':len(found),'dashboards':found[:50]}
