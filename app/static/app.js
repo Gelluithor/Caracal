@@ -523,3 +523,23 @@ window.addUrl=async function(){
  const profilesBeforeHttp=window.profiles;
  window.profiles=async function(){await profilesBeforeHttp();try{for(const x of await api('/api/profiles')){if(x.auth_type!=='http')continue;const row=document.querySelector(`button[onclick="editProfile(${x.id})"]`)?.closest('.row');const meta=row&&row.querySelector('.meta');if(!meta)continue;meta.innerHTML=`<span class="badge auth">${L('Šifrováno','Encrypted')}</span><span class="badge web">${L('HTTP přihlášení','HTTP log-in')}</span>`;const url=row.querySelector('.muted');if(url)url.textContent=x.target_url}}catch(e){console.warn(e)}};
 })();
+
+
+// CARACAL_NOTIFY_SOUNDS_UI_V1
+// Custom notification sounds: an MP3 per level instead of the generated chime.
+(function(){
+ const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
+ const LEVELS=[['info','Info','Info'],['success','OK','OK'],['warning','Varování','Warning'],['critical','Kritické','Critical']];
+ const size=n=>n>=1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' kB';
+ async function panel(){
+  const sounds=await api('/api/notify/sounds');
+  const rows=LEVELS.map(([level,cs,e])=>{const s=sounds[level];return `<div class=row><div><div class=row-title>${L(cs,e)}</div><div class=muted>${s?`${esc(s.name)} · ${size(s.size)}`:L('Výchozí znělka','Default chime')}</div>${s?`<audio controls preload=none src="/api/notify/sounds/${level}/file?v=${esc(s.sha256.slice(0,12))}" class=snd-preview></audio>`:''}</div>
+   <div class=actions><input type=file id=sndFile-${level} accept=".mp3,audio/mpeg" hidden onchange="sndUpload('${level}',this)"><button class=secondary onclick="document.getElementById('sndFile-${level}').click()">${L('Nahrát MP3','Upload MP3')}</button>${s?`<button class=danger onclick="sndReset('${level}')">${L('Výchozí','Default')}</button>`:''}</div></div>`}).join('');
+  return `<div class=panel id=sndPanel><div class=panel-head><h2>${L('Vlastní zvuky','Custom sounds')}</h2></div><div class=ntf-body><p class=muted>${L('Pro každou úroveň jde nahrát vlastní MP3 (nejvýš 5 MB), na obrazovce se přehraje nejvýš 15 s s hlasitostí z nastavení. Bez nahraného souboru hraje vygenerovaná znělka. Vyzkoušet jde tlačítkem Poslat test se zvukem.','For each level you can upload your own MP3 (at most 5 MB); the screen plays at most 15 s with the volume of the settings. Without a file the generated chime plays. Try it with Send test and sound.')}</p></div>${rows}</div>`;
+ }
+ window.sndUpload=async function(level,input){const file=input.files[0];if(!file)return;if(file.size>5*1048576){alert(L('Soubor je větší než 5 MB.','The file is larger than 5 MB.'));return}const fd=new FormData();fd.append('file',file);try{await api('/api/notify/sounds/'+level,{method:'POST',body:fd});toast(L('Zvuk nahrán','Sound uploaded'));await sndRefresh()}catch(e){alert(e.message)}};
+ window.sndReset=async function(level){if(!confirm(L('Vrátit výchozí znělku?','Restore the default chime?')))return;await api('/api/notify/sounds/'+level,{method:'DELETE'});toast(L('Výchozí znělka obnovena','Default chime restored'));await sndRefresh()};
+ window.sndRefresh=async function(){const old=document.getElementById('sndPanel');if(old)old.outerHTML=await panel()};
+ const notificationsBeforeSounds=window.notifications;
+ window.notifications=async function(){await notificationsBeforeSounds();if(document.getElementById('sndPanel'))return;const settings=document.getElementById('ntfEnabled')?.closest('.panel');if(settings)settings.insertAdjacentHTML('afterend',await panel())};
+})();

@@ -80,3 +80,5 @@ body{background:var(--page);color:var(--text);transition:background .2s ease,col
 .wch-sample{margin-top:8px}
 .wch-error{color:#c0392b!important}
 .badge.wch-error{background:#fdecea;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* CARACAL_NOTIFY_SOUNDS_UI_V1 */
+.snd-preview{display:block;margin-top:8px;height:32px;max-width:100%}

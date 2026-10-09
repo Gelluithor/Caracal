@@ -1027,7 +1027,7 @@ def notify_overlay(req:Request):
  if cur and s['enabled']:
   current={k:cur[k] for k in ('id','title','message','level','source','duration')};current['remaining']=max(0.0,cur['shown_at']+cur['duration']-now)
   current['sound']=cur['sound']==1 or (cur['sound']!=0 and (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
- return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'current':current,'waiting':waiting}
+ return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'sounds':{k:v['sha256'][:16] for k,v in _snd_meta().items()},'current':current,'waiting':waiting}
 
 # administration
 @app.get('/api/notify/settings')
@@ -1399,7 +1399,7 @@ def _fleet_notifications():
  current=rows('SELECT title,message,level FROM notifications WHERE done=0 AND shown_at IS NOT NULL AND shown_at+duration>? LIMIT 1',(time.time(),))
  return {'settings':_ntf_settings(),'waiting':waiting,'current':current[0] if current else None,
   'watchers':rows(f'SELECT {_WCH_COLUMNS} FROM notify_watchers ORDER BY name COLLATE NOCASE,id'),
-  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n']}
+  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n'],'sounds':_snd_meta()}
 async def _fleet_json(req:Request):
  try:d=await req.json()
  except ValueError:raise HTTPException(400,'Invalid JSON')
@@ -1425,3 +1425,75 @@ def fleet_watcher_check(watcher_id:int,req:Request):
  _fleet_auth(req);r=rows('SELECT * FROM notify_watchers WHERE id=?',(watcher_id,))
  if not r:raise HTTPException(404,'Hlídač nebyl nalezen')
  return _wch_check(r[0])
+
+
+# CARACAL_NOTIFY_SOUNDS_V1
+# Custom notification sounds: one MP3 per level instead of the generated chime, uploaded in the admin UI or from
+# CARACAL Fleet. Stored as DATA/notify-sounds/<level>.mp3 (details in notify_settings 'sound_file_<level>'); the
+# overlay downloads it once, converts it to WAV with mpg123 and plays at most 15 s with the volume of the settings.
+import hashlib as _snd_hashlib
+_SND_DIR=DATA/'notify-sounds';_SND_DIR.mkdir(exist_ok=True)
+_SND_MAX=5*1024**2
+def _snd_level(level):
+ if level not in _NTF_LEVELS:raise HTTPException(404,'Neznámá úroveň oznámení')
+ return level
+def _snd_meta():
+ out={}
+ for r in rows("SELECT key,value FROM notify_settings WHERE key LIKE 'sound_file_%'"):
+  level=r['key'][len('sound_file_'):]
+  if level in _NTF_LEVELS and (_SND_DIR/f'{level}.mp3').is_file():
+   try:out[level]=_grafana_json.loads(r['value'])
+   except ValueError:pass
+ return out
+def _snd_is_mp3(head):
+ # ID3 tag or an MPEG audio frame header (11 sync bits)
+ return head[:3]==b'ID3' or (len(head)>1 and head[0]==0xFF and head[1]&0xE0==0xE0)
+async def _snd_store(level,upload,req,actor):
+ level=_snd_level(level)
+ if upload is None or not hasattr(upload,'read'):raise HTTPException(400,'Chybí soubor')
+ name=_ntf_text(Path(upload.filename or 'zvuk.mp3').name,120) or 'zvuk.mp3'
+ tmp=_SND_DIR/f'{level}.part';size=0;digest=_snd_hashlib.sha256()
+ try:
+  with tmp.open('wb') as f:
+   while chunk:=await upload.read(1048576):
+    if not size and not _snd_is_mp3(chunk):raise HTTPException(400,'Soubor není MP3')
+    size+=len(chunk)
+    if size>_SND_MAX:raise HTTPException(413,'Zvuk může mít nejvýš 5 MB')
+    digest.update(chunk);f.write(chunk)
+  if not size:raise HTTPException(400,'Prázdný soubor')
+  tmp.replace(_SND_DIR/f'{level}.mp3')
+ finally:tmp.unlink(missing_ok=True)
+ meta={'name':name,'size':size,'sha256':digest.hexdigest(),'uploaded':time.time()}
+ c=con();c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',('sound_file_'+level,_grafana_json.dumps(meta,ensure_ascii=False)));c.commit();c.close()
+ _ntf_audit(req,actor,'Zvuk oznámení nahrán',f'{level}: {name}')
+ return {'ok':True,'level':level,**meta}
+def _snd_delete(level,req,actor):
+ level=_snd_level(level);had=level in _snd_meta()
+ (_SND_DIR/f'{level}.mp3').unlink(missing_ok=True)
+ c=con();c.execute('DELETE FROM notify_settings WHERE key=?',('sound_file_'+level,));c.commit();c.close()
+ if had:_ntf_audit(req,actor,'Zvuk oznámení vrácen na výchozí',level)
+ return {'ok':True,'level':level}
+def _snd_file(level):
+ path=_SND_DIR/f'{_snd_level(level)}.mp3'
+ if not path.is_file():raise HTTPException(404,'Vlastní zvuk není nahraný')
+ return FileResponse(path,media_type='audio/mpeg')
+
+@app.get('/api/notify/sounds')
+def notify_sounds(u=Depends(auth)):return _snd_meta()
+@app.post('/api/notify/sounds/{level}')
+async def notify_sound_upload(level:str,req:Request,file:UploadFile=File(...),u=Depends(auth)):return await _snd_store(level,file,req,u)
+@app.delete('/api/notify/sounds/{level}')
+def notify_sound_delete(level:str,req:Request,u=Depends(auth)):return _snd_delete(level,req,u)
+@app.get('/api/notify/sounds/{level}/file')
+def notify_sound_file(level:str,u=Depends(auth)):return _snd_file(level)
+@app.get('/api/notify/sounds/{level}/overlay')
+def notify_sound_overlay(level:str,req:Request):
+ # the overlay downloads the sound from here (only on the device itself)
+ _local_only(req);return _snd_file(level)
+@app.post('/api/fleet/v1/notify/sounds/{level}')
+async def fleet_notify_sound_upload(level:str,req:Request):
+ # authenticate before the multipart body is parsed
+ _fleet_auth(req);form=await req.form();return await _snd_store(level,form.get('file'),req,_FLEET_ACTOR)
+@app.delete('/api/fleet/v1/notify/sounds/{level}')
+def fleet_notify_sound_delete(level:str,req:Request):
+ _fleet_auth(req);return _snd_delete(level,req,_FLEET_ACTOR)

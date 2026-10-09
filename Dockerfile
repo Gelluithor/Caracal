@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-tk chromium xdotool wmctrl x11-xserver-utils x11-utils alsa-utils \
+      python3 python3-venv python3-tk chromium xdotool wmctrl x11-xserver-utils x11-utils alsa-utils mpg123 \
       fonts-dejavu-core fonts-noto-color-emoji curl ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 

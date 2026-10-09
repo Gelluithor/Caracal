@@ -62,8 +62,15 @@ chime, warning two beeps, critical urgent beeping). In **Notifications → Setti
 A single notification can override the setting with `"sound": true` or `"sound": false` (header `X-Sound: yes/no`);
 `"sound": true` always plays; volume 0 mutes the screen completely. The chime plays when the notification appears, not again when the overlay restarts.
 
+**Custom sounds:** under *Notifications → Custom sounds* (or from CARACAL Fleet) each level can get its own MP3
+instead of the generated chime, at most 5 MB. The overlay downloads it from the app once, converts it with `mpg123`
+to stereo 48 kHz WAV and plays at most 15 s with the volume of the settings. If the file cannot be converted, the
+generated chime plays. *Default* returns to the chime. API (administrator session): `GET /api/notify/sounds`,
+`POST /api/notify/sounds/{level}` (multipart `file`), `GET /api/notify/sounds/{level}/file`,
+`DELETE /api/notify/sounds/{level}`; `level` is `info`, `success`, `warning` or `critical`.
+
 The overlay plays the sound with `aplay` (ALSA), or `paplay` / `pw-play` when those are available. The Docker image
-and `install.sh` install `alsa-utils`. In Docker, the `overlay` service in `docker/compose.yml` gets `/dev/snd` and the
+and `install.sh` install `alsa-utils` and `mpg123`. In Docker, the `overlay` service in `docker/compose.yml` gets `/dev/snd` and the
 host `audio` group (`CARACAL_AUDIO_GID`, 29 on Raspberry Pi OS and Debian). Nodes installed by CARACAL Fleet need this
 compose file too. A TV usually plays HDMI audio only when it is not muted and HDMI audio is enabled on the Raspberry Pi.
 

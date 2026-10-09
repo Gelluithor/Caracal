@@ -27,14 +27,15 @@ def raise_window():
 
 # On-screen notifications. The app owns the queue; GET /api/notify/overlay says what to show right now,
 # so this only animates one notification at a time.
-NOTIFY_URL=os.getenv('CARACAL_BASE','http://127.0.0.1:8080').rstrip('/')+'/api/notify/overlay'
+CARACAL_BASE=os.getenv('CARACAL_BASE','http://127.0.0.1:8080').rstrip('/')
+NOTIFY_URL=CARACAL_BASE+'/api/notify/overlay'
 LEVELS={'info':('ℹ','#3b82f6'),'success':('✓','#22c55e'),'warning':('⚠','#f59e0b'),'critical':('✖','#ef4444')}
 TOAST_BG='#111926';TOAST_FG='#f8fafc';TOAST_MUTED='#94a3b8';ANIM=0.25
 notify_data={}
 
 # Notification sounds: a short chime per level, generated here (no sound files), played with ALSA aplay
 # (or paplay / pw-play). The app decides whether a notification has a sound; volume and device come with it.
-import math,shutil,struct,tempfile,wave
+import array,math,shutil,struct,sys,tempfile,wave
 SOUND_DIR=Path(tempfile.gettempdir())/'caracal-sounds'
 # (frequency Hz, start s, length s) notes per level
 CHIMES={'info':[(880,0,.18),(1175,.14,.32)],'success':[(660,0,.14),(880,.11,.14),(1320,.22,.36)],
@@ -71,14 +72,54 @@ def aplay(path,device):
  r=subprocess.run(['aplay','-q']+(['-D',device] if device else [])+[str(path)],env=ENV,capture_output=True,text=True,timeout=15)
  if r.returncode:print(f"notification sound: aplay {'-D '+device if device else '(default device)'} failed: {(r.stderr or '').strip()[:300]}",flush=True)
  return r.returncode==0
-def play_sound(level,volume,device):
+def custom_sound_file(level,key,volume):
+ # an uploaded MP3: downloaded once, converted to stereo 48 kHz WAV (at most 15 s) and scaled to the volume;
+ # None when it cannot be converted, then the generated chime plays instead
+ path=SOUND_DIR/f'custom-{level}-{key}-{volume}.wav'
+ if path.exists():return path
+ SOUND_DIR.mkdir(parents=True,exist_ok=True)
+ mp3=SOUND_DIR/f'custom-{level}-{key}.mp3';raw=SOUND_DIR/f'custom-{level}-{key}.raw.wav'
+ try:
+  if not mp3.exists():
+   with urllib.request.urlopen(f'{CARACAL_BASE}/api/notify/sounds/{level}/overlay',timeout=20) as response:data=response.read(6*1024**2)
+   tmp=mp3.with_suffix('.part');tmp.write_bytes(data);tmp.replace(mp3)
+  if not raw.exists():
+   for cmd in (['mpg123','-q','-r','48000','--stereo','-n','600','-w',str(raw),str(mp3)],
+               ['ffmpeg','-v','error','-y','-i',str(mp3),'-t','15','-ac','2','-ar','48000','-sample_fmt','s16',str(raw)]):
+    if shutil.which(cmd[0]):
+     r=subprocess.run(cmd,capture_output=True,text=True,timeout=60)
+     if r.returncode==0 and raw.exists():break
+     print('notification sound:',cmd[0],'could not convert the MP3:',(r.stderr or '').strip()[:300],flush=True)
+     raw.unlink(missing_ok=True)
+   if not shutil.which('mpg123') and not shutil.which('ffmpeg'):
+    print('notification sound: install mpg123 to play uploaded MP3 sounds',flush=True)
+  if not raw.exists():return None
+  with wave.open(str(raw)) as w:params=w.getparams();frames=w.readframes(min(w.getnframes(),w.getframerate()*15))
+  if params.sampwidth!=2:return None
+  samples=array.array('h',frames)
+  if sys.byteorder=='big':samples.byteswap()
+  gain=(volume/100)**2   # the same curve as the generated chimes
+  samples=array.array('h',(max(-32768,min(32767,int(x*gain))) for x in samples))
+  if sys.byteorder=='big':samples.byteswap()
+  tmp=path.with_suffix('.tmp')
+  with wave.open(str(tmp),'wb') as out:
+   out.setnchannels(params.nchannels);out.setsampwidth(2);out.setframerate(params.framerate);out.writeframes(samples.tobytes())
+  tmp.replace(path)
+  # older conversions of this level (other volume or a replaced file) are not needed any more
+  for old in SOUND_DIR.glob(f'custom-{level}-*'):
+   if old not in (path,mp3,raw):old.unlink(missing_ok=True)
+  return path
+ except Exception as error:
+  print('notification sound: uploaded sound not usable, playing the default chime:',error,flush=True)
+  return None
+def play_sound(level,volume,device,custom=None):
  def run():
   global sound_device_found
   try:
    volume_pct=max(0,min(100,int(volume)))
-   print('notification sound:',level,f'{volume_pct} %',device or 'automatic output',flush=True)
+   print('notification sound:',level,f'{volume_pct} %',device or 'automatic output','uploaded sound' if custom else 'chime',flush=True)
    if volume_pct==0:return
-   path=sound_file(level,volume_pct)
+   path=(custom_sound_file(level,custom,volume_pct) if custom else None) or sound_file(level,volume_pct)
    if os.name=='nt':
     import winsound;winsound.PlaySound(str(path),winsound.SND_FILENAME);return
    if shutil.which('aplay'):
@@ -173,7 +214,7 @@ def notify_tick(now,bar_height):
  if toast_shown is None and cur:
   toast_build(cur,data);toast_shown=want;toast_phase='in';toast_phase_start=now;toast.update_idletasks();toast_place(data.get('position') or 'top-right',0,bar_height);toast.deiconify()
   # only for a notification that has just appeared, not when the overlay restarts in the middle of one
-  if cur.get('sound') and remaining>=float(cur.get('duration') or 0)-3:play_sound(cur.get('level') or 'info',data.get('volume',70),data.get('sound_device') or '')
+  if cur.get('sound') and remaining>=float(cur.get('duration') or 0)-3:play_sound(cur.get('level') or 'info',data.get('volume',70),data.get('sound_device') or '',(data.get('sounds') or {}).get(cur.get('level') or 'info'))
  elif cur and toast_shown==want and toast_content!=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),int(data.get('waiting') or 0),data.get('scale'),data.get('position')):
   toast_build(cur,data);toast.update_idletasks()   # the sender updated it (same key) or the queue length changed
  if toast_shown is None:return
