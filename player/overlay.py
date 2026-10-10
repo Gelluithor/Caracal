@@ -29,6 +29,12 @@ def raise_window():
 # so this only animates one notification at a time.
 CARACAL_BASE=os.getenv('CARACAL_BASE','http://127.0.0.1:8080').rstrip('/')
 NOTIFY_URL=CARACAL_BASE+'/api/notify/overlay'
+# the app's local endpoints want the key from its data directory (only processes of this device can read it)
+LOCAL_KEY_FILE=os.getenv('CARACAL_LOCAL_KEY_FILE',os.path.join(os.getenv('CARACAL_DATA','/var/lib/caracal'),'local.key'))
+def local_get(url,timeout):
+ try:key=Path(LOCAL_KEY_FILE).read_text().strip()
+ except OSError:key=''
+ return urllib.request.urlopen(urllib.request.Request(url,headers={'X-Caracal-Local':key}),timeout=timeout)
 LEVELS={'info':('ℹ','#3b82f6'),'success':('✓','#22c55e'),'warning':('⚠','#f59e0b'),'critical':('✖','#ef4444')}
 TOAST_BG='#111926';TOAST_FG='#f8fafc';TOAST_MUTED='#94a3b8';ANIM=0.25
 # The look set in the admin UI (Notifications → Look); the app sends it with every poll. These defaults are used
@@ -101,7 +107,7 @@ def custom_sound_file(level,key,volume):
  mp3=SOUND_DIR/f'custom-{level}-{key}.mp3';raw=SOUND_DIR/f'custom-{level}-{key}.raw.wav'
  try:
   if not mp3.exists():
-   with urllib.request.urlopen(f'{CARACAL_BASE}/api/notify/sounds/{level}/overlay',timeout=20) as response:data=response.read(6*1024**2)
+   with local_get(f'{CARACAL_BASE}/api/notify/sounds/{level}/overlay',20) as response:data=response.read(6*1024**2)
    tmp=mp3.with_suffix('.part');tmp.write_bytes(data);tmp.replace(mp3)
   if not raw.exists():
    for cmd in (['mpg123','-q','-r','48000','--stereo','-n','600','-w',str(raw),str(mp3)],
@@ -165,7 +171,7 @@ def poll_notifications():
  global notify_data
  while True:
   try:
-   with urllib.request.urlopen(NOTIFY_URL,timeout=3) as response:data=json.loads(response.read().decode('utf-8'))
+   with local_get(NOTIFY_URL,3) as response:data=json.loads(response.read().decode('utf-8'))
    data['received']=time.monotonic()
   except Exception:data={}
   notify_data=data

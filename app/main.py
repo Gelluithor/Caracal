@@ -13,6 +13,18 @@ if not SF.exists():SF.write_text(secrets.token_urlsafe(48));os.chmod(SF,0o600)
 if not VF.exists():VF.write_bytes(Fernet.generate_key());os.chmod(VF,0o600)
 vault=Fernet(VF.read_bytes());secret=SF.read_text();pwd=CryptContext(schemes=['bcrypt'],deprecated='auto');app=FastAPI(docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static');app.mount('/media',StaticFiles(directory=MEDIA),name='media')
+_UPLOAD_MAX=2*1024**3
+# Security headers: no framing (clickjacking), no MIME sniffing, no referrer, no plugins. The admin UI uses inline
+# event handlers, so scripts keep 'unsafe-inline'; everything else is limited to this origin.
+_SECURITY_HEADERS={'X-Frame-Options':'DENY','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
+ 'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
+ 'Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"}
+@app.middleware('http')
+async def _security_headers(request:Request,call_next):
+ response=await call_next(request)
+ for k,v in _SECURITY_HEADERS.items():response.headers.setdefault(k,v)
+ if request.url.path.startswith('/api/'):response.headers.setdefault('Cache-Control','no-store')
+ return response
 def con():c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
 def init():
  c=con();c.executescript("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE,password_hash TEXT);CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY,name TEXT,kind TEXT,source TEXT,duration INTEGER DEFAULT 30,position INTEGER DEFAULT 0,auth_profile_id INTEGER);CREATE TABLE IF NOT EXISTS auth_profiles(id INTEGER PRIMARY KEY,name TEXT,login_url TEXT,target_url TEXT,username_enc BLOB,password_enc BLOB,user_selector TEXT,pass_selector TEXT,submit_selector TEXT);""");c.commit();c.close()
@@ -29,8 +41,15 @@ if "auth_type" not in [row[1] for row in c.execute("PRAGMA table_info(auth_profi
 c.commit();c.close()
 def _profile_type(value):return 'http' if str(value or '').strip().lower()=='http' else 'form'
 def rows(q,a=()):c=con();r=[dict(x) for x in c.execute(q,a).fetchall()];c.close();return r
+# The player and the overlay prove that they run on this device with a key only processes of this device can read
+# (DATA/local.key, mode 600). The loopback address alone is not enough: a reverse proxy on the same host (as
+# recommended for HTTPS) also connects from 127.0.0.1, and these endpoints return e.g. decrypted website logins.
+_LOCAL_KEY_FILE=DATA/'local.key'
+if not _LOCAL_KEY_FILE.exists():
+ _fd=os.open(_LOCAL_KEY_FILE,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(_fd,secrets.token_urlsafe(32).encode());os.close(_fd)
+_LOCAL_KEY=_LOCAL_KEY_FILE.read_text().strip()
 def _local_only(req:Request):
- if not req.client or req.client.host not in ('127.0.0.1','::1'):raise HTTPException(403)
+ if not req.client or req.client.host not in ('127.0.0.1','::1') or not secrets.compare_digest(req.headers.get('X-Caracal-Local',''),_LOCAL_KEY):raise HTTPException(403)
 def _remove_media(source):
  # deleted images/videos also free their file, unless another item still uses it
  if not str(source or '').startswith('/media/'):return
@@ -90,9 +109,15 @@ def url(name:str=Form(...),source:str=Form(...),duration:int=Form(30),auth_profi
 async def upload(name:str=Form(...),duration:int=Form(15),file:UploadFile=File(...),u=Depends(auth)):
  ext=Path(file.filename or '').suffix.lower();kind='image' if ext in {'.png','.jpg','.jpeg','.webp','.gif'} else 'video' if ext in {'.mp4','.webm','.mkv'} else None
  if not kind:raise HTTPException(400,'Nepodporovaný soubor')
- fn=secrets.token_hex(10)+ext
- with (MEDIA/fn).open('wb') as f:
-  while chunk:=await file.read(1048576):f.write(chunk)
+ fn=secrets.token_hex(10)+ext;size=0
+ try:
+  with (MEDIA/fn).open('wb') as f:
+   while chunk:=await file.read(1048576):
+    size+=len(chunk)
+    if size>_UPLOAD_MAX:raise HTTPException(413,'Soubor je větší než 2 GB')
+    f.write(chunk)
+ except BaseException:
+  (MEDIA/fn).unlink(missing_ok=True);raise
  c=con();p=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0];c.execute('INSERT INTO assets(name,kind,source,duration,position) VALUES(?,?,?,?,?)',(name,kind,'/media/'+fn,max(5,duration),p));c.commit();c.close();return {'ok':1}
 @app.delete('/api/assets/{i}')
 def delete(i:int,u=Depends(auth)):
@@ -108,7 +133,7 @@ def profile(name:str=Form(...),login_url:str=Form(''),target_url:str=Form(...),u
  c=con();c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector,auth_type) VALUES(?,?,?,?,?,?,?,?,?)',(name,login_url,target_url.strip(),vault.encrypt(username.encode()),vault.encrypt(password.encode()),user_selector,pass_selector,submit_selector,auth_type));c.commit();c.close();return {'ok':1}
 @app.get('/api/player/profile/{i}')
 def player_profile(i:int,req:Request):
- if req.client.host not in ('127.0.0.1','::1'):raise HTTPException(403)
+ _local_only(req)
  c=con();r=c.execute('SELECT * FROM auth_profiles WHERE id=?',(i,)).fetchone();c.close()
  if not r:raise HTTPException(404)
  d=dict(r);d['username']=vault.decrypt(d.pop('username_enc')).decode();d['password']=vault.decrypt(d.pop('password_enc')).decode();return d
@@ -307,11 +332,11 @@ def caracal_player_status(u=Depends(auth)):
  state=_caracal_read_state();state["player_online"]=(time.time()-float(state.get("updated") or 0))<8;return state
 @app.get("/api/player/control-state")
 def caracal_player_control_state(req:Request):
- if req.client.host not in ("127.0.0.1","::1"):raise HTTPException(403)
+ _local_only(req)
  state=_caracal_read_state();return {"force_id":state.get("force_id"),"frozen":bool(state.get("frozen"))}
 @app.post("/api/player/heartbeat")
 async def caracal_player_heartbeat(req:Request):
- if req.client.host not in ("127.0.0.1","::1"):raise HTTPException(403)
+ _local_only(req)
  data=await req.json();state=_caracal_read_state()
  for key in ("current_id","current_name","remaining","duration"):
   if key in data:state[key]=data[key]
@@ -355,11 +380,11 @@ def cc2_status(u=Depends(auth)):
  x=_cc2_read();x["player_online"]=(time.time()-float(x.get("updated") or 0))<8;return x
 @app.get("/api/v2/player/command")
 def cc2_command(req:Request):
- if req.client.host not in ("127.0.0.1","::1"):raise HTTPException(403)
+ _local_only(req)
  x=_cc2_read();return {"command_id":x.get("command_id",0),"action":x.get("action",""),"asset_id":x.get("asset_id")}
 @app.post("/api/v2/player/heartbeat")
 async def cc2_heartbeat(req:Request):
- if req.client.host not in ("127.0.0.1","::1"):raise HTTPException(403)
+ _local_only(req)
  d=await req.json();x=_cc2_read()
  for k in ("current_id","current_name","frozen","remaining","duration"):
   if k in d:x[k]=d[k]
@@ -551,7 +576,7 @@ def caracal_live_options_v5(u=Depends(auth)):
 
 @app.get('/api/v5/player/command')
 def caracal_command_v5(req:Request):
-    if req.client.host not in ('127.0.0.1','::1'):raise HTTPException(403)
+    _local_only(req)
     state=_cc2_read();return {'command_id':state.get('v5_command_id',0),'action':state.get('v5_action',''),'item_id':state.get('v5_item_id'),'collection_id':state.get('v5_collection_id')}
 
 @app.post('/api/v5/player/control')
@@ -591,7 +616,7 @@ async def caracal_control_v6(req:Request,u=Depends(auth)):
  return {'ok':True,'command_id':state['v6_command_id']}
 @app.get('/api/v6/player/command')
 def caracal_command_v6(req:Request):
- if req.client.host not in ('127.0.0.1','::1'):raise HTTPException(403)
+ _local_only(req)
  s=_cc2_read();return {'command_id':s.get('v6_command_id',0),'action':s.get('v6_action',''),'item_id':s.get('v6_item_id'),'collection_id':s.get('v6_collection_id'),'restart_id':s.get('restart_player_request',0)}
 
 

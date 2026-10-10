@@ -1,11 +1,16 @@
 import os,time,re,subprocess,requests
 from playwright.sync_api import sync_playwright
 BASE=os.getenv('CARACAL_BASE','http://127.0.0.1:8080');PROFILE=os.getenv('CARACAL_PROFILE','/var/lib/caracal/chromium')
+# the app's local endpoints want the key from its data directory (only processes of this device can read it)
+LOCAL_KEY_FILE=os.getenv('CARACAL_LOCAL_KEY_FILE',os.path.join(os.getenv('CARACAL_DATA','/var/lib/caracal'),'local.key'))
+def local_headers():
+ try:return {'X-Caracal-Local':open(LOCAL_KEY_FILE).read().strip()}
+ except OSError:return {}
 def get(path,default=None):
- try:r=requests.get(BASE+path,timeout=8);r.raise_for_status();return r.json()
+ try:r=requests.get(BASE+path,timeout=8,headers=local_headers());r.raise_for_status();return r.json()
  except Exception as e:print('GET',path,e,flush=True);return default
 def post(path,data):
- try:requests.post(BASE+path,json=data,timeout=5)
+ try:requests.post(BASE+path,json=data,timeout=5,headers=local_headers())
  except Exception as e:print('POST',path,e,flush=True)
 def display_size():
  try:

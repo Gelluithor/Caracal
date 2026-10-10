@@ -107,6 +107,9 @@ compose file too. A TV usually plays HDMI audio only when it is not muted and HD
 - Bodies are limited to 64 KB, titles to 120 and messages to 600 characters; text is shown as plain text.
 - The node serves plain HTTP on port 8080. Outside a trusted network, put it behind a reverse proxy with HTTPS
   (Caddy, Traefik, nginx) so the token is not sent in clear text.
+- The endpoints of the player and the overlay (`/api/notify/overlay`, the player's playlist and logins) accept
+  only requests from this device that carry the key from `/var/lib/caracal/local.key` (created by the app, mode
+  600), so a reverse proxy on the same host does not expose them.
 
 ## Watchers
 
