@@ -86,8 +86,10 @@
 .nse input[type=range]{width:130px;accent-color:var(--accent,#e85d3f)}
 .nse input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent,#e85d3f)}
 .nse-tabs{display:flex;gap:2px;padding:3px;margin-bottom:14px;border-radius:10px;background:color-mix(in srgb,currentColor 8%,transparent);overflow-x:auto}
-.nse-tabs button{flex:1;border:0;background:none;color:inherit;font:inherit;font-size:13px;font-weight:550;padding:6px 10px;border-radius:8px;cursor:pointer;opacity:.7;white-space:nowrap}
+.nse-tabs button{flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;border:0;background:none;color:inherit;font:inherit;font-size:13px;font-weight:550;padding:6px 10px;border-radius:8px;cursor:pointer;opacity:.7;white-space:nowrap}
 .nse-tabs button.on{background:var(--nse-on,#fff);color:#111;opacity:1;box-shadow:0 1px 3px #0002}
+/* the tabs share one fixed-height area (scrolled when longer), so the editor and its dialog keep their size */
+.nse-panes{height:clamp(360px,58vh,540px);overflow-y:auto;overscroll-behavior:contain;padding-right:6px;margin-right:-6px;scrollbar-gutter:stable}
 .nse-pane[hidden]{display:none}
 .nse-presets{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
 .nse-preset{display:grid;gap:6px;padding:8px;border:1px solid color-mix(in srgb,currentColor 15%,transparent);border-radius:10px;background:transparent;color:inherit;font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;text-align:left}
@@ -119,7 +121,9 @@
 .nse-play{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
 @keyframes nse-in{from{opacity:0;translate:var(--from)}}
 .nse-anim{animation:nse-in var(--speed) cubic-bezier(.2,.8,.2,1) both}
-@media (max-width:900px){.nse{grid-template-columns:minmax(0,1fr)}.nse-side{position:static}}`;
+@media (max-width:900px){.nse{grid-template-columns:minmax(0,1fr)}.nse-side{position:static;order:-1}.nse-panes{height:clamp(320px,50vh,520px)}}
+@media (max-width:520px){.nse-tabs button{padding:6px 3px;font-size:12.5px}.nse-presets{grid-template-columns:repeat(2,minmax(0,1fr))}.nse-grid{grid-template-columns:minmax(6.5em,9em) minmax(0,1fr) 3.2em;gap:6px 8px}
+.nse-play{flex-direction:column;align-items:stretch}.nse-play .nse-seg{justify-content:center}.nse-play .nse-row{justify-content:flex-end}}`;
   function injectCss() {
     if (document.getElementById('nse-css')) return;
     const el = document.createElement('style');
@@ -209,6 +213,7 @@
     function controls() {
       return `<div class="nse-controls">
         <div class="nse-tabs" role="tablist">${TABS.map(([id, cs, en]) => `<button type="button" role="tab" aria-selected="${tab === id}" data-tab="${id}" class="${tab === id ? 'on' : ''}">${T(cs, en)}</button>`).join('')}</div>
+        <div class="nse-panes">
         ${pane('style', `
           <h4>${T('Předvolby', 'Presets')}</h4><div class="nse-presets">${Object.entries(PRESETS).map(([key, [cs, en, p]]) => { const x = merge(DEFAULT, p), c = x.levels.warning.color, solid = x.fill === 'solid';
             const bgc = solid ? c : x.gradient !== 'none' ? `linear-gradient(135deg,${x.bg},${x.bg2})` : x.bg;
@@ -249,6 +254,7 @@
           <h4>${T('Příchod a odchod', 'Entrance and exit')}</h4><div class="nse-row">${seg('animation', [['slide', 'Vysunutí', 'Slide'], ['fade', 'Prolnutí', 'Fade'], ['none', 'Žádná', 'None']])}</div>
           ${s.animation !== 'none' ? `<div class="nse-grid">${range('speed', 'Délka', 'Length', 50)}</div>` : ''}
           <p class="nse-note">${T('Na slabších zařízeních zvolte kratší animaci nebo prolnutí.', 'On slower devices choose a shorter animation or the fade.')}</p>`)}
+        </div>
       </div>`;
     }
     function previewHtml(animate) {
@@ -267,7 +273,11 @@
     fit();
     draw(true);
     const changed = () => { draw(false); opts.onChange && opts.onChange(clone(s)); };
-    const sync = () => { el.querySelector('.nse-controls').outerHTML = controls(); bind(); };
+    const sync = (top = true) => {
+      const keep = top ? 0 : (el.querySelector('.nse-panes') || {}).scrollTop || 0;
+      el.querySelector('.nse-controls').outerHTML = controls(); bind();
+      el.querySelector('.nse-panes').scrollTop = keep;
+    };
     // choices that show or hide other controls redraw the panel
     const STRUCTURAL = ['fill', 'gradient', 'image', 'image_pos', 'progress', 'animation'];
     function bind() {
@@ -280,7 +290,7 @@
           if (out) out.textContent = s[k] + unit(k);
           changed();
           if (e.type !== 'change') return;
-          if (STRUCTURAL.includes(k)) sync();
+          if (STRUCTURAL.includes(k)) sync(false);
           if (k === 'image' && s.image && !image && opts.onImage) el.querySelector('[data-file]')?.click();
         };
       });
@@ -292,27 +302,27 @@
           const key = b.parentElement.dataset.seg;
           s[key] = pick(key, b.dataset.v, s[key]);
           changed();
-          if (STRUCTURAL.includes(key)) sync(); else b.parentElement.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+          if (STRUCTURAL.includes(key)) sync(false); else b.parentElement.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
           if (key === 'animation') draw(true);
         };
       });
       const bc = el.querySelector('[data-bc]');
-      if (bc) bc.onchange = () => { s.border_color = bc.checked ? '' : '#ffffff'; changed(); sync(); };
+      if (bc) bc.onchange = () => { s.border_color = bc.checked ? '' : '#ffffff'; changed(); sync(false); };
       el.querySelectorAll('[data-preset]').forEach(b => {
-        b.onclick = () => { s = merge(DEFAULT, PRESETS[b.dataset.preset][2]); sync(); draw(true); opts.onChange && opts.onChange(clone(s)); };
+        b.onclick = () => { s = merge(DEFAULT, PRESETS[b.dataset.preset][2]); sync(false); draw(true); opts.onChange && opts.onChange(clone(s)); };
       });
       const file = el.querySelector('[data-file]'), up = el.querySelector('[data-upload]'), rm = el.querySelector('[data-unimage]');
       if (up) up.onclick = () => file.click();
       if (file) file.onchange = async () => {
         const f = file.files[0];
         if (!f) return;
-        busy = true; sync();
+        busy = true; sync(false);
         try { image = safeUrl(await opts.onImage(f)) || image; s.image = true; opts.onChange && opts.onChange(clone(s)); } catch (e) { /* the caller reports the error */ }
-        busy = false; sync(); draw(true);
+        busy = false; sync(false); draw(true);
       };
       if (rm) rm.onclick = async () => {
         try { await opts.onImageRemove(); image = ''; s.image = false; opts.onChange && opts.onChange(clone(s)); } catch (e) { /* reported by the caller */ }
-        sync(); draw(false);
+        sync(false); draw(false);
       };
     }
     bind();
@@ -329,7 +339,7 @@
     return {
       get: () => clone(s),
       set(v) { s = merge(DEFAULT, v || {}); sync(); draw(true); },
-      setImage(url) { image = safeUrl(url || ''); sync(); draw(false); },
+      setImage(url) { image = safeUrl(url || ''); sync(false); draw(false); },
       setBackground(url) { backdrop = safeUrl(url || ''); draw(false); },
     };
   }
