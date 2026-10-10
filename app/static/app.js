@@ -394,7 +394,9 @@ window.addUrl=async function(){
  window.ntfCopy=async function(button){const text=button.previousElementSibling.textContent;try{await navigator.clipboard.writeText(text)}catch{const area=document.createElement('textarea');area.value=text;document.body.append(area);area.select();document.execCommand('copy');area.remove()}toast(L('Zkopírováno','Copied'))};
  window.ntfHideToken=function(){newToken=null;notifications()};
  window.ntfSaveSettings=async function(){try{await api('/api/notify/settings',send('PUT',{enabled:$('#ntfEnabled').checked,position:$('#ntfPosition').value,duration:Number($('#ntfDuration').value),scale:Number($('#ntfScale').value),max_queue:Number($('#ntfMaxQueue').value),sound:$('#ntfSound').value,volume:Number($('#ntfVolume').value),sound_device:$('#ntfSoundDevice').value.trim(),history_max:Number($('#ntfHistoryMax').value),history_days:Number($('#ntfHistoryDays').value)}));toast(L('Nastavení oznámení uloženo','Notification settings saved'))}catch(e){alert(e.message)}};
- window.ntfTest=function(){modal(L('Testovací oznámení','Test notification'),`<label>${L('Nadpis','Title')}<input name=title value="${esc(L('Test oznámení','Test notification'))}"></label><label>${L('Text','Message')}<input name=message value="${esc(L('Takhle vypadá oznámení na obrazovce.','This is how a notification looks on screen.'))}"></label><label>${L('Úroveň','Level')}<select name=level>${Object.entries(LEVELS).map(([k,v])=>`<option value=${k}>${L(v[0],v[1])}</option>`).join('')}</select></label><label>${L('Doba zobrazení (s, prázdné = výchozí)','Display time (s, empty = default)')}<input name=duration type=number min=3 max=120></label><label>${L('Zvuk','Sound')}<select name=sound><option value=''>${L('Podle nastavení','By the settings')}</option><option value=1>${L('Zahrát','Play')}</option><option value=0>${L('Bez zvuku','Silent')}</option></select></label>`,f=>api('/api/notify/test',send('POST',Object.fromEntries(f.entries()))))};
+ window.ntfTest=function(){modal(L('Testovací oznámení','Test notification'),`<label>${L('Nadpis','Title')}<input name=title value="${esc(L('Test oznámení','Test notification'))}"></label><label>${L('Text','Message')}<input name=message value="${esc(L('Takhle vypadá oznámení na obrazovce.','This is how a notification looks on screen.'))}"></label><label>${L('Úroveň','Level')}<select name=level>${Object.entries(LEVELS).map(([k,v])=>`<option value=${k}>${L(v[0],v[1])}</option>`).join('')}</select></label><label>${L('Doba zobrazení (s, prázdné = výchozí)','Display time (s, empty = default)')}<input name=duration type=number min=3 max=120></label><label>${L('Zvuk','Sound')}<select name=sound><option value=''>${L('Podle nastavení','By the settings')}</option><option value=1>${L('Zahrát','Play')}</option><option value=0>${L('Bez zvuku','Silent')}</option></select></label>`
+  +`<label>${L('Obrázek','Picture')}<select name=image><option value=''>${L('Podle vzhledu','As in the look')}</option><option value=none>${L('Bez obrázku','No picture')}</option><option value=left>${L('Vlevo','Left')}</option><option value=right>${L('Vpravo','Right')}</option><option value=top>${L('Nahoře','Top')}</option><option value=bottom>${L('Dole','Bottom')}</option><option value=background>${L('Jako pozadí','As background')}</option></select></label>`
+  +`<label>${L('Velikost obrázku (%, prázdné = podle vzhledu)','Picture size (%, empty = as in the look)')}<input name=image_size type=number min=10 max=60 step=5></label>`,f=>api('/api/notify/test',send('POST',Object.fromEntries(f.entries()))))};
  window.ntfClearHistory=async function(){if(!confirm(L('Smazat celou historii oznámení? Čekající oznámení zůstanou.','Delete the whole notification history? Waiting notifications stay.')))return;const r=await api('/api/notify/history/clear',{method:'POST'});toast(L('Smazáno záznamů: ','Entries deleted: ')+r.deleted);ntfRefreshQueue()};
  window.ntfSkip=async function(){await api('/api/notify/skip',{method:'POST'});ntfRefreshQueue()};
  window.ntfRemove=async function(id){await api('/api/notify/queue/'+id,{method:'DELETE'});ntfRefreshQueue()};
@@ -549,10 +551,14 @@ window.addUrl=async function(){
 (function(){
  const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
  const send=(method,body)=>({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
- let editor=null;
+ let editor=null,picture=null;
  function mount(s){
   const el=document.getElementById('ntfLookEditor');if(!el||!window.NotifyStyle)return;
-  editor=NotifyStyle.editor(el,editor?editor.get():s.style,{t:L,position:document.getElementById('ntfPosition')?.value||s.position,scale:Number(document.getElementById('ntfScale')?.value||s.scale)});
+  const image=picture&&picture.sha256?'/api/notify/image/file?v='+picture.sha256.slice(0,12):'';
+  editor=NotifyStyle.editor(el,editor?editor.get():s.style,{t:L,position:document.getElementById('ntfPosition')?.value||s.position,scale:Number(document.getElementById('ntfScale')?.value||s.scale),image,
+   onImage:async file=>{if(file.size>5*1048576){alert(L('Obrázek je větší než 5 MB.','The picture is larger than 5 MB.'));throw Error('size')}const fd=new FormData();fd.append('file',file);try{picture=await api('/api/notify/image',{method:'POST',body:fd})}catch(e){alert(e.message);throw e}toast(L('Obrázek nahrán – uložte vzhled','Picture uploaded – save the look'));return '/api/notify/image/file?v='+picture.sha256.slice(0,12)},
+   onImageRemove:async()=>{if(!confirm(L('Odebrat obrázek oznámení?','Remove the notification picture?')))throw Error('cancel');await api('/api/notify/image',{method:'DELETE'});picture=null},
+   capture:()=>window.caracalScreenshot()});
  }
  window.ntfLookSave=async function(){if(!editor)return;try{await api('/api/notify/settings',send('PUT',{style:editor.get()}));toast(L('Vzhled oznámení uložen – na obrazovce se projeví s dalším oznámením','Notification look saved – the screen uses it with the next notification'))}catch(e){alert(e.message)}};
  window.ntfLookReset=function(){if(editor)editor.set(NotifyStyle.DEFAULT)};
@@ -560,11 +566,56 @@ window.addUrl=async function(){
  window.notifications=async function(){
   await notificationsBeforeLook();if(document.getElementById('ntfLook'))return;
   const settings=document.getElementById('ntfEnabled')?.closest('.panel');if(!settings||!window.NotifyStyle)return;
-  const s=await api('/api/notify/settings');editor=null;
+  const s=await api('/api/notify/settings');editor=null;picture=await api('/api/notify/image').catch(()=>null);
   settings.insertAdjacentHTML('afterend',`<div class=panel id=ntfLook><div class=panel-head><h2>${L('Vzhled oznámení','Notification look')}</h2><div class=toolbar><button class=secondary onclick=ntfTest()>${L('Poslat test','Send test')}</button><button class=secondary onclick=ntfLookReset()>${L('Výchozí','Default')}</button><button class=primary onclick=ntfLookSave()>${L('Uložit vzhled','Save look')}</button></div></div>`
-   +`<div class=ntf-body><p class=muted>${L('Barvy, ikony, tvar, písmo, šířka a animace oznámení na televizi. Náhled vpravo odpovídá obrazovce 1920 × 1080 s pozicí a velikostí z nastavení výše; po uložení to zkuste tlačítkem Poslat test.','Colours, icons, shape, font, width and animation of the notifications on the TV. The preview matches a 1920 × 1080 screen with the position and size set above; after saving, try it with Send test.')}</p><div id=ntfLookEditor></div></div></div>`);
+   +`<div class=ntf-body><p class=muted>${L('Barvy, tvar, průhlednost, obrázek, písmo a animace oznámení na televizi. Náhled odpovídá obrazovce 1920 × 1080 s pozicí a velikostí z nastavení výše; tlačítkem Skutečná obrazovka ho uvidíte nad tím, co televize právě ukazuje.','Colours, shape, transparency, picture, font and animation of the notifications on the TV. The preview matches a 1920 × 1080 screen with the position and size set above; Real screen shows it over what the TV shows right now.')}</p><div id=ntfLookEditor></div></div></div>`);
   mount(s);
   // the preview follows the position and size while they are being changed above
   for(const id of ['ntfPosition','ntfScale'])document.getElementById(id)?.addEventListener('change',()=>mount(s));
+ };
+})();
+
+// "Na obrazovce": a picture of what the TV really shows (page, countdown and notifications), taken by the overlay
+// on the device when asked. window.caracalScreenshot() -> Promise<URL of the new picture>.
+(function(){
+ const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
+ window.caracalScreenshot=async function(){
+  const {id}=await api('/api/screenshot',{method:'POST'});const until=Date.now()+20000;
+  while(Date.now()<until){
+   await new Promise(r=>setTimeout(r,700));
+   const s=await api('/api/screenshot');
+   if(s.id===id){if(s.error)throw Error(s.error);return '/api/screenshot.jpg?t='+Math.round(s.taken*1000)}
+  }
+  throw Error(L('Obrazovka neodpověděla. Běží overlay (služba caracal-overlay)?','The screen did not answer. Is the overlay running (caracal-overlay service)?'));
+ };
+ const ago=t=>{const s=Math.max(0,Math.round(Date.now()/1000-t));return s<60?L('před chvílí','just now'):s<3600?L(`před ${Math.round(s/60)} min`,`${Math.round(s/60)} min ago`):new Date(t*1000).toLocaleString()};
+ let auto=null;
+ const screenHidden=()=>{try{return localStorage.getItem('caracal-screen-hidden')==='1'}catch{return false}};
+ window.screenToggle=function(){const p=document.getElementById('screenPanel');if(!p)return;const hide=!p.classList.contains('screen-hidden');p.classList.toggle('screen-hidden',hide);try{localStorage.setItem('caracal-screen-hidden',hide?'1':'0')}catch{}document.getElementById('screenToggle').textContent=hide?L('Zobrazit','Show'):L('Skrýt','Hide');if(hide)window.screenAuto(false),p.querySelector('.screen-auto input').checked=false};
+ window.screenRefresh=async function(){
+  if(screenHidden())window.screenToggle();
+  const box=document.getElementById('screenShot');if(!box)return;const btn=document.getElementById('screenBtn'),note=document.getElementById('screenNote');
+  btn.disabled=true;btn.textContent=L('Snímám…','Capturing…');
+  try{const url=await window.caracalScreenshot();const img=new Image();img.onload=()=>{box.replaceChildren(img);box.classList.add('has')};img.src=url;img.alt=L('Obrazovka zařízení','Device screen');note.textContent=L('Snímek ','Captured ')+ago(Date.now()/1000)}
+  catch(e){note.textContent=e.message}
+  finally{btn.disabled=false;btn.textContent=L('Obnovit','Refresh')}
+ };
+ window.screenAuto=function(on){clearInterval(auto);auto=null;if(on)auto=setInterval(()=>{if(!document.getElementById('screenShot'))return window.screenAuto(false);if(!document.hidden)window.screenRefresh()},10000)};
+ async function panel(){
+  let info={};try{info=await api('/api/screenshot')}catch{}
+  const has=info.taken&&info.id;
+  const hidden=screenHidden();
+  return `<div class="panel${hidden?' screen-hidden':''}" id=screenPanel><div class=panel-head><h2>${L('Na obrazovce','On screen')}</h2><div class=toolbar><label class=screen-auto><input type=checkbox onchange=screenAuto(this.checked)> ${L('Obnovovat každých 10 s','Refresh every 10 s')}</label><button class=primary id=screenBtn onclick=screenRefresh()>${has?L('Obnovit','Refresh'):L('Zobrazit obrazovku','Show the screen')}</button><button class=secondary id=screenToggle onclick=screenToggle()>${hidden?L('Zobrazit','Show'):L('Skrýt','Hide')}</button></div></div>`
+   +`<div class=screen-body><div id=screenShot class="screen-shot${has?' has':''}">${has?`<img src="/api/screenshot.jpg?t=${Math.round(info.taken*1000)}" alt="">`:`<span>${L('Snímek toho, co televize právě ukazuje – stránka, odpočet i oznámení.','A picture of what the TV shows right now – the page, the countdown and notifications.')}</span>`}</div><div class="muted" id=screenNote>${has?L('Snímek ','Captured ')+ago(info.taken):''}</div></div></div>`;
+ }
+ const css=document.createElement('style');
+ css.textContent='.screen-body{padding:0 18px 18px}.screen-shot{aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:#0b1018;display:grid;place-items:center;color:#94a3b8;font-size:14px;text-align:center;padding:0}.screen-shot span{max-width:32em;padding:20px}.screen-shot img{width:100%;height:100%;object-fit:contain;display:block}#screenNote{margin-top:8px;font-size:13px}.screen-auto{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500}#screenPanel.screen-hidden .screen-body,#screenPanel.screen-hidden .screen-auto,#screenPanel.screen-hidden #screenBtn{display:none}#screenPanel.screen-hidden .panel-head{border-bottom:0}';
+ document.head.append(css);
+ const dashboardBeforeScreen=window.dashboard;
+ window.dashboard=async function(){
+  await dashboardBeforeScreen();if(document.getElementById('screenPanel'))return;
+  const live=document.querySelector('#content .panel');if(!live)return;
+  // at the very end of the overview; hidden it keeps only its title bar (remembered in this browser)
+  (document.getElementById('content')||live.parentElement).insertAdjacentHTML('beforeend',await panel());
  };
 })();

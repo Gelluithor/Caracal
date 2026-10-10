@@ -41,6 +41,15 @@ Open `http://<device-ip>:8080` and create the administrator. Running `install.sh
 the data in `/var/lib/caracal` are kept. To remove CARACAL: `sudo bash uninstall.sh` (`--purge` also removes the
 data).
 
+### Small boards (Raspberry Pi 4 with 1 GB)
+
+CARACAL runs on a Raspberry Pi 4 with 1 GB of memory. On boards with up to 1.5 GB the player starts Chromium in its
+low-end mode (fewer renderer processes, smaller caches, no background services) and restarts the browser between
+two items when memory runs out; the countdown overlay draws at 30 frames per second. The installation (also the
+one by CARACAL Fleet) turns on compressed swap in memory (zram) on boards with up to 2 GB. `CARACAL_LOW_MEMORY=1`
+or `0` forces the mode on or off, `CARACAL_CHROMIUM_FLAGS` adds Chromium options, `CARACAL_OVERLAY_FPS` sets the
+overlay frame rate. Very heavy dashboards still need memory: prefer fewer panels per dashboard on 1 GB boards.
+
 ## Data
 
 Everything is stored in `/var/lib/caracal`: database, media, encrypted login profiles, player state and the

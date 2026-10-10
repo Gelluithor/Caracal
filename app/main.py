@@ -486,6 +486,22 @@ import urllib.parse as _grafana_urlparse
 import urllib.request as _grafana_urlrequest
 import ssl as _grafana_ssl
 
+# The player asks for the expanded playlist every few seconds; Grafana is asked at most once a minute per collection
+# and a short outage keeps the last known dashboards instead of emptying the playlist.
+import threading as _grafana_threading
+_GRAFANA_CACHE={};_GRAFANA_TTL=60;_GRAFANA_LOCK=_grafana_threading.Lock()
+def _grafana_cached(base_url,tag,max_age=_GRAFANA_TTL):
+ key=(str(base_url or '').rstrip('/'),str(tag or ''))
+ hit=_GRAFANA_CACHE.get(key)
+ if hit and time.time()-hit[0]<max_age:return hit[1]
+ with _GRAFANA_LOCK:
+  hit=_GRAFANA_CACHE.get(key)
+  if hit and time.time()-hit[0]<max_age:return hit[1]
+  try:return _grafana_discover(*key)
+  except HTTPException:
+   if hit:_GRAFANA_CACHE[key]=(time.time()-max_age+15,hit[1]);return hit[1]   # stale, tried again in 15 s
+   raise
+
 def _grafana_discover(base_url, tag):
  base=base_url.rstrip('/')
  query=_grafana_urlparse.urlencode({'tag':tag,'type':'dash-db','limit':5000})
@@ -500,6 +516,8 @@ def _grafana_discover(base_url, tag):
  for item in data:
   if item.get('type')!='dash-db' or not item.get('url'):continue
   dashboards.append({'title':item.get('title') or item.get('uid') or 'Grafana dashboard','url':base+item['url']})
+ if len(_GRAFANA_CACHE)>200:_GRAFANA_CACHE.clear()
+ _GRAFANA_CACHE[(base,str(tag or ''))]=(time.time(),dashboards)
  return dashboards
 
 @app.post('/api/assets/grafana-tag')
@@ -527,7 +545,7 @@ def expanded_player_playlist():
    output.append(asset);continue
   try:
    config=_grafana_json.loads(asset.get('source') or '{}')
-   discovered=_grafana_discover(config.get('grafana_url',''),config.get('tag',''))
+   discovered=_grafana_cached(config.get('grafana_url',''),config.get('tag',''))
    for index,dashboard in enumerate(discovered):
     separator='&' if '?' in dashboard['url'] else '?'
     url=dashboard['url']
@@ -711,13 +729,26 @@ def _fleet_grafana_config(d,current=None):
  if not tag:raise HTTPException(400,'Tag must not be empty')
  return {'grafana_url':url,'tag':tag,'kiosk':bool(d.get('kiosk',current.get('kiosk',True)))}
 
+def _fleet_collections():
+ # the dashboards of each Grafana collection, so CARACAL Fleet can show or freeze a single one
+ out=[]
+ for asset in rows("SELECT id,name,source FROM assets WHERE kind='grafana-tag' ORDER BY position,id"):
+  item={'id':asset['id'],'name':asset['name'],'dashboards':[]}
+  try:
+   config=_grafana_json.loads(asset.get('source') or '{}')
+   for index,dashboard in enumerate(_grafana_cached(config.get('grafana_url',''),config.get('tag',''))[:500]):
+    item['dashboards'].append({'id':int(asset['id'])*100000+index,'name':dashboard['title'],'source':dashboard['url']})
+  except Exception as error:item['error']=str(getattr(error,'detail',error))[:300]
+  out.append(item)
+ return out
 @app.get('/api/fleet/v1/snapshot')
 def fleet_snapshot(req:Request):
  _fleet_auth(req);state=_cc2_read();state['player_online']=(time.time()-float(state.get('updated') or 0))<8
  player={k:state.get(k) for k in ('current_id','current_name','frozen','collection_frozen','collection_id','remaining','duration','updated','player_online')}
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
  return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications(),
-  'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))}}
+  'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))},
+  'collections':_fleet_collections(),'screenshot':_shot_info()}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -858,20 +889,30 @@ _NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'
 # a solid colour or a border), the font, the width (100 = a banner across the screen), opacity, what is shown and the
 # animation. Edited visually in the admin UI (and in CARACAL Fleet) by static/notify-style.js.
 import json as _ntf_json
+# With Pillow the overlay draws the notification as a picture (player/notify_render.py), which adds rounded corners,
+# a gradient, see-through or blurred (glass) background, a shadow, a border colour, an uploaded picture and sizes.
 _NTF_STYLE={'bg':'#111926','title':'#f8fafc','text':'#cbd5e1','muted':'#94a3b8','fill':'stripe','stripe':100,'font':'DejaVu Sans','bold':True,
- 'opacity':96,'width':0,'align':'left','icon':True,'source':True,'waiting':True,'progress':True,'animation':'slide','speed':250,
+ 'opacity':100,'width':0,'align':'left','icon':True,'source':True,'waiting':True,'progress':True,'animation':'slide','speed':250,
+ 'radius':14,'bg2':'#111926','gradient':'none','bg_opacity':100,'blur':0,'shadow':40,'border_color':'','stripe_pos':'left',
+ 'image':False,'image_pos':'left','image_size':25,'image_align':'center','image_shape':'rounded','image_dim':45,'title_size':100,'text_size':100,'padding':100,'margin':100,
+ 'progress_pos':'bottom','progress_size':100,
  'levels':{'info':{'color':'#3b82f6','icon':'ℹ'},'success':{'color':'#22c55e','icon':'✓'},'warning':{'color':'#f59e0b','icon':'⚠'},'critical':{'color':'#ef4444','icon':'✖'}}}
-_NTF_STYLE_CHOICES={'fill':('stripe','solid','border'),'font':('DejaVu Sans','DejaVu Serif','DejaVu Sans Mono'),'align':('left','center'),'animation':('slide','fade','none')}
-_NTF_STYLE_RANGES={'stripe':(0,300),'opacity':(50,100),'width':(0,100),'speed':(100,1500)}
+_NTF_STYLE_CHOICES={'fill':('stripe','solid','border'),'font':('DejaVu Sans','DejaVu Serif','DejaVu Sans Mono'),'align':('left','center'),'animation':('slide','fade','none'),
+ 'gradient':('none','vertical','horizontal','diagonal'),'stripe_pos':('left','right','top','bottom'),'image_pos':('left','right','top','bottom','background'),'image_align':('top','center','bottom'),'image_shape':('square','rounded','circle'),'progress_pos':('bottom','top')}
+_NTF_STYLE_RANGES={'stripe':(0,300),'opacity':(50,100),'width':(0,100),'speed':(100,1500),'radius':(0,60),'bg_opacity':(0,100),'blur':(0,100),'shadow':(0,100),
+ 'image_size':(10,60),'image_dim':(0,90),'title_size':(50,250),'text_size':(50,250),'padding':(50,250),'margin':(0,300),'progress_size':(50,400)}
 def _ntf_style(d,base=None):
  # missing keys keep the base (the stored look); raises ValueError with what is wrong
  out=_ntf_json.loads(_ntf_json.dumps(base or _NTF_STYLE))
  if not isinstance(d,dict):raise ValueError('vzhled musí být objekt')
  color=lambda v:isinstance(v,str) and _ntf_re.fullmatch(r'#[0-9a-fA-F]{6}',v)
- for k in ('bg','title','text','muted'):
+ for k in ('bg','title','text','muted','bg2'):
   if k in d:
    if not color(d[k]):raise ValueError(f'{k}: barva ve tvaru #RRGGBB')
    out[k]=d[k].lower()
+ if 'border_color' in d:   # '' = the colour of the level
+  if d['border_color'] not in ('',None) and not color(d['border_color']):raise ValueError('border_color: barva ve tvaru #RRGGBB nebo prázdné')
+  out['border_color']=(d['border_color'] or '').lower()
  for k,choices in _NTF_STYLE_CHOICES.items():
   if k in d:
    if d[k] not in choices:raise ValueError(f"{k}: {', '.join(choices)}")
@@ -882,7 +923,7 @@ def _ntf_style(d,base=None):
    except (TypeError,ValueError):raise ValueError(f'{k}: číslo')
    if not lo<=v<=hi or (k=='width' and 0<v<20):raise ValueError(f'{k}: {lo}–{hi}'+(' (0 = automaticky, jinak 20–100)' if k=='width' else ''))
    out[k]=v
- for k in ('bold','icon','source','waiting','progress'):
+ for k in ('bold','icon','source','waiting','progress','image'):
   if k in d:out[k]=bool(d[k])
  levels=d.get('levels') or {}
  if not isinstance(levels,dict):raise ValueError('levels: objekt')
@@ -914,6 +955,8 @@ CREATE INDEX IF NOT EXISTS notifications_queue ON notifications(done,priority,id
 CREATE TABLE IF NOT EXISTS notify_settings(key TEXT PRIMARY KEY,value TEXT);""")
 # notifications.sound: NULL = by the sound setting, 0 = silent, 1 = always
 if 'sound' not in [r[1] for r in c.execute('PRAGMA table_info(notifications)').fetchall()]:c.execute('ALTER TABLE notifications ADD COLUMN sound INTEGER')
+# notifications.look: JSON with the picture of this one notification ({"image": false} or a place and size), NULL = the look
+if 'look' not in [r[1] for r in c.execute('PRAGMA table_info(notifications)').fetchall()]:c.execute('ALTER TABLE notifications ADD COLUMN look TEXT')
 c.commit();c.close()
 # notifications.done: 0 waiting or on screen, 1 shown, 2 dropped or expired, 3 removed by the administrator
 
@@ -931,6 +974,28 @@ def _ntf_level(value,default='info'):
  if v in _NTF_WARNING:return 'warning'
  if v in _NTF_SUCCESS:return 'success'
  return 'info' if v in ('info','information','notice','low','min','default','1','2','3') else default
+def _ntf_picture(d,headers=None):
+ # per-notification picture: image = none | left | right | top | bottom | background (or true/false), image_size 10-60 %;
+ # None when the notification does not say (the look decides)
+ headers=headers or {}
+ value=d.get('image') if 'image' in d else headers.get('x-image')
+ size=d.get('image_size') if 'image_size' in d else headers.get('x-image-size')
+ if value in (None,'') and size in (None,''):return None
+ out={}
+ if value not in (None,''):
+  v=str(value).strip().lower()
+  if isinstance(value,bool) or v in ('true','false','1','0','yes','no','on','off','default'):
+   if v!='default':out['image']=v in ('true','1','yes','on')
+  elif v in ('none','hide','hidden'):out['image']=False
+  elif v in _NTF_STYLE_CHOICES['image_pos']:out.update(image=True,image_pos=v)
+  else:raise HTTPException(400,'image: none, left, right, top, bottom or background')
+ if size not in (None,''):
+  try:n=int(float(size))
+  except (TypeError,ValueError):raise HTTPException(400,'image_size: 10 to 60')
+  lo,hi=_NTF_STYLE_RANGES['image_size']
+  if not lo<=n<=hi:raise HTTPException(400,f'image_size: {lo} to {hi}')
+  out['image_size']=n
+ return _ntf_json.dumps(out) if out else None
 def _ntf_sound(value):
  # per-notification override: true / false, or None for the screen's sound setting
  if value is None or value=='':return None
@@ -951,7 +1016,7 @@ def _ntf_item(d,headers=None):
  message=_ntf_text(next((d[k] for k in ('message','text','body','msg','description','content') if d.get(k) not in (None,'')),''),600)
  if not title and not message:raise HTTPException(400,'Notification needs a title or a message')
  level=_ntf_level(d.get('level') or d.get('severity') or d.get('priority') or d.get('type') or headers.get('x-level') or headers.get('priority') or headers.get('x-priority'))
- return {'title':title,'message':message,'level':level,'key':_ntf_text(d.get('key') or d.get('dedup_key') or d.get('tag') or headers.get('x-key'),200) or None,'duration':_ntf_duration(d.get('duration') or headers.get('x-duration')),'source':_ntf_text(d.get('source') or d.get('app'),60) or None,'sound':_ntf_sound(d['sound'] if 'sound' in d else headers.get('x-sound'))}
+ return {'title':title,'message':message,'level':level,'key':_ntf_text(d.get('key') or d.get('dedup_key') or d.get('tag') or headers.get('x-key'),200) or None,'duration':_ntf_duration(d.get('duration') or headers.get('x-duration')),'source':_ntf_text(d.get('source') or d.get('app'),60) or None,'sound':_ntf_sound(d['sound'] if 'sound' in d else headers.get('x-sound')),'look':_ntf_picture(d,headers)}
 
 def _ntf_from_alerts(p):
  # Grafana alerting and Prometheus Alertmanager webhooks
@@ -1022,7 +1087,7 @@ def _ntf_enqueue(token_id,source,items):
     if it['key']:
      row=c.execute('SELECT id FROM notifications WHERE done=0 AND key=? AND COALESCE(token_id,0)=? ORDER BY id DESC LIMIT 1',(it['key'],token_id or 0)).fetchone()
      if row:
-      c.execute('UPDATE notifications SET title=?,message=?,level=?,priority=?,source=?,duration=MAX(duration,?) WHERE id=?',(it['title'],it['message'],it['level'],priority,src,duration,row['id']))
+      c.execute('UPDATE notifications SET title=?,message=?,level=?,priority=?,source=?,duration=MAX(duration,?),look=? WHERE id=?',(it['title'],it['message'],it['level'],priority,src,duration,it.get('look'),row['id']))
       result['updated']+=1;result['ids'].append(row['id']);continue
     own=c.execute('SELECT COUNT(*) FROM notifications WHERE done=0 AND shown_at IS NULL AND COALESCE(token_id,0)=?',(token_id or 0,)).fetchone()[0]
     if own>=_NTF_PER_SOURCE and not _ntf_evict(c,priority,token_id or 0):result['dropped']+=1;continue
@@ -1030,7 +1095,7 @@ def _ntf_enqueue(token_id,source,items):
     waiting=lambda:c.execute('SELECT COUNT(*) FROM notifications WHERE done=0 AND shown_at IS NULL').fetchone()[0]
     while waiting()>=s['max_queue'] and _ntf_evict(c,priority):pass
     if waiting()>=s['max_queue']:result['dropped']+=1;continue
-    q=c.execute('INSERT INTO notifications(token_id,source,title,message,level,priority,key,duration,created,sound) VALUES(?,?,?,?,?,?,?,?,?,?)',(token_id,src,it['title'],it['message'],it['level'],priority,it['key'],duration,now,it.get('sound')))
+    q=c.execute('INSERT INTO notifications(token_id,source,title,message,level,priority,key,duration,created,sound,look) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(token_id,src,it['title'],it['message'],it['level'],priority,it['key'],duration,now,it.get('sound'),it.get('look')))
     result['queued']+=1;result['ids'].append(q.lastrowid)
    c.commit()
   finally:c.close()
@@ -1101,8 +1166,11 @@ def notify_overlay(req:Request):
  current=None
  if cur and s['enabled']:
   current={k:cur[k] for k in ('id','title','message','level','source','duration')};current['remaining']=max(0.0,cur['shown_at']+cur['duration']-now)
+  try:current['look']=_ntf_json.loads(cur['look']) if cur['look'] else {}
+  except (ValueError,IndexError,KeyError):current['look']={}
   current['sound']=cur['sound']==1 or (cur['sound']!=0 and (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
- return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'sounds':{k:v['sha256'][:16] for k,v in _snd_meta().items()},'style':s['style'],'current':current,'waiting':waiting}
+ return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'sounds':{k:v['sha256'][:16] for k,v in _snd_meta().items()},'style':s['style'],'current':current,'waiting':waiting,
+  'image':(_img_meta().get('sha256') or '')[:16],'screenshot':_shot_pending()}
 
 # administration
 @app.get('/api/notify/settings')
@@ -1477,7 +1545,7 @@ def _fleet_notifications():
  current=rows('SELECT title,message,level FROM notifications WHERE done=0 AND shown_at IS NOT NULL AND shown_at+duration>? LIMIT 1',(time.time(),))
  return {'settings':_ntf_settings(),'waiting':waiting,'current':current[0] if current else None,
   'watchers':rows(f'SELECT {_WCH_COLUMNS} FROM notify_watchers ORDER BY name COLLATE NOCASE,id'),
-  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n'],'sounds':_snd_meta(),
+  'tokens':rows('SELECT COUNT(*) AS n FROM notify_tokens WHERE enabled=1')[0]['n'],'sounds':_snd_meta(),'image':_img_meta(),
   # the queue (not the messages of the history: those stay on the node and are fetched on demand)
   'queue':[{**x,'title':_ntf_text(x['title'],120),'message':_ntf_text(x['message'],200)} for x in rows('SELECT id,source,title,message,level,priority,created FROM notifications WHERE done=0 AND shown_at IS NULL ORDER BY priority DESC,id LIMIT 30')],
   'history_count':rows('SELECT COUNT(*) AS n FROM notifications WHERE done>0')[0]['n'],
@@ -1580,6 +1648,114 @@ async def fleet_notify_sound_upload(level:str,req:Request):
 @app.delete('/api/fleet/v1/notify/sounds/{level}')
 def fleet_notify_sound_delete(level:str,req:Request):
  _fleet_auth(req);return _snd_delete(level,req,_FLEET_ACTOR)
+
+
+# CARACAL_NOTIFY_IMAGE_V1
+# A picture for the notification look (a logo, a photo, a background): PNG, JPEG, GIF or WebP up to 5 MB, stored as
+# DATA/notify-image (details in notify_settings 'image_file'). Shown when the look has 'image' on; the overlay
+# downloads it once per version (the overlay poll carries the first 16 characters of its SHA-256).
+_IMG_FILE=DATA/'notify-image';_IMG_MAX=5*1024**2
+_IMG_TYPES=((b'\x89PNG\r\n\x1a\n','image/png'),(b'\xff\xd8\xff','image/jpeg'),(b'GIF87a','image/gif'),(b'GIF89a','image/gif'))
+def _img_type(head):
+ for magic,kind in _IMG_TYPES:
+  if head.startswith(magic):return kind
+ return 'image/webp' if head[:4]==b'RIFF' and head[8:12]==b'WEBP' else ''
+def _img_meta():
+ r=rows("SELECT value FROM notify_settings WHERE key='image_file'")
+ if not r or not _IMG_FILE.is_file():return {}
+ try:return _grafana_json.loads(r[0]['value'])
+ except ValueError:return {}
+async def _img_store(upload,req,actor):
+ if upload is None or not hasattr(upload,'read'):raise HTTPException(400,'Chybí soubor')
+ name=_ntf_text(Path(upload.filename or 'obrazek').name,120) or 'obrazek'
+ tmp=DATA/'notify-image.part';size=0;digest=_snd_hashlib.sha256();kind=''
+ try:
+  with tmp.open('wb') as f:
+   while chunk:=await upload.read(1048576):
+    if not size:
+     kind=_img_type(chunk[:16])
+     if not kind:raise HTTPException(400,'Obrázek musí být PNG, JPEG, GIF nebo WebP')
+    size+=len(chunk)
+    if size>_IMG_MAX:raise HTTPException(413,'Obrázek může mít nejvýš 5 MB')
+    digest.update(chunk);f.write(chunk)
+  if not size:raise HTTPException(400,'Prázdný soubor')
+  tmp.replace(_IMG_FILE)
+ finally:tmp.unlink(missing_ok=True)
+ meta={'name':name,'size':size,'type':kind,'sha256':digest.hexdigest(),'uploaded':time.time()}
+ c=con();c.execute("INSERT OR REPLACE INTO notify_settings(key,value) VALUES('image_file',?)",(_grafana_json.dumps(meta,ensure_ascii=False),));c.commit();c.close()
+ _ntf_audit(req,actor,'Obrázek oznámení nahrán',name)
+ return {'ok':True,**meta}
+def _img_delete(req,actor):
+ had=bool(_img_meta());_IMG_FILE.unlink(missing_ok=True)
+ c=con();c.execute("DELETE FROM notify_settings WHERE key='image_file'");c.commit();c.close()
+ if had:_ntf_audit(req,actor,'Obrázek oznámení odebrán','')
+ return {'ok':True}
+def _img_file():
+ meta=_img_meta()
+ if not meta:raise HTTPException(404,'Obrázek není nahraný')
+ return FileResponse(_IMG_FILE,media_type=meta.get('type') or 'application/octet-stream',headers={'Cache-Control':'no-cache'})
+@app.get('/api/notify/image')
+def notify_image(u=Depends(auth)):return _img_meta()
+@app.post('/api/notify/image')
+async def notify_image_upload(req:Request,file:UploadFile=File(...),u=Depends(auth)):return await _img_store(file,req,u)
+@app.delete('/api/notify/image')
+def notify_image_delete(req:Request,u=Depends(auth)):return _img_delete(req,u)
+@app.get('/api/notify/image/file')
+def notify_image_file(u=Depends(auth)):return _img_file()
+@app.get('/api/notify/image/overlay')
+def notify_image_overlay(req:Request):
+ _local_only(req);return _img_file()
+@app.post('/api/fleet/v1/notify/image')
+async def fleet_notify_image_upload(req:Request):
+ _fleet_auth(req);form=await req.form();return await _img_store(form.get('file'),req,_FLEET_ACTOR)
+@app.delete('/api/fleet/v1/notify/image')
+def fleet_notify_image_delete(req:Request):
+ _fleet_auth(req);return _img_delete(req,_FLEET_ACTOR)
+
+
+# CARACAL_SCREENSHOT_V1
+# What the TV shows right now. The admin UI (or CARACAL Fleet) asks for a picture; the overlay, which runs on the
+# device's display, sees the request in its next poll (about a second), reads the whole screen (page, countdown and
+# notifications) and uploads a JPEG here. Kept as DATA/screenshot.jpg until the next one.
+import asyncio as _shot_asyncio
+_SHOT_FILE=DATA/'screenshot.jpg';_SHOT_MAX=8*1024**2;_SHOT_WAIT=60
+_shot={'request':'','requested':0.0,'id':'','taken':0.0,'error':''}
+def _shot_info():
+ info={k:_shot[k] for k in ('request','requested','id','taken','error')}
+ if not info['taken'] and _SHOT_FILE.is_file():info['taken']=_SHOT_FILE.stat().st_mtime   # after a restart
+ info['pending']=bool(_shot_pending())
+ return info
+def _shot_pending():
+ return _shot['request'] if _shot['request'] and _shot['request']!=_shot['id'] and time.time()-_shot['requested']<_SHOT_WAIT else ''
+def _shot_request():
+ if not _shot_pending():_shot.update(request=secrets.token_hex(6),requested=time.time(),error='')
+ return _shot['request']
+@app.post('/api/screenshot')
+def screenshot_request(u=Depends(auth)):return {'ok':True,'id':_shot_request()}
+@app.get('/api/screenshot')
+def screenshot_info(u=Depends(auth)):return _shot_info()
+@app.get('/api/screenshot.jpg')
+def screenshot_file(u=Depends(auth)):
+ if not _SHOT_FILE.is_file():raise HTTPException(404,'Zatím žádný snímek obrazovky')
+ return FileResponse(_SHOT_FILE,media_type='image/jpeg',headers={'Cache-Control':'no-store'})
+@app.post('/api/screenshot/upload')
+async def screenshot_upload(req:Request,id:str='',error:str=''):
+ _local_only(req)
+ if not id or id!=_shot['request']:raise HTTPException(409,'Snímek nebyl vyžádán')
+ if error:_shot.update(id=id,error=_ntf_text(error,300));return {'ok':True}
+ body=await req.body()
+ if len(body)>_SHOT_MAX or body[:3]!=b'\xff\xd8\xff':raise HTTPException(400,'Očekává se JPEG')
+ tmp=_SHOT_FILE.with_suffix('.part');tmp.write_bytes(body);tmp.replace(_SHOT_FILE)
+ _shot.update(id=id,taken=time.time(),error='')
+ return {'ok':True}
+@app.post('/api/fleet/v1/screenshot')
+async def fleet_screenshot(req:Request):
+ # asks for a picture and waits for it (up to 15 s); answers the JPEG itself
+ _fleet_auth(req);request=_shot_request();deadline=time.time()+15
+ while time.time()<deadline and _shot['id']!=request:await _shot_asyncio.sleep(.25)
+ if _shot['id']!=request:raise HTTPException(504,'The screen did not answer; is the overlay running (caracal-overlay)?')
+ if _shot['error']:raise HTTPException(409,_shot['error'])
+ return FileResponse(_SHOT_FILE,media_type='image/jpeg',headers={'Cache-Control':'no-store'})
 
 
 # CARACAL_FLEET_PARITY_V1

@@ -1,14 +1,30 @@
-import json,time,tkinter as tk,subprocess,os,threading,urllib.request
+import base64,json,time,tkinter as tk,subprocess,os,sys,threading,urllib.request
 from pathlib import Path
 STATE=Path('/var/lib/caracal/player-control-v2.json')
 ENV=dict(os.environ,DISPLAY=':0',XAUTHORITY='/home/caracal/.Xauthority')
-FPS=50
+def total_ram_mb():
+ try:
+  for line in open('/proc/meminfo'):
+   if line.startswith('MemTotal:'):return int(line.split()[1])//1024
+ except (OSError,ValueError):pass
+ return 0
+# fewer frames on small boards (Raspberry Pi with 1-2 GB): the countdown still moves smoothly
+FPS=int(os.getenv('CARACAL_OVERLAY_FPS') or (30 if 0<total_ram_mb()<=2048 else 50))
 FRAME_MS=max(10,round(1000/FPS))
+# notifications drawn as one picture (rounded, translucent, gradients, pictures); without Pillow the plain Tk look
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+try:import notify_render
+except Exception as error:
+ notify_render=None;print('notification overlay: Pillow not available, notifications use the plain look:',error,flush=True)
 root=tk.Tk(className='CaracalOverlay')
 root.withdraw();root.overrideredirect(True);root.attributes('-topmost',True);root.attributes('-alpha',0.92)
 root.configure(bg='#080d14');root.title('CARACAL Progress')
 canvas=tk.Canvas(root,highlightthickness=0,borderwidth=0,bg='#111827')
 canvas.pack(fill='both',expand=True)
+# the countdown bar is two rectangles that only move (no redrawing of the whole canvas every frame)
+bar_track=canvas.create_rectangle(0,0,0,0,fill='#111827',outline='')
+bar_fill=canvas.create_rectangle(0,0,0,0,fill='#e85d3f',outline='')
+bar_geometry='';bar_color='#e85d3f';bar_fill_width=-1
 last_raise=0
 last_remaining=None
 last_duration=None
@@ -16,9 +32,11 @@ last_state_update=0.0
 smoothed_progress=0.0
 last_frame=time.monotonic()
 
+last_lift=0.0
 def raise_window():
- global last_raise
- root.deiconify();root.lift();root.attributes('-topmost',True)
+ global last_raise,last_lift
+ if root.state()!='normal':root.deiconify()
+ if time.monotonic()-last_lift>.25:root.lift();root.attributes('-topmost',True);last_lift=time.monotonic()
  if time.time()-last_raise>1:
   try:
    subprocess.run(['wmctrl','-i','-r',str(root.winfo_id()),'-b','add,above,sticky,skip_taskbar'],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -43,9 +61,12 @@ STYLE={'bg':TOAST_BG,'title':TOAST_FG,'text':'#cbd5e1','muted':TOAST_MUTED,'fill
  'opacity':96,'width':0,'align':'left','icon':True,'source':True,'waiting':True,'progress':True,'animation':'slide','speed':250,
  'levels':{k:{'icon':v[0],'color':v[1]} for k,v in LEVELS.items()}}
 toast_style=STYLE
-def style_of(data):
+PICTURE_KEYS=('image','image_pos','image_size')
+def style_of(data,cur=None):
+ # the look, and the picture choice of the notification itself (where, how big or none) when it has one
  st=data.get('style') if isinstance(data.get('style'),dict) else {}
- out={**STYLE,**{k:v for k,v in st.items() if k!='levels'}}
+ look=(cur or {}).get('look') if isinstance((cur or {}).get('look'),dict) else {}
+ out={**STYLE,**{k:v for k,v in st.items() if k!='levels'},**{k:v for k,v in look.items() if k in PICTURE_KEYS}}
  out['levels']={k:{**STYLE['levels'][k],**((st.get('levels') or {}).get(k) or {})} for k in STYLE['levels']}
  return out
 def on_color(hex_color):
@@ -167,6 +188,43 @@ def play_sound(level,volume,device,custom=None):
   except Exception as error:print('notification sound error',error,flush=True)
  threading.Thread(target=run,daemon=True).start()
 
+def local_post(url,body,content_type,timeout):
+ try:key=Path(LOCAL_KEY_FILE).read_text().strip()
+ except OSError:key=''
+ request=urllib.request.Request(url,data=body,method='POST',headers={'X-Caracal-Local':key,'Content-Type':content_type})
+ return urllib.request.urlopen(request,timeout=timeout)
+
+# A picture of the screen when the admin UI or Fleet asks for one (the app passes the request id with the poll):
+# what the TV really shows, page, countdown bar and notifications included.
+screenshot_done=None
+def take_screenshot(request_id):
+ global screenshot_done
+ screenshot_done=request_id
+ try:
+  data=notify_render.screenshot() if notify_render else None
+  url=f'{CARACAL_BASE}/api/screenshot/upload?id={urllib.request.quote(str(request_id))}'
+  if data:
+   with local_post(url,data,'image/jpeg',20):pass
+  else:
+   error='Pillow is missing (install python3-pil)' if not notify_render else 'the screen could not be read (X display)'
+   with local_post(url+'&error='+urllib.request.quote(error),b'','application/octet-stream',10):pass
+ except Exception as error:print('screenshot error',error,flush=True)
+
+# The picture uploaded in the notification look; downloaded once per version.
+notify_picture=None;notify_picture_key=None
+def fetch_picture(key):
+ global notify_picture,notify_picture_key
+ notify_picture_key=key
+ if not key or not notify_render:notify_picture=None;return
+ try:
+  import io
+  with local_get(f'{CARACAL_BASE}/api/notify/image/overlay',10) as response:raw=response.read(6*1024**2)
+  img=notify_render.Image.open(io.BytesIO(raw));img.load()
+  img.thumbnail((900,900))
+  notify_picture=img.convert('RGBA')
+ except Exception as error:
+  notify_picture=None;print('notification picture not usable:',error,flush=True)
+
 def poll_notifications():
  global notify_data
  while True:
@@ -174,7 +232,9 @@ def poll_notifications():
    with local_get(NOTIFY_URL,3) as response:data=json.loads(response.read().decode('utf-8'))
    data['received']=time.monotonic()
   except Exception:data={}
+  if data.get('image','')!=notify_picture_key and data:fetch_picture(data.get('image') or '')
   notify_data=data
+  if data.get('screenshot') and data.get('screenshot')!=screenshot_done:take_screenshot(data['screenshot'])
   time.sleep(1)
 toast=tk.Toplevel(root,bg=TOAST_BG);toast.withdraw();toast.overrideredirect(True);toast.attributes('-topmost',True);toast.title('CARACAL Notification')
 stripe=tk.Frame(toast,width=10,bg=LEVELS['info'][1]);stripe.pack(side='left',fill='y')
@@ -192,9 +252,10 @@ def toast_build(cur,data):
  # (re)fill the notification window; sizes follow the screen height and the scale set in the admin UI,
  # colours, shape, font, width and what is shown follow the look (style)
  global toast_content,toast_width,toast_style
- st=toast_style=style_of(data)
+ st=toast_style=style_of(data,cur)
  sw=root.winfo_screenwidth();sh=root.winfo_screenheight();scale=max(.5,min(3,float(data.get('scale') or 100)/100))
- title_px=max(14,int(sh/38*scale));text_px=max(11,int(sh/54*scale));small_px=max(10,int(sh/72*scale));pad=max(10,int(sh/70*scale))
+ k=lambda key:max(.3,min(3,float(st.get(key) or 100)/100))
+ title_px=max(14,int(sh/38*scale*k('title_size')));text_px=max(11,int(sh/54*scale*k('text_size')));small_px=max(10,int(sh/72*scale));pad=max(10,int(sh/70*scale*k('padding')))
  width=int(st.get('width') or 0)
  toast_width=int(sw*width/100) if width else int(min(sw*.9,max(320,sw*(.42 if data.get('position') in ('top','bottom','center') else .32)*scale)))
  lv=st['levels'].get(cur.get('level')) or st['levels']['info'];color=lv['color'];waiting=int(data.get('waiting') or 0)
@@ -224,13 +285,13 @@ def toast_build(cur,data):
  if st['progress']:
   toast_bar.config(height=max(3,int(pad*.35)),bg='#000000' if solid else mix(st['bg'],st['muted'],.25));toast_bar.itemconfig(toast_bar_fill,fill=fg if solid else color);toast_bar.pack(side='bottom',fill='x')
  else:toast_bar.pack_forget()
- toast_content=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),waiting,data.get('scale'),data.get('position'),json.dumps(data.get('style'),sort_keys=True))
+ toast_content=content_key(cur,data)
 
 def toast_place(position,progress,bar_height):
  # progress 0..1 of the slide/fade animation; bottom positions stay above the countdown bar
  global toast_geometry
  sw=root.winfo_screenwidth();sh=root.winfo_screenheight();w=toast_width;h=toast.winfo_reqheight()
- banner=int(toast_style.get('width') or 0)>=100;m=0 if banner else int(min(sw,sh)*.035)
+ banner=int(toast_style.get('width') or 0)>=100;m=0 if banner else int(min(sw,sh)*.035*float(toast_style.get('margin') or 100)/100)
  x=sw-w-m if position.endswith('right') else m if position.endswith('left') else (sw-w)//2
  y=m if position.startswith('top') else sh-h-m-bar_height if position.startswith('bottom') else (sh-h)//2
  offset=0 if toast_style.get('animation')!='slide' else int((1-progress)*max(30,w*.15))
@@ -246,8 +307,69 @@ def toast_place(position,progress,bar_height):
  try:toast.attributes('-alpha',max(.5,min(1.0,float(toast_style.get('opacity') or 96)/100))*max(0.0,min(1.0,progress)))
  except Exception:pass
 
+# The picture look: the notification is drawn by notify_render into a picture of the screen area it covers
+# (taken just before it appears), so it can be rounded, translucent, blurred or have a shadow without a compositor.
+# Animations are pictures blended between the screen and the notification, made when first needed.
+itoast=tk.Toplevel(root,bg='#000000');itoast.withdraw();itoast.overrideredirect(True);itoast.attributes('-topmost',True);itoast.title('CARACAL Notification')
+icanvas=tk.Canvas(itoast,highlightthickness=0,borderwidth=0,bg='#000000');icanvas.pack(fill='both',expand=True)
+icanvas_image=icanvas.create_image(0,0,anchor='nw');icanvas_bar=icanvas.create_rectangle(0,0,0,0,outline='',width=0)
+img_toast=None   # {'box','background','picture','frames','bar','bar_color','anim','last'} of the shown notification
+toast_mode='tk';toast_hidden_at=0.0;picture_failed=False
+
+def photo(img):
+ return tk.PhotoImage(data=base64.b64encode(notify_render.png(img)).decode('ascii'))
+
+def img_build(cur,data,background=None):
+ # returns False when the screen cannot be read: the plain Tk look is used instead
+ global img_toast,toast_style,toast_content,picture_failed
+ st=toast_style=style_of(data,cur)
+ sw=root.winfo_screenwidth();sh=root.winfo_screenheight()
+ bar_height=int(data.get('bar_height_px') or 0)
+ picture=notify_picture if st.get('image') else None
+ g=notify_render.layout(cur,{**data,'bar_height':bar_height},st,sw,sh,picture)
+ box=notify_render.window_box(g,sw,sh)
+ if background is None or background.size!=(box[2]-box[0],box[3]-box[1]):
+  background=notify_render.grab(box)
+  if background is None:
+   if not picture_failed:print('notification overlay: the screen cannot be read, notifications use the plain look',flush=True)
+   picture_failed=True;return False
+ rendered,bar,color,track=notify_render.render(cur,data,st,g,box,background,picture)
+ w,h=box[2]-box[0],box[3]-box[1]
+ itoast.geometry(f'{w}x{h}+{box[0]}+{box[1]}');icanvas.config(width=w,height=h)
+ final=photo(rendered)
+ icanvas.itemconfig(icanvas_image,image=final)
+ if bar:icanvas.itemconfig(icanvas_bar,fill=color)
+ edge='right' if (data.get('position') or 'top-right').endswith('right') else 'left' if (data.get('position') or '').endswith('left') else 'top' if (data.get('position') or 'top').startswith('top') else 'bottom' if (data.get('position') or '').startswith('bottom') else ''
+ img_toast={'box':box,'background':background,'rendered':rendered,'final':final,'frames':{},'bar':bar,'edge':edge,'shown':None,
+  'shift':max(30,int(g['w']*.15)) if edge in ('left','right') else max(20,int(g['h']*.3))}
+ toast_content=content_key(cur,data)
+ return True
+
+def img_frame(t):
+ # the picture at animation point t (0 hidden .. 1 shown), cached in steps of 1/12
+ step=max(0,min(12,round(t*12)))
+ if step==12:return img_toast['final']
+ if step not in img_toast['frames']:
+  bg=img_toast['background'];out=img_toast['rendered'];a=step/12
+  if toast_style.get('animation')=='slide':
+   d=int((1-a)*img_toast['shift']);dx,dy={'right':(d,0),'left':(-d,0),'top':(0,-d),'bottom':(0,d)}.get(img_toast['edge'],(0,0))
+   moved=bg.copy();moved.paste(out,(dx,dy));out=moved
+  img_toast['frames'][step]=photo(notify_render.Image.blend(bg,out,a))
+ return img_toast['frames'][step]
+
+def img_place(progress,remaining,duration):
+ frame=img_frame(progress)
+ if img_toast['shown'] is not frame:icanvas.itemconfig(icanvas_image,image=frame);img_toast['shown']=frame
+ bar=img_toast['bar']
+ if bar and progress>=1 and duration:
+  x0,y0,x1,y1=bar;icanvas.coords(icanvas_bar,x0,y0,x0+int((x1-x0)*max(0.0,min(1.0,remaining/duration))),y1)
+ else:icanvas.coords(icanvas_bar,0,0,0,0)
+
+def content_key(cur,data):
+ return (cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),int(data.get('waiting') or 0),data.get('scale'),data.get('position'),json.dumps(data.get('style'),sort_keys=True),data.get('image'),json.dumps(cur.get('look'),sort_keys=True))
+
 def notify_tick(now,bar_height):
- global toast_shown,toast_phase,toast_phase_start,toast_raise
+ global toast_shown,toast_phase,toast_phase_start,toast_raise,toast_mode,toast_hidden_at
  data=notify_data;cur=data.get('current') if data.get('enabled') else None
  remaining=0.0
  if cur:
@@ -257,49 +379,78 @@ def notify_tick(now,bar_height):
  anim=0.0 if toast_style.get('animation')=='none' else max(.1,min(1.5,float(toast_style.get('speed') or 250)/1000))
  if toast_shown is not None and want!=toast_shown:
   if toast_phase!='out':toast_phase='out';toast_phase_start=now
-  if now-toast_phase_start>=anim:toast.withdraw();toast_shown=None;toast_phase='hidden';toast_content_reset()
+  if now-toast_phase_start>=anim:toast.withdraw();itoast.withdraw();toast_shown=None;toast_phase='hidden';toast_content_reset();toast_hidden_at=now
  if toast_shown is None and cur:
-  toast_build(cur,data);toast_shown=want;toast_phase='in';toast_phase_start=now;toast.update_idletasks();toast_place(data.get('position') or 'top-right',0,bar_height);toast.deiconify()
+  # the picture look reads the screen: give the page under a notification that has just gone time to repaint
+  if notify_render and not picture_failed and now-toast_hidden_at<.25:return
+  toast_mode='tk'
+  if notify_render and not picture_failed:
+   try:
+    if img_build(cur,{**data,'bar_height_px':bar_height}):toast_mode='img'
+   except Exception as error:print('notification picture error, using the plain look:',error,flush=True)
+  if toast_mode=='img':
+   img_place(0,0,0);itoast.deiconify()
+  else:
+   toast_build(cur,data);toast.update_idletasks();toast_place(data.get('position') or 'top-right',0,bar_height);toast.deiconify()
+  toast_shown=want;toast_phase='in';toast_phase_start=now
   # only for a notification that has just appeared, not when the overlay restarts in the middle of one
   if cur.get('sound') and remaining>=float(cur.get('duration') or 0)-3:play_sound(cur.get('level') or 'info',data.get('volume',70),data.get('sound_device') or '',(data.get('sounds') or {}).get(cur.get('level') or 'info'))
- elif cur and toast_shown==want and toast_content!=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),int(data.get('waiting') or 0),data.get('scale'),data.get('position'),json.dumps(data.get('style'),sort_keys=True)):
-  toast_build(cur,data);toast.update_idletasks()   # the sender updated it (same key) or the queue length changed
+ elif cur and toast_shown==want and toast_content!=content_key(cur,data):
+  # the sender updated it (same key) or the queue length changed; the picture look keeps the screen it read
+  if toast_mode=='img':
+   try:img_build(cur,{**data,'bar_height_px':bar_height},img_toast['background'])
+   except Exception as error:print('notification picture error',error,flush=True)
+  else:toast_build(cur,data);toast.update_idletasks()
  if toast_shown is None:return
  t=1.0 if not anim else min(1.0,(now-toast_phase_start)/anim)
  progress=1-(1-t)**3 if toast_phase=='in' else 1-t*t if toast_phase=='out' else 1.0
  if toast_phase=='in' and t>=1:toast_phase='shown'
- toast_place(data.get('position') or 'top-right',progress,bar_height)
- if cur:
-  width=toast_bar.winfo_width();toast_bar.coords(toast_bar_fill,0,0,int(width*max(0.0,min(1.0,remaining/max(1.0,float(cur.get('duration') or 1))))),20)
- toast.lift();toast.attributes('-topmost',True)
+ window=itoast if toast_mode=='img' else toast
+ if toast_mode=='img':img_place(progress,remaining,max(1.0,float(cur.get('duration') or 1)) if cur else 0)
+ else:
+  toast_place(data.get('position') or 'top-right',progress,bar_height)
+  if cur:
+   width=toast_bar.winfo_width();toast_bar.coords(toast_bar_fill,0,0,int(width*max(0.0,min(1.0,remaining/max(1.0,float(cur.get('duration') or 1))))),20)
+ if toast_phase!='shown' or time.time()-toast_raise>.25:window.lift();window.attributes('-topmost',True)
  if time.time()-toast_raise>1:
-  try:subprocess.run(['wmctrl','-i','-r',str(toast.winfo_id()),'-b','add,above,sticky,skip_taskbar'],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  try:subprocess.run(['wmctrl','-i','-r',str(window.winfo_id()),'-b','add,above,sticky,skip_taskbar'],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   except Exception:pass
   toast_raise=time.time()
 def toast_content_reset():
- global toast_content,toast_geometry
- toast_content=None;toast_geometry=''
+ global toast_content,toast_geometry,img_toast
+ toast_content=None;toast_geometry='';img_toast=None
 threading.Thread(target=poll_notifications,daemon=True).start()
 
+state_cache={};state_read=0.0
 def read_state():
- try:return json.loads(STATE.read_text(encoding='utf-8'))
- except Exception:return {}
+ # the player rewrites this file once a second; reading it a few times a second is enough
+ global state_cache,state_read
+ now=time.monotonic()
+ if now-state_read>=.2:
+  state_read=now
+  try:state_cache=json.loads(STATE.read_text(encoding='utf-8'))
+  except Exception:state_cache={}
+ return state_cache
 
 def tick():
- global last_remaining,last_duration,last_state_update,smoothed_progress,last_frame
+ global last_remaining,last_duration,last_state_update,smoothed_progress,last_frame,bar_geometry,bar_color,bar_fill_width
  now=time.monotonic();dt=max(0.001,min(0.1,now-last_frame));last_frame=now
  d=read_state();enabled=bool(d.get('overlay_enabled',True));online=time.time()-float(d.get('updated') or 0)<8
  try:height=max(2,min(160,int(d.get('overlay_size',8))))
  except Exception:height=8
  if not enabled or not online:
-  root.withdraw();last_remaining=None;last_duration=None;last_state_update=now
+  if root.state()!='withdrawn':root.withdraw()
+  last_remaining=None;last_duration=None;last_state_update=now
  else:
   width=root.winfo_screenwidth();y=root.winfo_screenheight()-height
-  root.geometry(f'{width}x{height}+0+{y}');root.update_idletasks();canvas.config(width=width,height=height);canvas.delete('all')
-  canvas.create_rectangle(0,0,width,height,fill='#111827',outline='')
+  geometry=f'{width}x{height}+0+{y}'
+  if geometry!=bar_geometry:
+   root.geometry(geometry);root.update_idletasks();canvas.config(width=width,height=height);canvas.coords(bar_track,0,0,width,height);bar_geometry=geometry;bar_fill_width=-1
   frozen=bool(d.get('frozen'));collection=bool(d.get('collection_frozen'))
+  color='#7c3aed' if collection else '#e85d3f'
+  if color!=bar_color:canvas.itemconfig(bar_fill,fill=color);bar_color=color
   if frozen or collection:
-   smoothed_progress=1.0;color='#7c3aed' if collection else '#e85d3f';canvas.create_rectangle(0,0,width,height,fill=color,outline='')
+   smoothed_progress=1.0;fill=width
   else:
    try:duration=max(1.0,float(d.get('duration') or 1));remaining=max(0.0,float(d.get('remaining') or 0))
    except Exception:duration=1.0;remaining=0.0
@@ -315,7 +466,7 @@ def tick():
    smoothed_progress += (target-smoothed_progress)*smoothing
    if smoothed_progress>0.999 or remaining<=0:smoothed_progress=1.0
    fill=max(2,int(width*smoothed_progress))
-   canvas.create_rectangle(0,0,fill,height,fill='#e85d3f',outline='')
+  if fill!=bar_fill_width:canvas.coords(bar_fill,0,0,fill,height);bar_fill_width=fill
   raise_window()
  try:notify_tick(now,height if enabled and online else 0)
  except Exception as error:print('notification overlay error',error,flush=True)

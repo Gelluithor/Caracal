@@ -52,23 +52,45 @@ Old entries are removed once a minute. API: `POST /api/notify/history/clear`, `G
 
 How notifications look on the TV is set visually in **Notifications → Notification look**, with a live preview of a
 1920 × 1080 screen that uses the position and size from the settings (CARACAL Fleet has the same editor under
-*Notifications → Notification look* of a device, also for many devices at once). Start from a preset (CARACAL,
-Light, Vivid, Minimal, High contrast, Full-width banner) and change what you like:
+*Notifications → Notification look* of a device, also for many devices at once). **Real screen** puts the preview
+over a picture of what the TV shows right now. Start from a preset (CARACAL, Glass, Light, Vivid, Dusk, Minimal,
+High contrast, Full-width banner, With picture) and change what you like, in five tabs:
 
-- **Colours** of the background, the title, the text and the details (sender, `+N`),
-- **a colour and an icon per level** (up to 3 characters such as ⚠ ✖ ✓ ℹ ★; colour emoji are refused because the
-  overlay draws with Tk, which cannot show them on X11),
-- **shape**: a stripe on the left, a solid background in the level colour (the text turns white or black,
-  whichever reads better) or a border, with its thickness,
-- **width**: automatic or 30–100 % of the screen; 100 % is a banner across the screen at the edge,
-- **alignment** (left or centre), **opacity** (50–100 %), **font** (DejaVu Sans, Serif or Sans Mono, the fonts
-  installed on the node) and a bold or regular title,
-- **what is shown**: the icon, the sender, the number of waiting notifications, the countdown line,
-- **animation**: slide in, fade or none, and its speed.
+- **Style**: colours of the background, the title, the text and the details (sender, `+N`), a flat background or a
+  gradient (down, across, diagonal) with a second colour, and **a colour and an icon per level** (up to 3
+  characters such as ⚠ ✖ ✓ ℹ ★; no colour emoji),
+- **Shape**: a stripe (left, right, top or bottom), a solid background in the level colour (the text turns white or
+  black, whichever reads better) or a border (in the level colour or your own), its thickness, **rounded corners**,
+  a **shadow**, **transparency** (opacity of the background, **blur behind it** for a glass look, opacity of the
+  whole notification), the width (automatic, 25–100 %; 100 % is a banner across the screen), padding and the
+  distance from the edge of the screen,
+- **Picture**: one uploaded picture (PNG, JPEG, GIF or WebP up to 5 MB – a logo, an icon or a photo) shown on the
+  left, on the right, on top or as the background (dimmed), with its size,
+- **Text**: the font (DejaVu Sans, Serif or Sans Mono), a bold or regular title, alignment, the size of the title
+  and of the text, what is shown (icon, sender, number waiting, countdown) and where the countdown line is,
+- **Motion**: slide in, fade or none, and its length.
 
-Rounded corners are not possible: the notification is an X11 window. The look is stored with the other settings
-(`style` in `GET/PUT /api/notify/settings` and `PUT /api/fleet/v1/notify/settings`; missing keys keep their value)
-and used from the next notification on.
+The overlay draws a notification as one picture (`player/notify_render.py`, Pillow – package `python3-pil`). The
+X display of a node has no compositing window manager, so a window itself cannot be rounded or see-through: the
+overlay reads the part of the screen the notification will cover just before it appears and draws the notification
+into that picture. A see-through or blurred background therefore shows the screen as it was at that moment (a video
+under the notification does not move there). Without Pillow, or when the screen cannot be read, the overlay keeps
+the plain look (no rounding, transparency or picture).
+
+The look is stored with the other settings (`style` in `GET/PUT /api/notify/settings` and
+`PUT /api/fleet/v1/notify/settings`; missing keys keep their value, looks saved by older versions get the new keys'
+defaults) and used from the next notification on. The picture: `GET/POST/DELETE /api/notify/image` (multipart
+`file`), `GET /api/notify/image/file`; CARACAL Fleet: `POST/DELETE /api/fleet/v1/notify/image`.
+
+## What the screen shows
+
+**Overview → On screen** (and *On screen* on the device page in CARACAL Fleet) shows a picture of the TV: the page,
+the countdown bar and the notification, exactly as on the screen. The overlay sees the request in its next poll
+(about a second), reads the whole screen and uploads a JPEG (at most 1280 px wide) to the app, which keeps the last
+one in `DATA/screenshot.jpg`. API: `POST /api/screenshot` asks for one (`{id}`), `GET /api/screenshot` says when it
+arrived (`{request, id, taken, error, pending}`), `GET /api/screenshot.jpg` is the picture; CARACAL Fleet:
+`POST /api/fleet/v1/screenshot` asks and answers the JPEG (up to 15 s). Only the overlay of the device itself can
+upload (`POST /api/screenshot/upload`, local key) and only when a picture was asked for.
 
 ## Sound
 

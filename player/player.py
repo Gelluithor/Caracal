@@ -3,15 +3,49 @@ from playwright.sync_api import sync_playwright
 BASE=os.getenv('CARACAL_BASE','http://127.0.0.1:8080');PROFILE=os.getenv('CARACAL_PROFILE','/var/lib/caracal/chromium')
 # the app's local endpoints want the key from its data directory (only processes of this device can read it)
 LOCAL_KEY_FILE=os.getenv('CARACAL_LOCAL_KEY_FILE',os.path.join(os.getenv('CARACAL_DATA','/var/lib/caracal'),'local.key'))
+_local_key=None
 def local_headers():
- try:return {'X-Caracal-Local':open(LOCAL_KEY_FILE).read().strip()}
- except OSError:return {}
+ global _local_key
+ if not _local_key:
+  try:_local_key=open(LOCAL_KEY_FILE).read().strip()
+  except OSError:return {}
+ return {'X-Caracal-Local':_local_key}
+# one kept-alive connection to the app instead of a new one for every request (several a second)
+session=requests.Session()
 def get(path,default=None):
- try:r=requests.get(BASE+path,timeout=8,headers=local_headers());r.raise_for_status();return r.json()
+ global _local_key
+ try:
+  r=session.get(BASE+path,timeout=8,headers=local_headers())
+  if r.status_code==403:_local_key=None   # the key was created again (fresh data directory)
+  r.raise_for_status();return r.json()
  except Exception as e:print('GET',path,e,flush=True);return default
 def post(path,data):
- try:requests.post(BASE+path,json=data,timeout=5,headers=local_headers())
+ try:session.post(BASE+path,json=data,timeout=5,headers=local_headers())
  except Exception as e:print('POST',path,e,flush=True)
+def meminfo():
+ out={}
+ try:
+  for line in open('/proc/meminfo'):
+   key,value=line.split(':',1);out[key]=int(value.split()[0])//1024
+ except (OSError,ValueError):pass
+ return out
+# Small boards (Raspberry Pi 4 with 1 GB): Chromium in its low-end mode with fewer renderer processes, and a
+# browser restart between two items when memory runs out (long-running dashboards slowly take more).
+TOTAL_MB=meminfo().get('MemTotal',0)
+LOW_MEMORY=os.getenv('CARACAL_LOW_MEMORY','auto').lower() in ('1','true','yes') or (os.getenv('CARACAL_LOW_MEMORY','auto').lower()=='auto' and 0<TOTAL_MB<=1536)
+def chromium_args(w,h):
+ args=['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}','--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox',
+  # nothing a signage screen needs: background downloads, updates of components, sync, extensions, translation
+  '--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','--disable-default-apps','--disable-breakpad',f'--disk-cache-size={32 if LOW_MEMORY else 64}000000']
+ features=['Translate','MediaRouter','OptimizationHints','AutofillServerCommunication','CalculateNativeWinOcclusion']
+ if LOW_MEMORY:
+  args+=['--enable-low-end-device-mode','--renderer-process-limit=2','--process-per-site']
+  features+=['site-per-process','IsolateOrigins','BackForwardCache']
+ args.append('--disable-features='+','.join(features))
+ return args+[x for x in os.getenv('CARACAL_CHROMIUM_FLAGS','').split() if x.startswith('--')]
+def memory_low():
+ m=meminfo();total=m.get('MemTotal',0);available=m.get('MemAvailable',total)
+ return bool(total) and available<max(80,total*.08)
 def display_size():
  try:
   out=subprocess.check_output(['xrandr','--current'],text=True);m=re.search(r' connected(?: primary)? (\d+)x(\d+)\+',out)
@@ -22,12 +56,14 @@ def display_size():
 # emulate a viewport: it then resizes the window to the viewport and current Chromium versions leave fullscreen
 # for that, which showed the page in an ordinary window on Docker nodes (Debian Chromium).
 CDP=None
-def fullscreen():
+def fullscreen(check_only=False):
+ # check_only (the periodic check): the window manager is only called when Chromium is not fullscreen
  if CDP is not None:
   try:
    wid=CDP.send('Browser.getWindowForTarget')['windowId']
    if CDP.send('Browser.getWindowBounds',{'windowId':wid})['bounds'].get('windowState')!='fullscreen':
     CDP.send('Browser.setWindowBounds',{'windowId':wid,'bounds':{'windowState':'fullscreen'}});print('Chromium window switched to fullscreen',flush=True)
+   elif check_only:return
   except Exception as e:print('fullscreen',e,flush=True)
  # the window manager is told as well (EWMH); wmctrl changes at most two properties per call
  env=dict(os.environ,DISPLAY=':0',XAUTHORITY='/home/caracal/.Xauthority')
@@ -134,18 +170,23 @@ def show(page,a):
   auto_accept_all_cookies(page)
  elif a['kind']=='image':page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><img src="{BASE+a["source"]}" style="width:100vw;height:100vh;object-fit:contain"></body>')
  else:page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><video src="{BASE+a["source"]}" autoplay muted loop style="width:100vw;height:100vh;object-fit:contain"></video></body>')
+resume_index=0   # where the playlist continues after the browser was restarted
 def run():
- global CDP
+ global CDP,resume_index
  CDP=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
  with sync_playwright() as pw:
-  ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}','--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox'])
-  page=ctx.pages[0] if ctx.pages else ctx.new_page();CDP=ctx.new_cdp_session(page);time.sleep(2);fullscreen();idx=0;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None
+  ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=chromium_args(w,h))
+  if LOW_MEMORY:print(f'Small memory ({TOTAL_MB} MB): Chromium runs in its low-end mode',flush=True)
+  page=ctx.pages[0] if ctx.pages else ctx.new_page();CDP=ctx.new_cdp_session(page);time.sleep(2);fullscreen();idx=resume_index;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None;items=[];items_at=0
   while True:
-   items=get('/api/player/playlist-expanded',[]) or [];cmd=get('/api/v6/player/command',{}) or {};cid=int(cmd.get('command_id') or 0)
+   # the playlist changes rarely: every 5 s (and right after a command); commands are checked every second
+   if time.time()-items_at>=5:items=get('/api/player/playlist-expanded',items) or [];items_at=time.time()
+   cmd=get('/api/v6/player/command',{}) or {};cid=int(cmd.get('command_id') or 0)
    # a restart requested from the admin UI (Docker: the container restarts the player after it exits)
    if restart_id is None:restart_id=cmd.get('restart_id',0)
    elif cmd.get('restart_id',restart_id)!=restart_id:print('PLAYER RESTART REQUESTED',flush=True);raise SystemExit(0)
    if cid!=last_cmd:
+    if last_cmd!=-1:items=get('/api/player/playlist-expanded',items) or [];items_at=time.time()
     last_cmd=cid;action=cmd.get('action');item_id=cmd.get('item_id');requested_collection=cmd.get('collection_id')
     if action in ('show','freeze'):
      target=next((x for x in items if int(x['id'])==int(item_id)),None)
@@ -170,7 +211,7 @@ def run():
    if cur is None:cur=items[idx%len(items)];show(page,cur);duration=max(5,int(cur.get('duration') or 30));remaining=duration;fullscreen()
    frozen=mode=='single-freeze';collection_frozen=mode in ('collection-freeze','collection-temporary')
    post('/api/v2/player/heartbeat',{'current_id':cur['id'],'current_name':cur['name'],'frozen':frozen,'collection_frozen':collection_frozen,'collection_id':collection_id,'remaining':None if frozen else remaining,'duration':duration})
-   if time.time()-last_fs>4:fullscreen();last_fs=time.time()
+   if time.time()-last_fs>4:fullscreen(True);last_fs=time.time()
    time.sleep(1)
    if not frozen:
     remaining-=1
@@ -187,6 +228,7 @@ def run():
       except Exception:idx=0
      else:idx=(idx+1)%len(items)
      mode='normal';cur=None
+     if memory_low():resume_index=idx;raise RuntimeError('memory almost full, restarting the browser')
 if __name__=='__main__':
  while True:
   try:run()

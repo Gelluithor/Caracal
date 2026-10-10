@@ -5,7 +5,7 @@ BASE=$(cd "$(dirname "$0")" && pwd)
 
 echo '[1/10] Instaluji systémové balíčky...'
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-tk chromium xserver-xorg xserver-xorg-core xserver-xorg-legacy xinit openbox unclutter dbus-x11 x11-xserver-utils xdotool wmctrl x11-utils alsa-utils mpg123 curl ca-certificates fonts-dejavu-core plymouth plymouth-themes initramfs-tools
+DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-tk python3-pil chromium xserver-xorg xserver-xorg-core xserver-xorg-legacy xinit openbox unclutter dbus-x11 x11-xserver-utils xdotool wmctrl x11-utils alsa-utils mpg123 curl ca-certificates fonts-dejavu-core plymouth plymouth-themes initramfs-tools
 
 echo '[2/10] Připravuji uživatele a datové adresáře...'
 id caracal >/dev/null 2>&1 || useradd -m -s /bin/bash caracal
@@ -55,6 +55,20 @@ cp -a /opt/caracal/plymouth/. /usr/share/plymouth/themes/caracal/
 chmod 644 /usr/share/plymouth/themes/caracal/*
 plymouth-set-default-theme caracal
 update-initramfs -u -k all
+
+# Small boards (Raspberry Pi 4 with 1-2 GB): compressed swap in memory (zram) so Chromium has room for heavier
+# dashboards; skipped when the system already has zram swap. Not needed for the installation to succeed.
+MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+if [ "${MEM_MB:-0}" -le 2048 ] && ! swapon --show=NAME --noheadings 2>/dev/null | grep -q zram; then
+ echo "Malá paměť (${MEM_MB} MB): zapínám zram swap..."
+ if DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools >/dev/null 2>&1; then
+  printf 'ALGO=zstd\nPERCENT=50\nPRIORITY=100\n' > /etc/default/zramswap
+  systemctl enable zramswap.service >/dev/null 2>&1 || true
+  systemctl restart zramswap.service >/dev/null 2>&1 || echo 'zram swap se nepodařilo spustit (nevadí)'
+ else
+  echo 'Balíček zram-tools není dostupný, pokračuji bez zram swapu'
+ fi
+fi
 
 echo '[8/10] Aktivuju služby...'
 systemctl daemon-reload
