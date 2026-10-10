@@ -48,6 +48,28 @@ The node keeps only a limited amount of data, so the SD card does not fill up:
 Old entries are removed once a minute. API: `POST /api/notify/history/clear`, `GET /api/notify/audit?limit=200`,
 `POST /api/notify/audit/clear` (administrator session).
 
+## Look
+
+How notifications look on the TV is set visually in **Notifications → Notification look**, with a live preview of a
+1920 × 1080 screen that uses the position and size from the settings (CARACAL Fleet has the same editor under
+*Notifications → Notification look* of a device, also for many devices at once). Start from a preset (CARACAL,
+Light, Vivid, Minimal, High contrast, Full-width banner) and change what you like:
+
+- **Colours** of the background, the title, the text and the details (sender, `+N`),
+- **a colour and an icon per level** (up to 3 characters such as ⚠ ✖ ✓ ℹ ★; colour emoji are refused because the
+  overlay draws with Tk, which cannot show them on X11),
+- **shape**: a stripe on the left, a solid background in the level colour (the text turns white or black,
+  whichever reads better) or a border, with its thickness,
+- **width**: automatic or 30–100 % of the screen; 100 % is a banner across the screen at the edge,
+- **alignment** (left or centre), **opacity** (50–100 %), **font** (DejaVu Sans, Serif or Sans Mono, the fonts
+  installed on the node) and a bold or regular title,
+- **what is shown**: the icon, the sender, the number of waiting notifications, the countdown line,
+- **animation**: slide in, fade or none, and its speed.
+
+Rounded corners are not possible: the notification is an X11 window. The look is stored with the other settings
+(`style` in `GET/PUT /api/notify/settings` and `PUT /api/fleet/v1/notify/settings`; missing keys keep their value)
+and used from the next notification on.
+
 ## Sound
 
 The device can play a short chime when a notification appears, a different one for each level (info and OK a soft

@@ -828,7 +828,53 @@ _NTF_CRITICAL={'critical','crit','error','err','fatal','emergency','alert','disa
 _NTF_WARNING={'warning','warn','average','degraded','major','4'}
 _NTF_SUCCESS={'success','ok','resolved','up','good','recovered'}
 _NTF_POSITIONS=('top-right','top-left','top','bottom-right','bottom-left','bottom','center')
-_NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'20','scale':'100','sound':'off','volume':'70','sound_device':'','history_max':'500','history_days':'7'}
+_NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'20','scale':'100','sound':'off','volume':'70','sound_device':'','history_max':'500','history_days':'7','style':''}
+# The look of notifications on the screen, drawn by the overlay with Tk: colours, an icon per level, the shape (a stripe,
+# a solid colour or a border), the font, the width (100 = a banner across the screen), opacity, what is shown and the
+# animation. Edited visually in the admin UI (and in CARACAL Fleet) by static/notify-style.js.
+import json as _ntf_json
+_NTF_STYLE={'bg':'#111926','title':'#f8fafc','text':'#cbd5e1','muted':'#94a3b8','fill':'stripe','stripe':100,'font':'DejaVu Sans','bold':True,
+ 'opacity':96,'width':0,'align':'left','icon':True,'source':True,'waiting':True,'progress':True,'animation':'slide','speed':250,
+ 'levels':{'info':{'color':'#3b82f6','icon':'ℹ'},'success':{'color':'#22c55e','icon':'✓'},'warning':{'color':'#f59e0b','icon':'⚠'},'critical':{'color':'#ef4444','icon':'✖'}}}
+_NTF_STYLE_CHOICES={'fill':('stripe','solid','border'),'font':('DejaVu Sans','DejaVu Serif','DejaVu Sans Mono'),'align':('left','center'),'animation':('slide','fade','none')}
+_NTF_STYLE_RANGES={'stripe':(0,300),'opacity':(50,100),'width':(0,100),'speed':(100,1500)}
+def _ntf_style(d,base=None):
+ # missing keys keep the base (the stored look); raises ValueError with what is wrong
+ out=_ntf_json.loads(_ntf_json.dumps(base or _NTF_STYLE))
+ if not isinstance(d,dict):raise ValueError('vzhled musí být objekt')
+ color=lambda v:isinstance(v,str) and _ntf_re.fullmatch(r'#[0-9a-fA-F]{6}',v)
+ for k in ('bg','title','text','muted'):
+  if k in d:
+   if not color(d[k]):raise ValueError(f'{k}: barva ve tvaru #RRGGBB')
+   out[k]=d[k].lower()
+ for k,choices in _NTF_STYLE_CHOICES.items():
+  if k in d:
+   if d[k] not in choices:raise ValueError(f"{k}: {', '.join(choices)}")
+   out[k]=d[k]
+ for k,(lo,hi) in _NTF_STYLE_RANGES.items():
+  if k in d:
+   try:v=int(d[k])
+   except (TypeError,ValueError):raise ValueError(f'{k}: číslo')
+   if not lo<=v<=hi or (k=='width' and 0<v<20):raise ValueError(f'{k}: {lo}–{hi}'+(' (0 = automaticky, jinak 20–100)' if k=='width' else ''))
+   out[k]=v
+ for k in ('bold','icon','source','waiting','progress'):
+  if k in d:out[k]=bool(d[k])
+ levels=d.get('levels') or {}
+ if not isinstance(levels,dict):raise ValueError('levels: objekt')
+ for level,v in levels.items():
+  if level not in out['levels'] or not isinstance(v,dict):raise ValueError('levels: info, success, warning, critical')
+  if 'color' in v:
+   if not color(v['color']):raise ValueError(f'{level}: barva ve tvaru #RRGGBB')
+   out['levels'][level]['color']=v['color'].lower()
+  if 'icon' in v:
+   icon=str(v['icon'] or '').strip()
+   # Tk on X11 cannot draw colour emoji (it can even crash on them), so icons stay in the Basic Multilingual Plane
+   if len(icon)>3 or any(ord(ch)<32 or ord(ch)>0xFFFF or ord(ch)==0xFE0F for ch in icon):raise ValueError(f'{level}: ikona nejvýš 3 znaky bez barevných emoji')
+   out['levels'][level]['icon']=icon
+ return out
+def _ntf_style_stored(raw):
+ try:return _ntf_style(_ntf_json.loads(raw) if raw else {})
+ except (ValueError,TypeError):return _ntf_style({})
 # sound: which levels play a chime by themselves - off (none), critical, warning (and critical), all.
 # A notification sent with sound=true always plays; volume 0 mutes the screen completely.
 _NTF_SOUNDS={'off':99,'critical':3,'warning':2,'all':1}
@@ -849,7 +895,7 @@ c.commit();c.close()
 def _ntf_hash(token):return _ntf_hashlib.sha256(token.encode()).hexdigest()
 def _ntf_settings():
  s=dict(_NTF_DEFAULTS);s.update({r['key']:r['value'] for r in rows('SELECT key,value FROM notify_settings')})
- return {'enabled':s['enabled']=='1','position':s['position'] if s['position'] in _NTF_POSITIONS else 'top-right','duration':int(s['duration']),'max_queue':int(s['max_queue']),'scale':int(s['scale']),'sound':s['sound'] if s['sound'] in _NTF_SOUNDS else 'off','volume':int(s['volume']),'sound_device':s['sound_device'],'history_max':int(s['history_max']),'history_days':int(s['history_days'])}
+ return {'enabled':s['enabled']=='1','position':s['position'] if s['position'] in _NTF_POSITIONS else 'top-right','duration':int(s['duration']),'max_queue':int(s['max_queue']),'scale':int(s['scale']),'sound':s['sound'] if s['sound'] in _NTF_SOUNDS else 'off','volume':int(s['volume']),'sound_device':s['sound_device'],'history_max':int(s['history_max']),'history_days':int(s['history_days']),'style':_ntf_style_stored(s['style'])}
 def _ntf_text(value,limit):
  text=_ntf_re.sub(r'[\x00-\x08\x0b-\x1f\x7f]','',str(value if value is not None else '')).strip()
  text=_ntf_re.sub(r'\n{3,}','\n\n',text)
@@ -1031,7 +1077,7 @@ def notify_overlay(req:Request):
  if cur and s['enabled']:
   current={k:cur[k] for k in ('id','title','message','level','source','duration')};current['remaining']=max(0.0,cur['shown_at']+cur['duration']-now)
   current['sound']=cur['sound']==1 or (cur['sound']!=0 and (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
- return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'sounds':{k:v['sha256'][:16] for k,v in _snd_meta().items()},'current':current,'waiting':waiting}
+ return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'sounds':{k:v['sha256'][:16] for k,v in _snd_meta().items()},'style':s['style'],'current':current,'waiting':waiting}
 
 # administration
 @app.get('/api/notify/settings')
@@ -1048,6 +1094,9 @@ def _ntf_save_settings(d,req,actor):
   s['sound']=str(d.get('sound',s['sound']));s['volume']=int(d.get('volume',s['volume']));s['sound_device']=str(d.get('sound_device',s['sound_device']) or '').strip()
   s['history_max']=int(d.get('history_max',s['history_max']));s['history_days']=int(d.get('history_days',s['history_days']))
  except (TypeError,ValueError):raise HTTPException(400,'Neplatné nastavení')
+ if 'style' in d:
+  try:s['style']=_ntf_style(d['style'],s['style'])
+  except ValueError as e:raise HTTPException(400,f'Neplatný vzhled oznámení – {e}')
  if s['position'] not in _NTF_POSITIONS:raise HTTPException(400,'Neplatná pozice')
  if not 3<=s['duration']<=120:raise HTTPException(400,'Doba zobrazení musí být 3 až 120 s')
  if not 1<=s['max_queue']<=200:raise HTTPException(400,'Fronta musí mít 1 až 200 míst')
@@ -1059,9 +1108,9 @@ def _ntf_save_settings(d,req,actor):
  if not 50<=s['history_max']<=5000:raise HTTPException(400,'Historie musí mít 50 až 5000 záznamů')
  if not 1<=s['history_days']<=90:raise HTTPException(400,'Historii jde držet 1 až 90 dní')
  before=_ntf_settings();c=con()
- for k in _NTF_DEFAULTS:c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',(k,('1' if s[k] else '0') if k=='enabled' else str(s[k])))
+ for k in _NTF_DEFAULTS:c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',(k,('1' if s[k] else '0') if k=='enabled' else _ntf_json.dumps(s[k],ensure_ascii=False) if k=='style' else str(s[k])))
  c.commit();c.close()
- changes=', '.join(f'{k}: {before[k]} → {s[k]}' for k in _NTF_DEFAULTS if before[k]!=s[k])
+ changes=', '.join('vzhled oznámení' if k=='style' else f'{k}: {before[k]} → {s[k]}' for k in _NTF_DEFAULTS if before[k]!=s[k])
  if changes:_ntf_audit(req,actor,'Nastavení změněno',changes)
  return s
 @app.get('/api/notify/tokens')

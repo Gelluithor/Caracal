@@ -31,6 +31,26 @@ CARACAL_BASE=os.getenv('CARACAL_BASE','http://127.0.0.1:8080').rstrip('/')
 NOTIFY_URL=CARACAL_BASE+'/api/notify/overlay'
 LEVELS={'info':('ℹ','#3b82f6'),'success':('✓','#22c55e'),'warning':('⚠','#f59e0b'),'critical':('✖','#ef4444')}
 TOAST_BG='#111926';TOAST_FG='#f8fafc';TOAST_MUTED='#94a3b8';ANIM=0.25
+# The look set in the admin UI (Notifications → Look); the app sends it with every poll. These defaults are used
+# with an older app that sends none, and the same as the app's own defaults.
+STYLE={'bg':TOAST_BG,'title':TOAST_FG,'text':'#cbd5e1','muted':TOAST_MUTED,'fill':'stripe','stripe':100,'font':'DejaVu Sans','bold':True,
+ 'opacity':96,'width':0,'align':'left','icon':True,'source':True,'waiting':True,'progress':True,'animation':'slide','speed':250,
+ 'levels':{k:{'icon':v[0],'color':v[1]} for k,v in LEVELS.items()}}
+toast_style=STYLE
+def style_of(data):
+ st=data.get('style') if isinstance(data.get('style'),dict) else {}
+ out={**STYLE,**{k:v for k,v in st.items() if k!='levels'}}
+ out['levels']={k:{**STYLE['levels'][k],**((st.get('levels') or {}).get(k) or {})} for k in STYLE['levels']}
+ return out
+def on_color(hex_color):
+ # text on a coloured background: white or near black, whichever reads better
+ try:n=int(hex_color[1:7],16)
+ except ValueError:return '#ffffff'
+ return '#111111' if ((n>>16)*299+((n>>8)&255)*587+(n&255)*114)/1000>160 else '#ffffff'
+def mix(a,b,t):
+ try:x=int(a[1:7],16);y=int(b[1:7],16)
+ except ValueError:return a
+ return '#%02x%02x%02x'%tuple(int(((x>>s)&255)*(1-t)+((y>>s)&255)*t) for s in (16,8,0))
 notify_data={}
 
 # Notification sounds: a short chime per level, generated here (no sound files), played with ALSA aplay
@@ -163,31 +183,51 @@ toast_bar_fill=toast_bar.create_rectangle(0,0,0,4,fill=LEVELS['info'][1],outline
 toast_shown=None;toast_phase='hidden';toast_phase_start=0.0;toast_content=None;toast_geometry='';toast_raise=0.0;toast_width=400
 
 def toast_build(cur,data):
- # (re)fill the notification window; sizes follow the screen height and the scale set in the admin UI
- global toast_content,toast_width
+ # (re)fill the notification window; sizes follow the screen height and the scale set in the admin UI,
+ # colours, shape, font, width and what is shown follow the look (style)
+ global toast_content,toast_width,toast_style
+ st=toast_style=style_of(data)
  sw=root.winfo_screenwidth();sh=root.winfo_screenheight();scale=max(.5,min(3,float(data.get('scale') or 100)/100))
  title_px=max(14,int(sh/38*scale));text_px=max(11,int(sh/54*scale));small_px=max(10,int(sh/72*scale));pad=max(10,int(sh/70*scale))
- toast_width=int(min(sw*.9,max(320,sw*(.42 if data.get('position') in ('top','bottom','center') else .32)*scale)))
- icon,color=LEVELS.get(cur.get('level'),LEVELS['info']);waiting=int(data.get('waiting') or 0)
- stripe.config(bg=color,width=max(6,int(pad*.6)));toast_bar.itemconfig(toast_bar_fill,fill=color)
- head.pack_configure(padx=pad,pady=(pad,int(pad*.3)))
- toast_source.config(text=f"{icon}  {cur.get('source') or 'CARACAL'}",fg=color,font=('DejaVu Sans',-small_px,'bold'))
- toast_waiting.config(text=f'+{waiting}' if waiting else '',font=('DejaVu Sans',-small_px,'bold'))
- toast_title.config(text=cur.get('title') or cur.get('message') or '',font=('DejaVu Sans',-title_px,'bold'),wraplength=toast_width-pad*3)
- toast_title.pack_configure(padx=pad,pady=(0,pad if not cur.get('title') or not cur.get('message') else int(pad*.4)))
+ width=int(st.get('width') or 0)
+ toast_width=int(sw*width/100) if width else int(min(sw*.9,max(320,sw*(.42 if data.get('position') in ('top','bottom','center') else .32)*scale)))
+ lv=st['levels'].get(cur.get('level')) or st['levels']['info'];color=lv['color'];waiting=int(data.get('waiting') or 0)
+ solid=st['fill']=='solid';border=st['fill']=='border'
+ bg=color if solid else st['bg'];fg=on_color(color) if solid else st['title'];fg2=on_color(color) if solid else st['text'];fgm=on_color(color) if solid else st['muted']
+ font=st['font'] if st['font'] in ('DejaVu Sans','DejaVu Serif','DejaVu Sans Mono') else 'DejaVu Sans';anchor,justify=('center','center') if st['align']=='center' else ('w','left')
+ for widget in (body,head,toast_source,toast_waiting,toast_title,toast_message):widget.config(bg=bg)
+ # border: the window shows the level colour around the body
+ bw=max(2,int(pad*.3*max(st['stripe'],30)/100)) if border else 0
+ toast.config(bg=color if border else bg);body.pack_configure(padx=bw,pady=bw)
+ stripe_w=int(max(6,pad*.6)*st['stripe']/100) if st['fill']=='stripe' else 0
+ if stripe_w:stripe.config(bg=color,width=stripe_w);stripe.pack(side='left',fill='y',before=body)
+ else:stripe.pack_forget()
+ if st['icon'] or st['source'] or st['waiting']:
+  head.pack(fill='x',before=toast_title,padx=pad,pady=(pad,int(pad*.3)))
+  label=(f"{lv['icon']}  " if st['icon'] and lv['icon'] else '')+((cur.get('source') or 'CARACAL') if st['source'] else '')
+  toast_source.config(text=label.strip(),fg=fg if solid else color,font=(font,-small_px,'bold'))
+  toast_source.pack_configure(side='left',expand=st['align']=='center')
+  toast_waiting.config(text=f'+{waiting}' if waiting and st['waiting'] else '',fg=fgm,font=(font,-small_px,'bold'))
+ else:head.pack_forget()
+ has_head=st['icon'] or st['source'] or st['waiting']
+ toast_title.config(text=cur.get('title') or cur.get('message') or '',fg=fg,font=(font,-title_px,'bold' if st['bold'] else 'normal'),wraplength=toast_width-pad*3,anchor=anchor,justify=justify)
+ toast_title.pack_configure(padx=pad,pady=(0 if has_head else pad,pad if not cur.get('title') or not cur.get('message') else int(pad*.4)))
  if cur.get('title') and cur.get('message'):
-  toast_message.config(text=cur['message'],font=('DejaVu Sans',-text_px),wraplength=toast_width-pad*3);toast_message.pack(fill='x',padx=pad,pady=(0,pad),after=toast_title)
+  toast_message.config(text=cur['message'],fg=fg2,font=(font,-text_px),wraplength=toast_width-pad*3,anchor=anchor,justify=justify);toast_message.pack(fill='x',padx=pad,pady=(0,pad),after=toast_title)
  else:toast_message.pack_forget()
- toast_bar.config(height=max(3,int(pad*.35)))
- toast_content=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),waiting,data.get('scale'),data.get('position'))
+ if st['progress']:
+  toast_bar.config(height=max(3,int(pad*.35)),bg='#000000' if solid else mix(st['bg'],st['muted'],.25));toast_bar.itemconfig(toast_bar_fill,fill=fg if solid else color);toast_bar.pack(side='bottom',fill='x')
+ else:toast_bar.pack_forget()
+ toast_content=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),waiting,data.get('scale'),data.get('position'),json.dumps(data.get('style'),sort_keys=True))
 
 def toast_place(position,progress,bar_height):
  # progress 0..1 of the slide/fade animation; bottom positions stay above the countdown bar
  global toast_geometry
- sw=root.winfo_screenwidth();sh=root.winfo_screenheight();w=toast_width;h=toast.winfo_reqheight();m=int(min(sw,sh)*.035)
+ sw=root.winfo_screenwidth();sh=root.winfo_screenheight();w=toast_width;h=toast.winfo_reqheight()
+ banner=int(toast_style.get('width') or 0)>=100;m=0 if banner else int(min(sw,sh)*.035)
  x=sw-w-m if position.endswith('right') else m if position.endswith('left') else (sw-w)//2
  y=m if position.startswith('top') else sh-h-m-bar_height if position.startswith('bottom') else (sh-h)//2
- offset=int((1-progress)*max(30,w*.15))
+ offset=0 if toast_style.get('animation')!='slide' else int((1-progress)*max(30,w*.15))
  if position.endswith('right'):x+=offset
  elif position.endswith('left'):x-=offset
  elif position.startswith('top'):y-=offset
@@ -197,7 +237,7 @@ def toast_place(position,progress,bar_height):
   # apply now: a mapped override-redirect window is otherwise only moved when Tk next runs idle tasks,
   # which nothing else does while the countdown bar is off, so the toast stayed at the animation start
   toast.geometry(geometry);toast.update_idletasks();toast_geometry=geometry
- try:toast.attributes('-alpha',.96*max(0.0,min(1.0,progress)))
+ try:toast.attributes('-alpha',max(.5,min(1.0,float(toast_style.get('opacity') or 96)/100))*max(0.0,min(1.0,progress)))
  except Exception:pass
 
 def notify_tick(now,bar_height):
@@ -208,17 +248,18 @@ def notify_tick(now,bar_height):
   remaining=float(cur.get('remaining') or 0)-(now-float(data.get('received') or now))
   if remaining<=0:cur=None   # hide on time; the next poll brings the next notification
  want=cur.get('id') if cur else None
+ anim=0.0 if toast_style.get('animation')=='none' else max(.1,min(1.5,float(toast_style.get('speed') or 250)/1000))
  if toast_shown is not None and want!=toast_shown:
   if toast_phase!='out':toast_phase='out';toast_phase_start=now
-  if now-toast_phase_start>=ANIM:toast.withdraw();toast_shown=None;toast_phase='hidden';toast_content_reset()
+  if now-toast_phase_start>=anim:toast.withdraw();toast_shown=None;toast_phase='hidden';toast_content_reset()
  if toast_shown is None and cur:
   toast_build(cur,data);toast_shown=want;toast_phase='in';toast_phase_start=now;toast.update_idletasks();toast_place(data.get('position') or 'top-right',0,bar_height);toast.deiconify()
   # only for a notification that has just appeared, not when the overlay restarts in the middle of one
   if cur.get('sound') and remaining>=float(cur.get('duration') or 0)-3:play_sound(cur.get('level') or 'info',data.get('volume',70),data.get('sound_device') or '',(data.get('sounds') or {}).get(cur.get('level') or 'info'))
- elif cur and toast_shown==want and toast_content!=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),int(data.get('waiting') or 0),data.get('scale'),data.get('position')):
+ elif cur and toast_shown==want and toast_content!=(cur.get('id'),cur.get('title'),cur.get('message'),cur.get('level'),cur.get('source'),int(data.get('waiting') or 0),data.get('scale'),data.get('position'),json.dumps(data.get('style'),sort_keys=True)):
   toast_build(cur,data);toast.update_idletasks()   # the sender updated it (same key) or the queue length changed
  if toast_shown is None:return
- t=min(1.0,(now-toast_phase_start)/ANIM)
+ t=1.0 if not anim else min(1.0,(now-toast_phase_start)/anim)
  progress=1-(1-t)**3 if toast_phase=='in' else 1-t*t if toast_phase=='out' else 1.0
  if toast_phase=='in' and t>=1:toast_phase='shown'
  toast_place(data.get('position') or 'top-right',progress,bar_height)

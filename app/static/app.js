@@ -543,3 +543,28 @@ window.addUrl=async function(){
  const notificationsBeforeSounds=window.notifications;
  window.notifications=async function(){await notificationsBeforeSounds();if(document.getElementById('sndPanel'))return;const settings=document.getElementById('ntfEnabled')?.closest('.panel');if(settings)settings.insertAdjacentHTML('afterend',await panel())};
 })();
+
+// "Oznámení" view: the look of notifications on the screen, edited visually with a live preview of the TV
+// (static/notify-style.js, the same editor CARACAL Fleet uses).
+(function(){
+ const en=()=>localStorage.getItem('caracal-language')==='en',L=(cs,e)=>en()?e:cs;
+ const send=(method,body)=>({method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ let editor=null;
+ function mount(s){
+  const el=document.getElementById('ntfLookEditor');if(!el||!window.NotifyStyle)return;
+  editor=NotifyStyle.editor(el,editor?editor.get():s.style,{t:L,position:document.getElementById('ntfPosition')?.value||s.position,scale:Number(document.getElementById('ntfScale')?.value||s.scale)});
+ }
+ window.ntfLookSave=async function(){if(!editor)return;try{await api('/api/notify/settings',send('PUT',{style:editor.get()}));toast(L('Vzhled oznámení uložen – na obrazovce se projeví s dalším oznámením','Notification look saved – the screen uses it with the next notification'))}catch(e){alert(e.message)}};
+ window.ntfLookReset=function(){if(editor)editor.set(NotifyStyle.DEFAULT)};
+ const notificationsBeforeLook=window.notifications;
+ window.notifications=async function(){
+  await notificationsBeforeLook();if(document.getElementById('ntfLook'))return;
+  const settings=document.getElementById('ntfEnabled')?.closest('.panel');if(!settings||!window.NotifyStyle)return;
+  const s=await api('/api/notify/settings');editor=null;
+  settings.insertAdjacentHTML('afterend',`<div class=panel id=ntfLook><div class=panel-head><h2>${L('Vzhled oznámení','Notification look')}</h2><div class=toolbar><button class=secondary onclick=ntfTest()>${L('Poslat test','Send test')}</button><button class=secondary onclick=ntfLookReset()>${L('Výchozí','Default')}</button><button class=primary onclick=ntfLookSave()>${L('Uložit vzhled','Save look')}</button></div></div>`
+   +`<div class=ntf-body><p class=muted>${L('Barvy, ikony, tvar, písmo, šířka a animace oznámení na televizi. Náhled vpravo odpovídá obrazovce 1920 × 1080 s pozicí a velikostí z nastavení výše; po uložení to zkuste tlačítkem Poslat test.','Colours, icons, shape, font, width and animation of the notifications on the TV. The preview matches a 1920 × 1080 screen with the position and size set above; after saving, try it with Send test.')}</p><div id=ntfLookEditor></div></div></div>`);
+  mount(s);
+  // the preview follows the position and size while they are being changed above
+  for(const id of ['ntfPosition','ntfScale'])document.getElementById(id)?.addEventListener('change',()=>mount(s));
+ };
+})();
