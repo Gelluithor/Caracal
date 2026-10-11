@@ -8,3 +8,4 @@ plymouth
 systemd
 system-config
 *.zip
+docs/*.gif

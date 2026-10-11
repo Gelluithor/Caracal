@@ -4,7 +4,7 @@ from datetime import datetime,timedelta,timezone
 import jwt,psutil
 from cryptography.fernet import Fernet
 from fastapi import FastAPI,Request,UploadFile,File,Form,HTTPException,Depends
-from fastapi.responses import FileResponse,JSONResponse
+from fastapi.responses import FileResponse,HTMLResponse,JSONResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
 DATA=Path(os.getenv('CARACAL_DATA',str(Path.home()/'.local/share/caracal')));MEDIA=DATA/'media';DATA.mkdir(parents=True,exist_ok=True);MEDIA.mkdir(exist_ok=True)
@@ -14,11 +14,11 @@ if not VF.exists():VF.write_bytes(Fernet.generate_key());os.chmod(VF,0o600)
 vault=Fernet(VF.read_bytes());secret=SF.read_text();pwd=CryptContext(schemes=['bcrypt'],deprecated='auto');app=FastAPI(docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static');app.mount('/media',StaticFiles(directory=MEDIA),name='media')
 _UPLOAD_MAX=2*1024**3
-# Security headers: no framing (clickjacking), no MIME sniffing, no referrer, no plugins. The admin UI uses inline
-# event handlers, so scripts keep 'unsafe-inline'; everything else is limited to this origin.
+# Security headers: no framing (clickjacking), no MIME sniffing, no referrer, no plugins. Scripts only from this origin
+# (the admin UI has no inline scripts or event handlers); styles allow inline style attributes.
 _SECURITY_HEADERS={'X-Frame-Options':'DENY','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
  'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
- 'Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"}
+ 'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"}
 @app.middleware('http')
 async def _security_headers(request:Request,call_next):
  response=await call_next(request)
@@ -76,7 +76,10 @@ def tok(i):
  r=rows('SELECT password_hash FROM users WHERE id=?',(i,))
  return jwt.encode({'sub':str(i),'pw':_pw_mark(r[0]['password_hash'] if r else ''),'exp':datetime.now(timezone.utc)+timedelta(days=1)},secret,algorithm='HS256')
 @app.get('/')
-def home():return FileResponse(Path(__file__).parent/'static/index.html')
+def home():
+ # the version in the addresses of the scripts and styles: a new CARACAL never runs with old files from the cache
+ html=(Path(__file__).parent/'static/index.html').read_text(encoding='utf-8')
+ return HTMLResponse(html.replace('{{VERSION}}',_caracal_version() or str(int((Path(__file__).parent/'static/app.js').stat().st_mtime))),headers={'Cache-Control':'no-cache'})
 @app.get('/api/setup-status')
 def setup_status():return {'needed':not bool(rows('SELECT id FROM users LIMIT 1'))}
 @app.post('/api/setup')
@@ -141,7 +144,7 @@ def player_profile(i:int,req:Request):
 def system(u=Depends(auth)):
  try:t=float(Path('/sys/class/thermal/thermal_zone0/temp').read_text())/1000
  except:t=None
- return {'hostname':socket.gethostname(),'cpu':psutil.cpu_percent(),'ram':psutil.virtual_memory().percent,'disk':psutil.disk_usage('/').percent,'temperature':t,'uptime':time.time()-psutil.boot_time()}
+ return {'hostname':socket.gethostname(),'cpu':psutil.cpu_percent(),'ram':psutil.virtual_memory().percent,'disk':psutil.disk_usage('/').percent,'temperature':t,'uptime':time.time()-psutil.boot_time(),'version':_caracal_version(),'runtime':RUNTIME}
 @app.post('/api/player/restart')
 def restart(u=Depends(auth)):request_player_restart();return {'ok':1}
 

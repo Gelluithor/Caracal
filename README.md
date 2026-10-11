@@ -4,7 +4,10 @@ Digital signage for Raspberry Pi 4/5 and PCs: a fullscreen Chromium player for w
 images and videos with a web admin. Many screens can be managed centrally with
 [CARACAL Fleet](https://github.com/Gelluithor/Caracal-Fleet).
 
-- Czech and English admin UI with dark mode and built-in help
+![CARACAL web administration: the screen now, freezing an item, what the TV shows, the playlist, the notification look
+and a test notification on the screen](docs/caracal.gif)
+
+- Czech and English admin UI with dark mode and built-in help, in the same look as CARACAL Fleet
 - web pages, images and videos in one playlist, drag-and-drop ordering
 - per-item duration and zoom (when adding, editing or live with a slider)
 - encrypted login profiles with automatic sign-in (log-in forms and HTTP Basic/Digest, the browser's pop-up), automatic acceptance of common cookie banners
