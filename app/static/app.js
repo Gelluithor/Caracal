@@ -223,6 +223,7 @@ function setTitle(title, crumb = '') {
   $('#title').textContent = title;
   $('#crumb').textContent = crumb;
   document.title = `${title} · CARACAL`;
+  syncTopbar(true);   // another title may change the toolbar's height
 }
 async function render(full = false) {
   const r = parseRoute();
@@ -239,7 +240,33 @@ async function render(full = false) {
   }
 }
 window.addEventListener('hashchange', () => render());
-window.addEventListener('scroll', () => $('#topbar').classList.toggle('scrolled', scrollY > 8), { passive: true });
+// The toolbar gets lower once the page scrolls. A bottom margin of the difference keeps the page below it in place:
+// without it the page got shorter by the same amount, which moved the scroll position back over the threshold and
+// the toolbar flickered between both states.
+function topbarGap(tb) {
+  const c = tb.cloneNode(true);
+  [c, ...c.querySelectorAll('[id]')].forEach(x => x.removeAttribute('id'));
+  c.setAttribute('aria-hidden', 'true');
+  c.style.cssText = `position:absolute;visibility:hidden;left:0;top:0;width:${tb.offsetWidth}px;margin:0`;
+  [c, ...c.querySelectorAll('*')].forEach(x => { x.style.transition = 'none'; });
+  c.classList.remove('scrolled');
+  tb.parentNode.append(c);
+  const full = c.offsetHeight;
+  c.classList.add('scrolled');
+  const gap = full - c.offsetHeight;
+  c.remove();
+  return Math.max(0, gap);
+}
+function syncTopbar(remeasure = false) {
+  const tb = $('#topbar');
+  if (!tb) return;
+  const on = scrollY > 8;
+  if (on === tb.classList.contains('scrolled') && !(remeasure && on)) return;
+  tb.style.marginBottom = on ? topbarGap(tb) + 'px' : '';
+  tb.classList.toggle('scrolled', on);
+}
+window.addEventListener('scroll', () => syncTopbar(), { passive: true });
+window.addEventListener('resize', () => syncTopbar(true));
 
 async function showApp() {
   $('#login').hidden = true;
@@ -567,6 +594,7 @@ function plRow(a, i) {
     <span class="idx">${i + 1}</span><span class="kind k-${k}">${kindIcon(a.kind)}</span>
     <div class="pl-main"><b>${esc(a.name)}</b><small>${esc(sourceText(a))}</small>
       <div class="row-tags">${scalable ? `<button class="tag" data-do="toggleScale" data-id="${a.id}" title="${T('Velikost obsahu', 'Content size')}">${pct(a.scale)} %</button>` : ''}
+        ${scalable && a.dark ? `<span class="tag" title="${T('Tmavý režim', 'Dark mode')}">${icon('moon')}${(DARK_MODES().find(([m]) => m === a.dark) || [])[1] || ''}</span>` : ''}
         ${a.auth_profile_id ? `<span class="tag accent">${icon('lock')}${esc(prof ? prof.name : T('Přihlášení', 'Login'))}</span>` : ''}
         ${a.kind === 'grafana-tag' ? `<button class="expand ${open ? 'open' : ''}" data-do="toggleDash" data-id="${a.id}">${icon('chev')}${dashes.length} ${T('dashboardů', 'dashboards')}</button>` : ''}</div></div>
     <span class="pl-dur">${a.duration} s</span>
@@ -641,10 +669,47 @@ VIEWS.playlist = async (root, changed) => {
         <button class="btn" data-do="upload">${icon('upload')}<span>${T('Nahrát médium', 'Upload media')}</span></button>
         <button class="btn primary" data-do="addWeb">${icon('plus')}<span>${T('Přidat web', 'Add website')}</span></button></div>
       <ol class="list" id="plList"></ol></section>
+      <section class="card" id="darkCard" hidden><div class="setting"><span><b>${T('Weby v tmavém režimu', 'Websites in dark mode')}</b>
+        <small>${T('Platí pro všechny weby a dashboardy Grafany, u položky jde nastavit jinak.', 'Applies to every website and Grafana dashboard; an item can have its own choice.')}</small></span>
+        <select id="webDark" style="width:auto;min-width:220px">${DARK_MODES().map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
+        <small class="muted" id="webDarkHint"></small></section>
       <p class="muted" style="font-size:13px">${T('Pořadí změníte přetažením za úchyt vlevo. Tlačítkem s procenty upravíte velikost stránky, ikonou ▶ položku hned zobrazíte.', 'Drag the handle on the left to change the order. The button with the percentage changes the size of the page; ▶ shows the item right away.')}</p>`;
   }
   drawPlaylist();
+  bindWebDark();
 };
+
+// dark mode of websites: the device's setting and the choice of each website / Grafana collection
+const DARK_MODES = () => [['off', T('Vypnuto', 'Off')], ['dark', T('Tmavý vzhled webu', "The site's dark look")], ['force', T('Vynutit tmavý', 'Force dark')]];
+const darkHint = v => ({
+  off: T('Weby se zobrazují tak, jak je navrhl jejich autor.', 'Websites look the way their authors made them.'),
+  dark: T('Weby, které mají vlastní tmavý vzhled, ho použijí (jako při tmavém režimu systému).', 'Websites with their own dark look use it (as with the dark mode of the system).'),
+  force: T('Navíc ztmaví i weby bez tmavého vzhledu. Barvy pak může upravit prohlížeč.', 'Also darkens websites without a dark look; the browser may then change their colours.'),
+}[v] || '');
+async function bindWebDark() {
+  const sel = $('#webDark');
+  if (!sel) return;
+  try { S.webDark = (await api('/api/player/settings')).web_dark; } catch { return; }
+  $('#darkCard').hidden = false;
+  sel.value = S.webDark;
+  $('#webDarkHint').textContent = darkHint(S.webDark);
+  sel.onchange = async () => {
+    try {
+      S.webDark = (await api('/api/player/settings', { method: 'PUT', json: { web_dark: sel.value } })).web_dark;
+      toast(T('Tmavý režim webů uložen', 'Dark mode of websites saved'));
+    } catch (e) { fail(e); sel.value = S.webDark; }
+    $('#webDarkHint').textContent = darkHint(S.webDark);
+    drawPlaylist();
+  };
+}
+function darkField(v, grafana = false) {
+  const modes = DARK_MODES().filter(([m]) => !grafana || m !== 'force');
+  const own = (DARK_MODES().find(([m]) => m === (S.webDark || 'off')) || [])[1] || '';
+  return `<label>${T('Tmavý režim', 'Dark mode')}<select name="dark"><option value="">${T('Podle zařízení', 'As the device')}${own ? ` (${own.toLowerCase()})` : ''}</option>
+    ${modes.map(([m, l]) => `<option value="${m}" ${v === m ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    <small>${grafana ? T('Grafana dostane svůj tmavý motiv.', 'Grafana gets its dark theme.') : T('„Vynutit“ ztmaví i web bez vlastního tmavého vzhledu.', '"Force" darkens also a website without a dark look of its own.')}</small></label>`;
+}
+const saveDark = (id, f) => api(`/api/assets/${id}/dark`, { method: 'PUT', json: { dark: f.get('dark') || null } });
 
 async function profileOptions(sel = '') {
   if (!S.profiles.length) S.profiles = await api('/api/profiles').catch(() => []);
@@ -676,10 +741,12 @@ Object.assign(ACT, {
       body: `<div class="form"><label>${T('Název', 'Name')}<input name="name" required placeholder="${T('např. Zabbix dashboard', 'e.g. Zabbix dashboard')}"></label>
         <label>URL<input name="source" type="url" required placeholder="https://"></label>
         <div class="row2"><label>${T('Doba zobrazení (s)', 'Display time (s)')}<input name="duration" type="number" min="5" value="30" required></label>${scaleField(1)}</div>
-        <label>${T('Přihlašovací profil', 'Login profile')}<select name="auth_profile_id">${await profileOptions()}</select></label></div>`,
+        <label>${T('Přihlašovací profil', 'Login profile')}<select name="auth_profile_id">${await profileOptions()}</select></label>
+        ${darkField('')}</div>`,
       submit: T('Přidat', 'Add'),
       onSubmit: async f => {
         const r = await api('/api/v9/assets/web', { json: { name: f.get('name').trim(), source: f.get('source').trim(), duration: Number(f.get('duration')), scale: parseScale(f.get('scale')), auth_profile_id: f.get('auth_profile_id') || null } });
+        if (f.get('dark') && r.id) await saveDark(r.id, f);
         toast(T(`Web přidán · ${pct(r.scale)} %`, `Website added · ${pct(r.scale)} %`));
         render(true);
       },
@@ -708,11 +775,12 @@ Object.assign(ACT, {
       body: `<div class="form"><label>${T('Název', 'Name')}<input name="name" value="${esc(a.name)}" required></label>
         ${web ? `<label>URL<input name="source" type="url" value="${esc(a.source)}" required></label>` : `<label>${T('Soubor', 'File')}<input value="${esc(sourceText(a))}" disabled></label>`}
         <div class="row2"><label>${T('Doba zobrazení (s)', 'Display time (s)')}<input name="duration" type="number" min="5" value="${a.duration}" required></label>${web ? scaleField(a.scale) : '<span></span>'}</div>
-        ${web ? `<label>${T('Přihlašovací profil', 'Login profile')}<select name="auth_profile_id">${await profileOptions(a.auth_profile_id)}</select></label>` : ''}</div>`,
+        ${web ? `<label>${T('Přihlašovací profil', 'Login profile')}<select name="auth_profile_id">${await profileOptions(a.auth_profile_id)}</select></label>${darkField(a.dark || '')}` : ''}</div>`,
       onSubmit: async f => {
         const scale = web ? parseScale(f.get('scale')) : null;
         await api('/api/assets/' + a.id, { method: 'PUT', json: { name: f.get('name').trim(), source: web ? f.get('source').trim() : a.source, duration: Number(f.get('duration')), auth_profile_id: web ? (f.get('auth_profile_id') || null) : null } });
         if (web) await api(`/api/v7/assets/${a.id}/scale`, { method: 'PUT', json: { scale } });
+        if (web && (f.get('dark') || '') !== (a.dark || '')) await saveDark(a.id, f);
         toast(T('Položka uložena', 'Item saved'));
         render(true);
       },
@@ -748,6 +816,7 @@ function grafanaDialog(a = null) {
       <div class="row2"><label>${T('Adresa Grafany', 'Grafana address')}<input name="grafana_url" type="url" required value="${esc(c.grafana_url || '')}" placeholder="https://grafana.example"></label>
       <label>${T('Tag dashboardů', 'Dashboard tag')}<input name="tag" required value="${esc(c.tag || '')}" placeholder="caracal-tv"></label></div>
       <div class="row2"><label>${T('Doba jednoho dashboardu (s)', 'Time per dashboard (s)')}<input name="duration" type="number" min="5" value="${a ? a.duration : 60}" required></label>${scaleField(a ? a.scale : 1)}</div>
+      ${darkField(a ? a.dark || '' : '', true)}
       <label class="check"><input type="checkbox" class="switch" name="kiosk" ${c.kiosk !== false ? 'checked' : ''}>${T('Kiosk režim Grafany (bez menu a lišt)', 'Grafana kiosk mode (no menus and bars)')}</label>
       <div class="form-actions start"><button type="button" class="btn sm" data-do="testTag">${icon('check')}${T('Vyzkoušet tag', 'Try the tag')}</button></div><div class="result-box" id="tagResult"></div></div>`,
     submit: a ? T('Uložit', 'Save') : T('Přidat', 'Add'),
@@ -756,6 +825,7 @@ function grafanaDialog(a = null) {
       if (a) {
         const r = await api('/api/grafana-collections/' + a.id, { method: 'PUT', json: { name: f.get('name').trim(), grafana_url: f.get('grafana_url').trim(), tag: f.get('tag').trim(), duration: Number(f.get('duration')), scale, kiosk: f.get('kiosk') === 'on' } });
         await api(`/api/v7/assets/${a.id}/scale`, { method: 'PUT', json: { scale } });
+        if ((f.get('dark') || '') !== (a.dark || '')) await saveDark(a.id, f);
         toast(T(`Kolekce uložena · ${r.dashboards} dashboardů`, `Collection saved · ${r.dashboards} dashboards`));
       } else {
         const fd = new FormData();
@@ -763,6 +833,7 @@ function grafanaDialog(a = null) {
         fd.set('scale', String(scale));
         if (f.get('kiosk') === 'on') fd.set('kiosk', 'on');
         const r = await api('/api/assets/grafana-tag', { form: fd });
+        if (f.get('dark') && r.id) await saveDark(r.id, f);
         toast(T(`Kolekce přidána · ${r.dashboards} dashboardů`, `Collection added · ${r.dashboards} dashboards`));
       }
       render(true);

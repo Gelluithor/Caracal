@@ -12,6 +12,7 @@ and a test notification on the screen](docs/caracal.gif)
 - per-item duration and zoom (when adding, editing or live with a slider)
 - encrypted login profiles with automatic sign-in (log-in forms and HTTP Basic/Digest, the browser's pop-up), automatic acceptance of common cookie banners
 - Grafana collections: all dashboards with a tag, read through Grafana's guest access on every cycle
+- websites in dark mode for the whole device or per item: the sites' own dark look, or forced dark for every page
 - live control: show or freeze an item or a whole collection, skip to the next item, resume
 - smooth progress bar at the bottom of the screen, splash screen and boot screen with the IP address
 - fullscreen watchdog, player and device restart from the admin UI

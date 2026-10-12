@@ -148,7 +148,22 @@ def show_http_auth(page,a,pr):
    try:page.goto(error_page,timeout=10000);break
    except Exception:page.wait_for_timeout(500)
 
+# Dark mode of websites (item 'dark' from the playlist): 'dark' asks the page for its own dark look
+# (prefers-color-scheme), 'force' also darkens pages without one (Chromium's automatic dark mode). Applied only when
+# it changes; a new browser starts without it.
+dark_applied=None
+def apply_dark(page,mode):
+ global dark_applied
+ mode=mode if mode in ('dark','force') else 'off'
+ if mode==dark_applied:return
+ try:page.emulate_media(color_scheme='dark' if mode!='off' else 'light')
+ except Exception as e:print('dark mode',e,flush=True)
+ try:
+  if CDP is not None:CDP.send('Emulation.setAutoDarkModeOverride',{'enabled':True} if mode=='force' else {})
+ except Exception as e:print('automatic dark mode',e,flush=True)
+ dark_applied=mode
 def show(page,a):
+ apply_dark(page,a.get('dark') if a['kind']=='web' else 'off')
  if a['kind']=='web':
   pid=a.get('auth_profile_id');pr=get('/api/player/profile/'+str(pid)) if pid else None
   if pr and pr.get('auth_type')=='http':show_http_auth(page,a,pr)
@@ -172,8 +187,8 @@ def show(page,a):
  else:page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><video src="{BASE+a["source"]}" autoplay muted loop style="width:100vw;height:100vh;object-fit:contain"></video></body>')
 resume_index=0   # where the playlist continues after the browser was restarted
 def run():
- global CDP,resume_index
- CDP=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
+ global CDP,resume_index,dark_applied
+ CDP=None;dark_applied=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
  with sync_playwright() as pw:
   ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=chromium_args(w,h))
   if LOW_MEMORY:print(f'Small memory ({TOTAL_MB} MB): Chromium runs in its low-end mode',flush=True)

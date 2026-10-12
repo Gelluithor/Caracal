@@ -533,8 +533,8 @@ def add_grafana_tag_collection(name:str=Form(...),grafana_url:str=Form(...),tag:
  if not found:raise HTTPException(404,'Pod tímto tagem nebyl nalezen žádný dashboard dostupný pro Guest účet')
  config={'grafana_url':grafana_url,'tag':tag,'kiosk':bool(kiosk)}
  c=con();position=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0]
- c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,NULL,?)',(name,'grafana-tag',_grafana_json.dumps(config,ensure_ascii=False),max(5,duration),position,scale));c.commit();c.close()
- return {'ok':True,'dashboards':len(found)}
+ q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,NULL,?)',(name,'grafana-tag',_grafana_json.dumps(config,ensure_ascii=False),max(5,duration),position,scale));c.commit();c.close()
+ return {'ok':True,'dashboards':len(found),'id':q.lastrowid}
 
 @app.post('/api/grafana/discover')
 def test_grafana_tag(grafana_url:str=Form(...),tag:str=Form(...),u=Depends(auth)):
@@ -542,18 +542,21 @@ def test_grafana_tag(grafana_url:str=Form(...),tag:str=Form(...),u=Depends(auth)
  return {'ok':True,'count':len(result),'dashboards':result[:50]}
 
 def expanded_player_playlist():
- output=[]
+ output=[];web_dark=_web_dark()
  for asset in rows('SELECT * FROM assets ORDER BY position,id'):
   if asset.get('kind')!='grafana-tag':
+   if asset.get('kind')=='web':asset['dark']=_dark_of(asset,web_dark)
    output.append(asset);continue
+  dark=_dark_of(asset,web_dark)
   try:
    config=_grafana_json.loads(asset.get('source') or '{}')
    discovered=_grafana_cached(config.get('grafana_url',''),config.get('tag',''))
    for index,dashboard in enumerate(discovered):
     separator='&' if '?' in dashboard['url'] else '?'
     url=dashboard['url']
-    if config.get('kiosk',True):url=url+separator+'kiosk=1'
-    output.append({'id':int(asset['id'])*100000+index,'parent_id':asset['id'],'name':asset['name']+' · '+dashboard['title'],'kind':'web','source':url,'duration':asset['duration'],'position':asset['position'],'auth_profile_id':None,'scale':asset.get('scale') or 1.0})
+    if config.get('kiosk',True):url=url+separator+'kiosk=1';separator='&'
+    if dark!='off':url=url+separator+'theme=dark'   # Grafana's own dark theme
+    output.append({'id':int(asset['id'])*100000+index,'parent_id':asset['id'],'name':asset['name']+' · '+dashboard['title'],'kind':'web','source':url,'duration':asset['duration'],'position':asset['position'],'auth_profile_id':None,'scale':asset.get('scale') or 1.0,'dark':'dark' if dark=='force' else dark})
   except Exception as error:
    print('Grafana collection error',asset.get('id'),error,flush=True)
  return output
@@ -751,7 +754,7 @@ def fleet_snapshot(req:Request):
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
  return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications(),
   'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))},
-  'collections':_fleet_collections(),'screenshot':_shot_info()}
+  'collections':_fleet_collections(),'screenshot':_shot_info(),'player_settings':_player_settings()}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -776,16 +779,16 @@ async def fleet_control(req:Request):
 async def fleet_add_web(req:Request):
  _fleet_auth(req);d=await req.json();name=str(d.get('name','')).strip();source=str(d.get('source','')).strip()
  if not name or not source.startswith(('http://','https://')):raise HTTPException(400,'Invalid name or URL')
- duration=_fleet_duration(d.get('duration',30));scale=_fleet_scale(d.get('scale',1));profile_id=_fleet_profile_id(d.get('auth_profile_id'))
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,scale,auth_profile_id) VALUES(?,?,?,?,?,?,?)',(name,'web',source,duration,_fleet_position(c),scale,profile_id));c.commit();c.close()
+ duration=_fleet_duration(d.get('duration',30));scale=_fleet_scale(d.get('scale',1));profile_id=_fleet_profile_id(d.get('auth_profile_id'));dark=_dark_value(d.get('dark'))
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,scale,auth_profile_id,dark) VALUES(?,?,?,?,?,?,?,?)',(name,'web',source,duration,_fleet_position(c),scale,profile_id,dark));c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.post('/api/fleet/v1/assets/grafana-tag')
 async def fleet_add_grafana_tag(req:Request):
  _fleet_auth(req);d=await req.json();name=str(d.get('name','')).strip()
  if not name:raise HTTPException(400,'Name must not be empty')
- config=_fleet_grafana_config(d);duration=_fleet_duration(d.get('duration',60));scale=_fleet_scale(d.get('scale',1))
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,NULL,?)',(name,'grafana-tag',_grafana_json.dumps(config,ensure_ascii=False),duration,_fleet_position(c),scale));c.commit();c.close()
+ config=_fleet_grafana_config(d);duration=_fleet_duration(d.get('duration',60));scale=_fleet_scale(d.get('scale',1));dark=_dark_value(d.get('dark'))
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale,dark) VALUES(?,?,?,?,?,NULL,?,?)',(name,'grafana-tag',_grafana_json.dumps(config,ensure_ascii=False),duration,_fleet_position(c),scale,dark));c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.post('/api/fleet/v1/assets/upload')
@@ -829,7 +832,8 @@ async def fleet_update_asset(asset_id:int,req:Request):
   try:current=_grafana_json.loads(a['source'] or '{}')
   except ValueError:current={}
   source=_grafana_json.dumps(_fleet_grafana_config(d,current),ensure_ascii=False)
- c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=?,auth_profile_id=? WHERE id=?',(name,source,duration,scale,profile_id,asset_id));c.commit();c.close()
+ dark=_dark_value(d['dark']) if 'dark' in d and a['kind'] in ('web','grafana-tag') else a.get('dark')
+ c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=?,auth_profile_id=?,dark=? WHERE id=?',(name,source,duration,scale,profile_id,dark,asset_id));c.commit();c.close()
  return {'ok':True}
 
 @app.delete('/api/fleet/v1/assets/{asset_id}')
@@ -1820,3 +1824,44 @@ async def fleet_grafana_discover(req:Request):
  if not url.startswith(('http://','https://')):raise HTTPException(400,'Grafana URL must start with http:// or https://')
  if not tag:raise HTTPException(400,'Tag must not be empty')
  found=_grafana_discover(url,tag);return {'ok':True,'count':len(found),'dashboards':found[:50]}
+
+
+# CARACAL_WEB_DARK_V1
+# Websites in dark mode: a setting of the node for every website and Grafana collection, and a choice of each item
+# (NULL = as the node). 'dark' asks the pages for their own dark look (prefers-color-scheme: dark), 'force' also
+# darkens pages that have none (Chromium's automatic dark mode). Grafana dashboards get its dark theme.
+_DARK_MODES=('off','dark','force')
+c=con();c.execute('CREATE TABLE IF NOT EXISTS player_settings(key TEXT PRIMARY KEY,value TEXT)')
+if 'dark' not in [r[1] for r in c.execute('PRAGMA table_info(assets)').fetchall()]:c.execute('ALTER TABLE assets ADD COLUMN dark TEXT')
+c.commit();c.close()
+def _dark_value(value,item=True):
+ # an item may follow the node (None); the node's own setting must be one of the modes
+ v=str(value or '').strip().lower()
+ if item and v in ('','auto','null','none'):return None
+ if v not in _DARK_MODES:raise HTTPException(400,'Dark mode must be off, dark or force')
+ return v
+def _web_dark():
+ r=rows("SELECT value FROM player_settings WHERE key='web_dark'")
+ return r[0]['value'] if r and r[0]['value'] in _DARK_MODES else 'off'
+def _dark_of(asset,default):return asset.get('dark') if asset.get('dark') in _DARK_MODES else default
+def _player_settings():return {'web_dark':_web_dark()}
+def _save_player_settings(d):
+ if not isinstance(d,dict):raise HTTPException(400,'Expected a JSON object')
+ if 'web_dark' in d:
+  c=con();c.execute("INSERT OR REPLACE INTO player_settings(key,value) VALUES('web_dark',?)",(_dark_value(d['web_dark'],False),));c.commit();c.close()
+ return _player_settings()
+def _set_asset_dark(asset_id,value):
+ dark=_dark_value(value);c=con();a=c.execute('SELECT kind FROM assets WHERE id=?',(asset_id,)).fetchone()
+ if not a:c.close();raise HTTPException(404,'Položka nebyla nalezena')
+ if a['kind'] not in ('web','grafana-tag'):c.close();raise HTTPException(400,'Tmavý režim jde nastavit jen u webu nebo kolekce Grafany')
+ c.execute('UPDATE assets SET dark=? WHERE id=?',(dark,asset_id));c.commit();c.close()
+ return {'ok':True,'dark':dark}
+@app.get('/api/player/settings')
+def player_settings(u=Depends(auth)):return _player_settings()
+@app.put('/api/player/settings')
+async def player_settings_save(request:Request,u=Depends(auth)):return _save_player_settings(await request.json())
+@app.put('/api/assets/{asset_id}/dark')
+async def asset_dark(asset_id:int,request:Request,u=Depends(auth)):
+ d=await request.json();return _set_asset_dark(asset_id,d.get('dark') if isinstance(d,dict) else None)
+@app.put('/api/fleet/v1/player/settings')
+async def fleet_player_settings(req:Request):_fleet_auth(req);return {'ok':True,**_save_player_settings(await _fleet_json(req))}
