@@ -225,9 +225,25 @@ def fetch_picture(key):
  except Exception as error:
   notify_picture=None;print('notification picture not usable:',error,flush=True)
 
+# Black screen watch: once a minute a small picture of the screen; a screen that is completely black is reported to
+# the app (which restarts the player when a website stays black, and tells CARACAL Fleet).
+BLACK_EVERY=60;black_checked=0.0
+def check_black():
+ global black_checked
+ black_checked=time.monotonic()
+ if not notify_render:return
+ try:
+  from PIL import ImageGrab
+  lo,hi=ImageGrab.grab().convert('L').resize((96,54)).getextrema()
+ except Exception:return
+ try:
+  with local_post(f'{CARACAL_BASE}/api/display/health',json.dumps({'black':hi<=24}).encode(),'application/json',5):pass
+ except Exception as error:print('display health',error,flush=True)
+
 def poll_notifications():
  global notify_data
  while True:
+  if time.monotonic()-black_checked>=BLACK_EVERY:check_black()
   try:
    with local_get(NOTIFY_URL,3) as response:data=json.loads(response.read().decode('utf-8'))
    data['received']=time.monotonic()

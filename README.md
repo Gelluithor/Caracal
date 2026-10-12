@@ -15,7 +15,8 @@ and a test notification on the screen](docs/caracal.gif)
 - websites in dark mode for the whole device or per item: the sites' own dark look, or forced dark for every page
 - live control: show or freeze an item or a whole collection, skip to the next item, resume
 - smooth progress bar at the bottom of the screen, splash screen and boot screen with the IP address
-- fullscreen watchdog, player and device restart from the admin UI
+- fullscreen watchdog, player and device restart from the admin UI; a website that keeps the screen black for five
+  minutes gets the player restarted
 - on-screen pop-up notifications from other apps (Grafana, Alertmanager, Uptime Kuma, scripts, …) through a token
   protected API, or watchers that ask an app's API for new items (Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub,
   any JSON API), shown one at a time from a queue, see [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md)

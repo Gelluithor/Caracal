@@ -1,700 +1,799 @@
-import os,sqlite3,secrets,time,socket,subprocess,hashlib
+"""CARACAL: the web administration and the local APIs of the player, the overlay and the CARACAL Fleet Agent.
+
+Sections: storage and security, session, playlist (websites, media, Grafana collections), website logins, the
+player (state, live control, countdown bar), the device, then the CARACAL Fleet API, notifications and their
+watchers, sounds and picture, the screen picture, Fleet parity, dark websites and the black screen watch.
+"""
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import socket
+import sqlite3
+import ssl
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime,timedelta,timezone
-import jwt,psutil
+
+import jwt
+import psutil
 from cryptography.fernet import Fernet
-from fastapi import FastAPI,Request,UploadFile,File,Form,HTTPException,Depends
-from fastapi.responses import FileResponse,HTMLResponse,JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
-DATA=Path(os.getenv('CARACAL_DATA',str(Path.home()/'.local/share/caracal')));MEDIA=DATA/'media';DATA.mkdir(parents=True,exist_ok=True);MEDIA.mkdir(exist_ok=True)
-DB=DATA/'hub.db';SF=DATA/'secret.key';VF=DATA/'vault.key'
-if not SF.exists():SF.write_text(secrets.token_urlsafe(48));os.chmod(SF,0o600)
-if not VF.exists():VF.write_bytes(Fernet.generate_key());os.chmod(VF,0o600)
-vault=Fernet(VF.read_bytes());secret=SF.read_text();pwd=CryptContext(schemes=['bcrypt'],deprecated='auto');app=FastAPI(docs_url=None,redoc_url=None)
-app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static');app.mount('/media',StaticFiles(directory=MEDIA),name='media')
-_UPLOAD_MAX=2*1024**3
+
+# ------------------------------------------------------------------ storage and security
+
+DATA = Path(os.getenv('CARACAL_DATA', str(Path.home() / '.local/share/caracal')))
+MEDIA = DATA / 'media'
+DATA.mkdir(parents=True, exist_ok=True)
+MEDIA.mkdir(exist_ok=True)
+DB = DATA / 'hub.db'
+SF, VF = DATA / 'secret.key', DATA / 'vault.key'
+if not SF.exists():
+    SF.write_text(secrets.token_urlsafe(48))
+    os.chmod(SF, 0o600)
+if not VF.exists():
+    VF.write_bytes(Fernet.generate_key())
+    os.chmod(VF, 0o600)
+vault = Fernet(VF.read_bytes())          # website logins are stored encrypted
+secret = SF.read_text()                 # signs the session cookies
+pwd = CryptContext(schemes=['bcrypt'], deprecated='auto')
+STATIC = Path(__file__).parent / 'static'
+app = FastAPI(docs_url=None, redoc_url=None)
+app.mount('/static', StaticFiles(directory=STATIC), name='static')
+app.mount('/media', StaticFiles(directory=MEDIA), name='media')
+_UPLOAD_MAX = 2 * 1024 ** 3
+_IMAGE_EXT, _VIDEO_EXT = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}, {'.mp4', '.webm', '.mkv'}
+# In Docker (CARACAL_RUNTIME=docker) there is no systemd/sudo: the player restarts itself when asked and the host
+# reboot is carried out by the CARACAL Fleet Agent, which reads the request from the Fleet snapshot.
+RUNTIME = os.getenv('CARACAL_RUNTIME', 'host')
+
 # Security headers: no framing (clickjacking), no MIME sniffing, no referrer, no plugins. Scripts only from this origin
 # (the admin UI has no inline scripts or event handlers); styles allow inline style attributes.
-_SECURITY_HEADERS={'X-Frame-Options':'DENY','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
- 'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
- 'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"}
+_SECURITY_HEADERS = {
+    'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                               "img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; "
+                               "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"}
+
+
 @app.middleware('http')
-async def _security_headers(request:Request,call_next):
- response=await call_next(request)
- for k,v in _SECURITY_HEADERS.items():response.headers.setdefault(k,v)
- if request.url.path.startswith('/api/'):response.headers.setdefault('Cache-Control','no-store')
- return response
-def con():c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for k, v in _SECURITY_HEADERS.items():
+        response.headers.setdefault(k, v)
+    if request.url.path.startswith('/api/'):
+        response.headers.setdefault('Cache-Control', 'no-store')
+    return response
+
+
+def con():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def rows(q, a=()):
+    c = con()
+    r = [dict(x) for x in c.execute(q, a).fetchall()]
+    c.close()
+    return r
+
+
+def _columns(c, table):
+    return [r[1] for r in c.execute(f'PRAGMA table_info({table})').fetchall()]
+
+
 def init():
- c=con();c.executescript("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE,password_hash TEXT);CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY,name TEXT,kind TEXT,source TEXT,duration INTEGER DEFAULT 30,position INTEGER DEFAULT 0,auth_profile_id INTEGER);CREATE TABLE IF NOT EXISTS auth_profiles(id INTEGER PRIMARY KEY,name TEXT,login_url TEXT,target_url TEXT,username_enc BLOB,password_enc BLOB,user_selector TEXT,pass_selector TEXT,submit_selector TEXT);""");c.commit();c.close()
+    c = con()
+    c.executescript("""
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT);
+CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, name TEXT, kind TEXT, source TEXT, duration INTEGER DEFAULT 30,
+  position INTEGER DEFAULT 0, auth_profile_id INTEGER);
+CREATE TABLE IF NOT EXISTS auth_profiles(id INTEGER PRIMARY KEY, name TEXT, login_url TEXT, target_url TEXT,
+  username_enc BLOB, password_enc BLOB, user_selector TEXT, pass_selector TEXT, submit_selector TEXT);
+CREATE TABLE IF NOT EXISTS player_settings(key TEXT PRIMARY KEY, value TEXT);
+""")
+    # columns added by later versions
+    if 'scale' not in _columns(c, 'assets'):
+        c.execute('ALTER TABLE assets ADD COLUMN scale REAL DEFAULT 1.0')
+    c.execute('UPDATE assets SET scale=1.0 WHERE scale IS NULL')
+    if 'dark' not in _columns(c, 'assets'):          # dark mode of a website: NULL = as the device
+        c.execute('ALTER TABLE assets ADD COLUMN dark TEXT')
+    # login profiles: 'form' fills in the page's log-in form, 'http' answers the browser's HTTP Basic/Digest pop-up
+    if 'auth_type' not in _columns(c, 'auth_profiles'):
+        c.execute("ALTER TABLE auth_profiles ADD COLUMN auth_type TEXT DEFAULT 'form'")
+    c.commit()
+    c.close()
+
+
 init()
-# Schema migration for existing installations.
-c=con()
-columns=[row[1] for row in c.execute("PRAGMA table_info(assets)").fetchall()]
-if "scale" not in columns:
- c.execute("ALTER TABLE assets ADD COLUMN scale REAL DEFAULT 1.0")
-c.execute("UPDATE assets SET scale=1.0 WHERE scale IS NULL")
-# login profiles: 'form' fills in the page's log-in form, 'http' answers the browser's HTTP Basic/Digest pop-up
-if "auth_type" not in [row[1] for row in c.execute("PRAGMA table_info(auth_profiles)").fetchall()]:
- c.execute("ALTER TABLE auth_profiles ADD COLUMN auth_type TEXT DEFAULT 'form'")
-c.commit();c.close()
-def _profile_type(value):return 'http' if str(value or '').strip().lower()=='http' else 'form'
-def rows(q,a=()):c=con();r=[dict(x) for x in c.execute(q,a).fetchall()];c.close();return r
+
 # The player and the overlay prove that they run on this device with a key only processes of this device can read
 # (DATA/local.key, mode 600). The loopback address alone is not enough: a reverse proxy on the same host (as
 # recommended for HTTPS) also connects from 127.0.0.1, and these endpoints return e.g. decrypted website logins.
-_LOCAL_KEY_FILE=DATA/'local.key'
+_LOCAL_KEY_FILE = DATA / 'local.key'
 if not _LOCAL_KEY_FILE.exists():
- _fd=os.open(_LOCAL_KEY_FILE,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(_fd,secrets.token_urlsafe(32).encode());os.close(_fd)
-_LOCAL_KEY=_LOCAL_KEY_FILE.read_text().strip()
-def _local_only(req:Request):
- if not req.client or req.client.host not in ('127.0.0.1','::1') or not secrets.compare_digest(req.headers.get('X-Caracal-Local',''),_LOCAL_KEY):raise HTTPException(403)
+    _fd = os.open(_LOCAL_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(_fd, secrets.token_urlsafe(32).encode())
+    os.close(_fd)
+_LOCAL_KEY = _LOCAL_KEY_FILE.read_text().strip()
+
+
+def _local_only(req: Request):
+    if not req.client or req.client.host not in ('127.0.0.1', '::1') or \
+            not secrets.compare_digest(req.headers.get('X-Caracal-Local', ''), _LOCAL_KEY):
+        raise HTTPException(403)
+
+
 def _remove_media(source):
- # deleted images/videos also free their file, unless another item still uses it
- if not str(source or '').startswith('/media/'):return
- path=MEDIA/Path(source).name
- if not rows('SELECT id FROM assets WHERE source=?',(source,)):path.unlink(missing_ok=True)
-_login_fails={}
-# In Docker (CARACAL_RUNTIME=docker) there is no systemd/sudo: the player restarts itself when asked and the
-# host reboot is carried out by the CARACAL Fleet Agent, which reads the request from the Fleet snapshot.
-RUNTIME=os.getenv('CARACAL_RUNTIME','host')
+    """A deleted picture or video also frees its file, unless another item still uses it."""
+    if not str(source or '').startswith('/media/'):
+        return
+    if not rows('SELECT id FROM assets WHERE source=?', (source,)):
+        (MEDIA / Path(source).name).unlink(missing_ok=True)
+
+
 def request_player_restart():
- if RUNTIME!='docker':subprocess.Popen(['sudo','/bin/systemctl','restart','caracal-player.service'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);return True
- state=_cc2_read();state['restart_player_request']=int(state.get('restart_player_request',0))+1;_cc2_write(state);return True
+    if RUNTIME != 'docker':
+        subprocess.Popen(['sudo', '/bin/systemctl', 'restart', 'caracal-player.service'], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True
+    state = _cc2_read()
+    state['restart_player_request'] = int(state.get('restart_player_request', 0)) + 1
+    _cc2_write(state)
+    return True
+
+
 def request_reboot():
- if RUNTIME!='docker':subprocess.Popen(['sudo','/bin/systemctl','reboot'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);return True
- state=_cc2_read();state['reboot_request']=int(state.get('reboot_request',0))+1;_cc2_write(state);return True
-def _pw_mark(password_hash):return hashlib.sha256(str(password_hash or '').encode()).hexdigest()[:16]
-def auth(req:Request):
- try:claims=jwt.decode(req.cookies.get('session',''),secret,algorithms=['HS256']);uid=int(claims['sub'])
- except:raise HTTPException(401)
- r=rows('SELECT id,username,password_hash FROM users WHERE id=?',(uid,));
- if not r or claims.get('pw')!=_pw_mark(r[0]['password_hash']):raise HTTPException(401)
- return {'id':r[0]['id'],'username':r[0]['username']}
+    if RUNTIME != 'docker':
+        subprocess.Popen(['sudo', '/bin/systemctl', 'reboot'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    state = _cc2_read()
+    state['reboot_request'] = int(state.get('reboot_request', 0)) + 1
+    _cc2_write(state)
+    return True
+
+
+# ------------------------------------------------------------------ session
+
+_login_fails = {}
+
+
+def _pw_mark(password_hash):
+    """Part of the session: a new password ends the sessions signed with the old one."""
+    return hashlib.sha256(str(password_hash or '').encode()).hexdigest()[:16]
+
+
+def auth(req: Request):
+    try:
+        claims = jwt.decode(req.cookies.get('session', ''), secret, algorithms=['HS256'])
+        uid = int(claims['sub'])
+    except Exception:
+        raise HTTPException(401)
+    r = rows('SELECT id,username,password_hash FROM users WHERE id=?', (uid,))
+    if not r or claims.get('pw') != _pw_mark(r[0]['password_hash']):
+        raise HTTPException(401)
+    return {'id': r[0]['id'], 'username': r[0]['username']}
+
+
 def tok(i):
- r=rows('SELECT password_hash FROM users WHERE id=?',(i,))
- return jwt.encode({'sub':str(i),'pw':_pw_mark(r[0]['password_hash'] if r else ''),'exp':datetime.now(timezone.utc)+timedelta(days=1)},secret,algorithm='HS256')
+    r = rows('SELECT password_hash FROM users WHERE id=?', (i,))
+    return jwt.encode({'sub': str(i), 'pw': _pw_mark(r[0]['password_hash'] if r else ''),
+                       'exp': datetime.now(timezone.utc) + timedelta(days=1)}, secret, algorithm='HS256')
+
+
+def _session(uid):
+    r = JSONResponse({'ok': 1})
+    r.set_cookie('session', tok(uid), httponly=True, samesite='strict')
+    return r
+
+
 @app.get('/')
 def home():
- # the version in the addresses of the scripts and styles: a new CARACAL never runs with old files from the cache
- html=(Path(__file__).parent/'static/index.html').read_text(encoding='utf-8')
- return HTMLResponse(html.replace('{{VERSION}}',_caracal_version() or str(int((Path(__file__).parent/'static/app.js').stat().st_mtime))),headers={'Cache-Control':'no-cache'})
+    # the version in the addresses of the scripts and styles: a new CARACAL never runs with old files from the cache
+    html = (STATIC / 'index.html').read_text(encoding='utf-8')
+    version = _caracal_version() or str(int((STATIC / 'app.js').stat().st_mtime))
+    return HTMLResponse(html.replace('{{VERSION}}', version), headers={'Cache-Control': 'no-cache'})
+
+
 @app.get('/api/setup-status')
-def setup_status():return {'needed':not bool(rows('SELECT id FROM users LIMIT 1'))}
+def setup_status():
+    return {'needed': not rows('SELECT id FROM users LIMIT 1')}
+
+
 @app.post('/api/setup')
-def setup(username:str=Form(...),password:str=Form(...)):
- if rows('SELECT id FROM users LIMIT 1'):raise HTTPException(409,'Setup completed')
- if len(password)<10:raise HTTPException(400,'Heslo musí mít nejméně 10 znaků')
- c=con();x=c.execute('INSERT INTO users(username,password_hash) VALUES(?,?)',(username,pwd.hash(password)));c.commit();i=x.lastrowid;c.close();r=JSONResponse({'ok':1});r.set_cookie('session',tok(i),httponly=True,samesite='strict');return r
-@app.post('/api/login')
-def login(request:Request,username:str=Form(...),password:str=Form(...)):
- ip=request.client.host if request.client else '';now=time.time();recent=[t for t in _login_fails.get(ip,[]) if t>now-300]
- if len(recent)>=10:raise HTTPException(429,'Příliš mnoho pokusů o přihlášení, zkuste to za 5 minut')
- r=rows('SELECT * FROM users WHERE username=?',(username,));
- if not r or not pwd.verify(password,r[0]['password_hash']):_login_fails[ip]=recent+[now];raise HTTPException(401,'Chybné přihlášení')
- _login_fails.pop(ip,None)
- x=JSONResponse({'ok':1});x.set_cookie('session',tok(r[0]['id']),httponly=True,samesite='strict');return x
-@app.get('/api/me')
-def me(u=Depends(auth)):return u
-@app.post('/api/logout')
-def logout():r=JSONResponse({'ok':1});r.delete_cookie('session');return r
-@app.get('/api/assets')
-def assets(u=Depends(auth)):return rows('SELECT * FROM assets ORDER BY position,id')
-@app.get('/api/player/playlist')
-def playlist(req:Request):_local_only(req);return rows('SELECT * FROM assets ORDER BY position,id')
-@app.post('/api/assets/url')
-def url(name:str=Form(...),source:str=Form(...),duration:int=Form(30),auth_profile_id:str=Form(''),u=Depends(auth)):
- if not source.startswith(('http://','https://')):raise HTTPException(400,'Neplatná URL')
- profile_id = int(auth_profile_id) if auth_profile_id and auth_profile_id.strip() else None
- c=con();p=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0];c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id) VALUES(?,?,?,?,?,?)',(name,'web',source,max(5,duration),p,profile_id));c.commit();c.close();return {'ok':1}
-@app.post('/api/assets/upload')
-async def upload(name:str=Form(...),duration:int=Form(15),file:UploadFile=File(...),u=Depends(auth)):
- ext=Path(file.filename or '').suffix.lower();kind='image' if ext in {'.png','.jpg','.jpeg','.webp','.gif'} else 'video' if ext in {'.mp4','.webm','.mkv'} else None
- if not kind:raise HTTPException(400,'Nepodporovaný soubor')
- fn=secrets.token_hex(10)+ext;size=0
- try:
-  with (MEDIA/fn).open('wb') as f:
-   while chunk:=await file.read(1048576):
-    size+=len(chunk)
-    if size>_UPLOAD_MAX:raise HTTPException(413,'Soubor je větší než 2 GB')
-    f.write(chunk)
- except BaseException:
-  (MEDIA/fn).unlink(missing_ok=True);raise
- c=con();p=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0];c.execute('INSERT INTO assets(name,kind,source,duration,position) VALUES(?,?,?,?,?)',(name,kind,'/media/'+fn,max(5,duration),p));c.commit();c.close();return {'ok':1}
-@app.delete('/api/assets/{i}')
-def delete(i:int,u=Depends(auth)):
- r=rows('SELECT source FROM assets WHERE id=?',(i,));c=con();c.execute('DELETE FROM assets WHERE id=?',(i,));c.commit();c.close()
- if r:_remove_media(r[0]['source'])
- return {'ok':1}
-@app.get('/api/profiles')
-def profiles(u=Depends(auth)):return rows("SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector,COALESCE(auth_type,'form') AS auth_type FROM auth_profiles")
-@app.post('/api/profiles')
-def profile(name:str=Form(...),login_url:str=Form(''),target_url:str=Form(...),username:str=Form(...),password:str=Form(...),user_selector:str=Form('input[name="name"],input[name="username"]'),pass_selector:str=Form('input[name="password"]'),submit_selector:str=Form('button[type="submit"],input[type="submit"]'),auth_type:str=Form('form'),u=Depends(auth)):
- auth_type=_profile_type(auth_type);login_url=login_url.strip() or (target_url.strip() if auth_type=='http' else '')
- if not target_url.strip().startswith(('http://','https://')) or not login_url.startswith(('http://','https://')):raise HTTPException(400,'URL musí začínat http:// nebo https://')
- c=con();c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,submit_selector,auth_type) VALUES(?,?,?,?,?,?,?,?,?)',(name,login_url,target_url.strip(),vault.encrypt(username.encode()),vault.encrypt(password.encode()),user_selector,pass_selector,submit_selector,auth_type));c.commit();c.close();return {'ok':1}
-@app.get('/api/player/profile/{i}')
-def player_profile(i:int,req:Request):
- _local_only(req)
- c=con();r=c.execute('SELECT * FROM auth_profiles WHERE id=?',(i,)).fetchone();c.close()
- if not r:raise HTTPException(404)
- d=dict(r);d['username']=vault.decrypt(d.pop('username_enc')).decode();d['password']=vault.decrypt(d.pop('password_enc')).decode();return d
-@app.get('/api/system')
-def system(u=Depends(auth)):
- try:t=float(Path('/sys/class/thermal/thermal_zone0/temp').read_text())/1000
- except:t=None
- return {'hostname':socket.gethostname(),'cpu':psutil.cpu_percent(),'ram':psutil.virtual_memory().percent,'disk':psutil.disk_usage('/').percent,'temperature':t,'uptime':time.time()-psutil.boot_time(),'version':_caracal_version(),'runtime':RUNTIME}
-@app.post('/api/player/restart')
-def restart(u=Depends(auth)):request_player_restart();return {'ok':1}
-
-
-@app.put("/api/assets/{asset_id}")
-async def update_asset(
-    asset_id: int,
-    request: Request,
-    u=Depends(auth),
-):
-    data = await request.json()
-
-    name = str(
-        data.get("name", "")
-    ).strip()
-
-    source = str(
-        data.get("source", "")
-    ).strip()
-
-    try:
-        duration = max(
-            5,
-            int(data.get("duration", 30)),
-        )
-    except (TypeError, ValueError):
-        raise HTTPException(
-            400,
-            "Neplatná doba zobrazení",
-        )
-
-    raw_profile = data.get("auth_profile_id")
-
-    if raw_profile in (
-        None,
-        "",
-        "null",
-    ):
-        profile_id = None
-    else:
-        try:
-            profile_id = int(raw_profile)
-        except (TypeError, ValueError):
-            raise HTTPException(
-                400,
-                "Neplatný přihlašovací profil",
-            )
-
-    if not name:
-        raise HTTPException(
-            400,
-            "Název nesmí být prázdný",
-        )
-
-    connection = con()
-
-    current = connection.execute(
-        "SELECT * FROM assets WHERE id=?",
-        (asset_id,),
-    ).fetchone()
-
-    if not current:
-        connection.close()
-        raise HTTPException(
-            404,
-            "Položka nebyla nalezena",
-        )
-
-    if current["kind"] == "web":
-        if not source.startswith(
-            (
-                "http://",
-                "https://",
-            )
-        ):
-            connection.close()
-            raise HTTPException(
-                400,
-                "URL musí začínat http:// nebo https://",
-            )
-    else:
-        source = current["source"]
-        profile_id = None
-
-    connection.execute(
-        """
-        UPDATE assets
-        SET name=?,
-            source=?,
-            duration=?,
-            auth_profile_id=?
-        WHERE id=?
-        """,
-        (
-            name,
-            source,
-            duration,
-            profile_id,
-            asset_id,
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    return {
-        "ok": True,
-    }
-
-
-# PROFILE_EDIT_API_V4
-@app.put("/api/profiles/{profile_id}")
-async def edit_profile_v4(profile_id: int, request: Request, u=Depends(auth)):
-    data = await request.json()
+def setup(username: str = Form(...), password: str = Form(...)):
+    if rows('SELECT id FROM users LIMIT 1'):
+        raise HTTPException(409, 'Setup completed')
+    if len(password) < 10:
+        raise HTTPException(400, 'Heslo musí mít nejméně 10 znaků')
     c = con()
-    r = c.execute("SELECT * FROM auth_profiles WHERE id=?", (profile_id,)).fetchone()
-    if not r:
-        c.close()
-        raise HTTPException(404, "Profil nebyl nalezen")
-    name = str(data.get("name", "")).strip()
-    auth_type = _profile_type(data.get("auth_type", r["auth_type"]))
-    login = str(data.get("login_url", "")).strip()
-    target = str(data.get("target_url", "")).strip()
-    us = str(data.get("user_selector", "")).strip()
-    ps = str(data.get("pass_selector", "")).strip()
-    ss = str(data.get("submit_selector", "")).strip()
-    if auth_type == "http":
-        # the browser's pop-up has no page and no form: only the address and the credentials matter
-        login = login or target
-        us = us or r["user_selector"] or 'input[name="username"]'
-        ps = ps or r["pass_selector"] or 'input[name="password"]'
-        ss = ss or r["submit_selector"] or 'button[type="submit"]'
-    if not name or not login.startswith(("http://", "https://")) or not target.startswith(("http://", "https://")) or not us or not ps or not ss:
-        c.close()
-        raise HTTPException(400, "Zkontroluj povinna pole a URL")
-    username = str(data.get("username", ""))
-    password = str(data.get("password", ""))
-    ue = vault.encrypt(username.encode()) if username.strip() else r["username_enc"]
-    pe = vault.encrypt(password.encode()) if password else r["password_enc"]
-    c.execute("UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,pass_selector=?,submit_selector=?,auth_type=? WHERE id=?", (name,login,target,ue,pe,us,ps,ss,auth_type,profile_id))
+    uid = c.execute('INSERT INTO users(username,password_hash) VALUES(?,?)', (username, pwd.hash(password))).lastrowid
     c.commit()
     c.close()
-    return {"ok": True}
-
-# CARACAL_SCALE_DELETE_V2
-@app.put('/api/assets/{asset_id}/scale')
-async def save_scale(asset_id:int,request:Request,u=Depends(auth)):
- data=await request.json()
- try:s=float(data.get('scale',1))
- except:raise HTTPException(400,'Neplatne meritko')
- if not .5<=s<=3:raise HTTPException(400,'Meritko musi byt 0.5 az 3.0')
- c=con();c.execute('update assets set scale=? where id=?',(s,asset_id));c.commit();c.close();return {'ok':True}
-@app.delete('/api/profiles/{profile_id}')
-def drop_profile(profile_id:int,u=Depends(auth)):
- c=con();c.execute('update assets set auth_profile_id=NULL where auth_profile_id=?',(profile_id,));c.execute('delete from auth_profiles where id=?',(profile_id,));c.commit();c.close();return {'ok':True}
+    return _session(uid)
 
 
-# CARACAL_REBOOT_API_V1
-@app.post("/api/system/reboot")
-async def reboot_device(request: Request, u=Depends(auth)):
+@app.post('/api/login')
+def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    ip = request.client.host if request.client else ''
+    now = time.time()
+    recent = [t for t in _login_fails.get(ip, []) if t > now - 300]
+    if len(recent) >= 10:
+        raise HTTPException(429, 'Příliš mnoho pokusů o přihlášení, zkuste to za 5 minut')
+    r = rows('SELECT * FROM users WHERE username=?', (username,))
+    if not r or not pwd.verify(password, r[0]['password_hash']):
+        _login_fails[ip] = recent + [now]
+        raise HTTPException(401, 'Chybné přihlášení')
+    _login_fails.pop(ip, None)
+    return _session(r[0]['id'])
+
+
+@app.get('/api/me')
+def me(u=Depends(auth)):
+    return u
+
+
+@app.post('/api/logout')
+def logout():
+    r = JSONResponse({'ok': 1})
+    r.delete_cookie('session')
+    return r
+
+
+# ------------------------------------------------------------------ playlist
+
+def _next_position(c):
+    return c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0]
+
+
+def _scale(value, message='Měřítko musí být 0,5 až 3,0'):
+    try:
+        scale = float(str(value).strip().replace(',', '.'))
+    except (TypeError, ValueError):
+        raise HTTPException(400, 'Neplatné měřítko')
+    if not 0.5 <= scale <= 3.0:
+        raise HTTPException(400, message)
+    return scale
+
+
+def _duration(value, default=30):
+    try:
+        return max(5, int(value if value not in (None, '') else default))
+    except (TypeError, ValueError):
+        raise HTTPException(400, 'Neplatná doba zobrazení')
+
+
+def _profile_ref(value):
+    """A login profile of a website: None, or the id of an existing profile."""
+    if value in (None, '', 'null'):
+        return None
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, 'Neplatný přihlašovací profil')
+    if not rows('SELECT id FROM auth_profiles WHERE id=?', (pid,)):
+        raise HTTPException(404, 'Přihlašovací profil nebyl nalezen')
+    return pid
+
+
+@app.get('/api/assets')
+def assets(u=Depends(auth)):
+    return rows('SELECT * FROM assets ORDER BY position,id')
+
+
+@app.post('/api/v9/assets/web')
+async def add_web(request: Request, u=Depends(auth)):
     data = await request.json()
-    if data.get("confirm") != "REBOOT":
-        raise HTTPException(400, "Restart nebyl potvrzen")
-    request_reboot()
-    return {"ok": True}
+    name, source = str(data.get('name', '')).strip(), str(data.get('source', '')).strip()
+    if not name:
+        raise HTTPException(400, 'Vyplň název')
+    if not source.startswith(('http://', 'https://')):
+        raise HTTPException(400, 'URL musí začínat http:// nebo https://')
+    duration, scale, profile_id = _duration(data.get('duration'), 30), _scale(data.get('scale', 1)), _profile_ref(data.get('auth_profile_id'))
+    c = con()
+    asset_id = c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,?,?)',
+                         (name, 'web', source, duration, _next_position(c), profile_id, scale)).lastrowid
+    c.commit()
+    c.close()
+    return {'ok': True, 'id': asset_id, 'scale': scale}
 
 
-# CARACAL_LIVE_CONTROL_V1
-import json as _caracal_json
-import threading as _caracal_threading
-_CARACAL_STATE_FILE = DATA / "player-state.json"
-_CARACAL_STATE_LOCK = _caracal_threading.Lock()
-def _caracal_default_state():
- return {"current_id":None,"current_name":"","force_id":None,"frozen":False,"remaining":None,"duration":None,"updated":0,"player_online":False}
-def _caracal_read_state():
- with _CARACAL_STATE_LOCK:
-  try:
-   data=_caracal_json.loads(_CARACAL_STATE_FILE.read_text(encoding="utf-8"))
-   state=_caracal_default_state();state.update(data);return state
-  except Exception:return _caracal_default_state()
-def _caracal_write_state(state):
- with _CARACAL_STATE_LOCK:
-  tmp=_CARACAL_STATE_FILE.with_suffix(".tmp")
-  tmp.write_text(_caracal_json.dumps(state,ensure_ascii=False),encoding="utf-8")
-  tmp.replace(_CARACAL_STATE_FILE)
-@app.get("/api/player/status")
-def caracal_player_status(u=Depends(auth)):
- state=_caracal_read_state();state["player_online"]=(time.time()-float(state.get("updated") or 0))<8;return state
-@app.get("/api/player/control-state")
-def caracal_player_control_state(req:Request):
- _local_only(req)
- state=_caracal_read_state();return {"force_id":state.get("force_id"),"frozen":bool(state.get("frozen"))}
-@app.post("/api/player/heartbeat")
-async def caracal_player_heartbeat(req:Request):
- _local_only(req)
- data=await req.json();state=_caracal_read_state()
- for key in ("current_id","current_name","remaining","duration"):
-  if key in data:state[key]=data[key]
- state["updated"]=time.time();state["player_online"]=True;_caracal_write_state(state);return {"ok":True}
-@app.post("/api/player/control")
-async def caracal_player_control(req:Request,u=Depends(auth)):
- data=await req.json();action=data.get("action");state=_caracal_read_state()
- if action=="show":
-  aid=int(data.get("asset_id"));
-  if not rows("SELECT id FROM assets WHERE id=?",(aid,)):raise HTTPException(404,"Položka nebyla nalezena")
-  state["force_id"]=aid;state["frozen"]=False
- elif action=="freeze":
-  aid=data.get("asset_id") or state.get("current_id")
-  if not aid:raise HTTPException(400,"Není vybraná položka")
-  state["force_id"]=int(aid);state["frozen"]=True;state["remaining"]=None
- elif action=="unfreeze":
-  state["force_id"]=None;state["frozen"]=False
- elif action=="next":
-  state["force_id"]=None;state["frozen"]=False;state["remaining"]=0
- else:raise HTTPException(400,"Neznámá akce")
- state["updated"]=time.time();_caracal_write_state(state);return {"ok":True,"state":state}
+@app.post('/api/assets/upload')
+async def upload(name: str = Form(...), duration: int = Form(15), file: UploadFile = File(...), u=Depends(auth)):
+    ext = Path(file.filename or '').suffix.lower()
+    kind = 'image' if ext in _IMAGE_EXT else 'video' if ext in _VIDEO_EXT else None
+    if not kind:
+        raise HTTPException(400, 'Nepodporovaný soubor')
+    fn, size = secrets.token_hex(10) + ext, 0
+    try:
+        with (MEDIA / fn).open('wb') as f:
+            while chunk := await file.read(1048576):
+                size += len(chunk)
+                if size > _UPLOAD_MAX:
+                    raise HTTPException(413, 'Soubor je větší než 2 GB')
+                f.write(chunk)
+    except BaseException:
+        (MEDIA / fn).unlink(missing_ok=True)
+        raise
+    c = con()
+    c.execute('INSERT INTO assets(name,kind,source,duration,position) VALUES(?,?,?,?,?)',
+              (name, kind, '/media/' + fn, max(5, duration), _next_position(c)))
+    c.commit()
+    c.close()
+    return {'ok': 1}
 
 
-# CARACAL_LIVE_CONTROL_V2
-import json as _cc2_json
-import threading as _cc2_threading
-_CC2_FILE=DATA/"player-control-v2.json"
-_CC2_LOCK=_cc2_threading.Lock()
-def _cc2_default():
- return {"command_id":0,"action":"","asset_id":None,"current_id":None,"current_name":"","frozen":False,"remaining":None,"duration":None,"updated":0}
-def _cc2_read():
- with _CC2_LOCK:
-  try:
-   x=_cc2_default();x.update(_cc2_json.loads(_CC2_FILE.read_text(encoding="utf-8")));return x
-  except Exception:return _cc2_default()
-def _cc2_write(x):
- with _CC2_LOCK:
-  t=_CC2_FILE.with_suffix(".tmp");t.write_text(_cc2_json.dumps(x,ensure_ascii=False),encoding="utf-8");t.replace(_CC2_FILE)
-@app.get("/api/v2/player/status")
-def cc2_status(u=Depends(auth)):
- x=_cc2_read();x["player_online"]=(time.time()-float(x.get("updated") or 0))<8;return x
-@app.get("/api/v2/player/command")
-def cc2_command(req:Request):
- _local_only(req)
- x=_cc2_read();return {"command_id":x.get("command_id",0),"action":x.get("action",""),"asset_id":x.get("asset_id")}
-@app.post("/api/v2/player/heartbeat")
-async def cc2_heartbeat(req:Request):
- _local_only(req)
- d=await req.json();x=_cc2_read()
- for k in ("current_id","current_name","frozen","remaining","duration"):
-  if k in d:x[k]=d[k]
- x["updated"]=time.time();_cc2_write(x);return {"ok":True}
-@app.post("/api/v2/player/control")
-async def cc2_control(req:Request,u=Depends(auth)):
- d=await req.json();a=str(d.get("action",""));aid=d.get("asset_id")
- if a not in ("show","freeze","unfreeze","next"):raise HTTPException(400,"Neznámá akce")
- if a in ("show","freeze"):
-  if aid is None:raise HTTPException(400,"Vyber položku")
-  aid=int(aid)
-  if not rows("SELECT id FROM assets WHERE id=?",(aid,)):raise HTTPException(404,"Položka nenalezena")
- x=_cc2_read();x["command_id"]=int(x.get("command_id",0))+1;x["action"]=a;x["asset_id"]=int(aid) if aid is not None else None;x["updated"]=time.time();_cc2_write(x);return {"ok":True,"command_id":x["command_id"]}
-
-
-# CARACAL_KIOSK_FIX_V3
-@app.post("/api/v3/player/restart")
-def caracal_restart_player_v3(u=Depends(auth)):
- request_player_restart()
- return {"ok":True}
-@app.post("/api/v3/player/overlay")
-async def caracal_overlay_v3(request:Request,u=Depends(auth)):
- data=await request.json();enabled=bool(data.get("enabled"));state=_cc2_read() if "_cc2_read" in globals() else {}
- state["overlay_enabled"]=enabled
- if "_cc2_write" in globals():_cc2_write(state)
- return {"ok":True,"enabled":enabled}
-@app.get("/api/v3/player/overlay-state")
-def caracal_overlay_state_v3(u=Depends(auth)):
- state=_cc2_read() if "_cc2_read" in globals() else {}
- return {"enabled":bool(state.get("overlay_enabled",True))}
-
-
-# CARACAL_PLAYLIST_REORDER_V1
-@app.put("/api/assets/reorder")
-async def caracal_reorder_assets(request: Request, u=Depends(auth)):
+@app.put('/api/assets/{asset_id}')
+async def update_asset(asset_id: int, request: Request, u=Depends(auth)):
+    """Name, display time and (websites) address and login profile; the size and dark mode have their own routes."""
     data = await request.json()
-    ids = data.get("ids")
+    name, source = str(data.get('name', '')).strip(), str(data.get('source', '')).strip()
+    duration, profile_id = _duration(data.get('duration'), 30), _profile_ref(data.get('auth_profile_id'))
+    if not name:
+        raise HTTPException(400, 'Název nesmí být prázdný')
+    current = rows('SELECT * FROM assets WHERE id=?', (asset_id,))
+    if not current:
+        raise HTTPException(404, 'Položka nebyla nalezena')
+    if current[0]['kind'] == 'web':
+        if not source.startswith(('http://', 'https://')):
+            raise HTTPException(400, 'URL musí začínat http:// nebo https://')
+    else:
+        source, profile_id = current[0]['source'], None
+    c = con()
+    c.execute('UPDATE assets SET name=?,source=?,duration=?,auth_profile_id=? WHERE id=?', (name, source, duration, profile_id, asset_id))
+    c.commit()
+    c.close()
+    return {'ok': True}
+
+
+@app.put('/api/v7/assets/{asset_id}/scale')
+async def save_scale(asset_id: int, request: Request, u=Depends(auth)):
+    scale = _scale((await request.json()).get('scale'), 'Měřítko musí být 50 až 300 %')
+    a = rows('SELECT kind FROM assets WHERE id=?', (asset_id,))
+    if not a:
+        raise HTTPException(404, 'Položka nebyla nalezena')
+    if a[0]['kind'] not in ('web', 'grafana-tag'):
+        raise HTTPException(400, 'Měřítko lze měnit jen u webu nebo Grafana kolekce')
+    c = con()
+    c.execute('UPDATE assets SET scale=? WHERE id=?', (scale, asset_id))
+    c.commit()
+    c.close()
+    return {'ok': True, 'asset_id': asset_id, 'scale': scale}
+
+
+@app.delete('/api/assets/{i}')
+def delete(i: int, u=Depends(auth)):
+    r = rows('SELECT source FROM assets WHERE id=?', (i,))
+    c = con()
+    c.execute('DELETE FROM assets WHERE id=?', (i,))
+    c.commit()
+    c.close()
+    if r:
+        _remove_media(r[0]['source'])
+    return {'ok': 1}
+
+
+@app.put('/api/playlist/reorder')
+async def reorder(request: Request, u=Depends(auth)):
+    ids = (await request.json()).get('ids')
     if not isinstance(ids, list) or not ids:
-        raise HTTPException(400, "Chybí pořadí playlistu")
+        raise HTTPException(400, 'Chybí pořadí playlistu')
     try:
         ids = [int(x) for x in ids]
     except (TypeError, ValueError):
-        raise HTTPException(400, "Neplatné ID položky")
-    existing = [row["id"] for row in rows("SELECT id FROM assets ORDER BY position,id")]
+        raise HTTPException(400, 'Neplatné ID položky')
+    existing = [r['id'] for r in rows('SELECT id FROM assets ORDER BY position,id')]
     if len(ids) != len(existing) or set(ids) != set(existing):
-        raise HTTPException(400, "Seznam položek neodpovídá playlistu")
+        raise HTTPException(409, 'Playlist se mezitím změnil. Obnov stránku a zkus to znovu.')
     c = con()
     for position, asset_id in enumerate(ids):
-        c.execute("UPDATE assets SET position=? WHERE id=?", (position, asset_id))
-    c.commit(); c.close()
-    return {"ok": True, "ids": ids}
+        c.execute('UPDATE assets SET position=? WHERE id=?', (position, asset_id))
+    c.commit()
+    c.close()
+    return {'ok': True, 'ids': ids}
 
 
-# CARACAL_REORDER_OVERLAY_SIZE_V2
-@app.put("/api/playlist/reorder")
-async def caracal_playlist_reorder_v2(request: Request, u=Depends(auth)):
-    data = await request.json()
-    ids = data.get("ids")
-    if not isinstance(ids, list) or not ids:
-        raise HTTPException(400, "Chybí pořadí playlistu")
-    try:
-        ids = [int(value) for value in ids]
-    except (TypeError, ValueError):
-        raise HTTPException(400, "Neplatné ID položky")
-    existing = [row["id"] for row in rows("SELECT id FROM assets ORDER BY position,id")]
-    if len(ids) != len(existing) or set(ids) != set(existing):
-        raise HTTPException(409, "Playlist se mezitím změnil. Obnov stránku a zkus to znovu.")
-    c = con()
-    for position, asset_id in enumerate(ids):
-        c.execute("UPDATE assets SET position=? WHERE id=?", (position, asset_id))
-    c.commit(); c.close()
-    return {"ok": True, "ids": ids}
-
-@app.get("/api/v4/player/overlay-settings")
-def caracal_overlay_settings_v4(u=Depends(auth)):
-    state = _cc2_read() if "_cc2_read" in globals() else {}
-    return {"enabled": bool(state.get("overlay_enabled", True)), "size": int(state.get("overlay_size", 16))}
-
-@app.put("/api/v4/player/overlay-settings")
-async def caracal_overlay_settings_save_v4(request: Request, u=Depends(auth)):
-    data = await request.json()
-    state = _cc2_read() if "_cc2_read" in globals() else {}
-    enabled = bool(data.get("enabled", state.get("overlay_enabled", True)))
-    try:
-        size = int(data.get("size", state.get("overlay_size", 16)))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "Neplatná velikost odpočtu")
-    if size < 1:
-        raise HTTPException(400, "Velikost odpočtu musí být kladné celé číslo")
-    state["overlay_enabled"] = enabled
-    state["overlay_size"] = size
-    if "_cc2_write" in globals(): _cc2_write(state)
-    return {"ok": True, "enabled": enabled, "size": size}
+# Grafana collections: every dashboard with a tag, found through Grafana's guest access. The player asks for the
+# expanded playlist every few seconds; Grafana is asked at most once a minute per collection and a short outage keeps
+# the last known dashboards instead of emptying the playlist.
+_GRAFANA_CACHE, _GRAFANA_TTL, _GRAFANA_LOCK = {}, 60, threading.Lock()
 
 
-# CARACAL_GRAFANA_TAG_COLLECTION_V1
-import json as _grafana_json
-import urllib.parse as _grafana_urlparse
-import urllib.request as _grafana_urlrequest
-import ssl as _grafana_ssl
+def _grafana_cached(base_url, tag, max_age=_GRAFANA_TTL):
+    key = (str(base_url or '').rstrip('/'), str(tag or ''))
+    hit = _GRAFANA_CACHE.get(key)
+    if hit and time.time() - hit[0] < max_age:
+        return hit[1]
+    with _GRAFANA_LOCK:
+        hit = _GRAFANA_CACHE.get(key)
+        if hit and time.time() - hit[0] < max_age:
+            return hit[1]
+        try:
+            return _grafana_discover(*key)
+        except HTTPException:
+            if hit:
+                _GRAFANA_CACHE[key] = (time.time() - max_age + 15, hit[1])   # stale, tried again in 15 s
+                return hit[1]
+            raise
 
-# The player asks for the expanded playlist every few seconds; Grafana is asked at most once a minute per collection
-# and a short outage keeps the last known dashboards instead of emptying the playlist.
-import threading as _grafana_threading
-_GRAFANA_CACHE={};_GRAFANA_TTL=60;_GRAFANA_LOCK=_grafana_threading.Lock()
-def _grafana_cached(base_url,tag,max_age=_GRAFANA_TTL):
- key=(str(base_url or '').rstrip('/'),str(tag or ''))
- hit=_GRAFANA_CACHE.get(key)
- if hit and time.time()-hit[0]<max_age:return hit[1]
- with _GRAFANA_LOCK:
-  hit=_GRAFANA_CACHE.get(key)
-  if hit and time.time()-hit[0]<max_age:return hit[1]
-  try:return _grafana_discover(*key)
-  except HTTPException:
-   if hit:_GRAFANA_CACHE[key]=(time.time()-max_age+15,hit[1]);return hit[1]   # stale, tried again in 15 s
-   raise
 
 def _grafana_discover(base_url, tag):
- base=base_url.rstrip('/')
- query=_grafana_urlparse.urlencode({'tag':tag,'type':'dash-db','limit':5000})
- request=_grafana_urlrequest.Request(base+'/api/search?'+query,headers={'Accept':'application/json','User-Agent':'CARACAL/1.0'})
- context=_grafana_ssl._create_unverified_context()
- try:
-  with _grafana_urlrequest.urlopen(request,timeout=15,context=context) as response:
-   data=_grafana_json.loads(response.read().decode('utf-8'))
- except Exception as error:
-  raise HTTPException(400,'Grafana API není dostupné pro Guest účet: '+str(error))
- dashboards=[]
- for item in data:
-  if item.get('type')!='dash-db' or not item.get('url'):continue
-  dashboards.append({'title':item.get('title') or item.get('uid') or 'Grafana dashboard','url':base+item['url']})
- if len(_GRAFANA_CACHE)>200:_GRAFANA_CACHE.clear()
- _GRAFANA_CACHE[(base,str(tag or ''))]=(time.time(),dashboards)
- return dashboards
+    base = base_url.rstrip('/')
+    query = urllib.parse.urlencode({'tag': tag, 'type': 'dash-db', 'limit': 5000})
+    request = urllib.request.Request(base + '/api/search?' + query, headers={'Accept': 'application/json', 'User-Agent': 'CARACAL/1.0'})
+    try:
+        with urllib.request.urlopen(request, timeout=15, context=ssl._create_unverified_context()) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except Exception as error:
+        raise HTTPException(400, 'Grafana API není dostupné pro Guest účet: ' + str(error))
+    dashboards = [{'title': item.get('title') or item.get('uid') or 'Grafana dashboard', 'url': base + item['url']}
+                  for item in data if item.get('type') == 'dash-db' and item.get('url')]
+    if len(_GRAFANA_CACHE) > 200:
+        _GRAFANA_CACHE.clear()
+    _GRAFANA_CACHE[(base, str(tag or ''))] = (time.time(), dashboards)
+    return dashboards
+
+
+def _grafana_fields(name, grafana_url, tag):
+    name, grafana_url, tag = str(name or '').strip(), str(grafana_url or '').strip().rstrip('/'), str(tag or '').strip()
+    if not name or not tag:
+        raise HTTPException(400, 'Vyplň název a tag')
+    if not grafana_url.startswith(('http://', 'https://')):
+        raise HTTPException(400, 'URL Grafany musí začínat http:// nebo https://')
+    found = _grafana_discover(grafana_url, tag)
+    if not found:
+        raise HTTPException(404, 'Pod tímto tagem nebyl nalezen žádný dashboard dostupný pro Guest účet')
+    return name, grafana_url, tag, found
+
 
 @app.post('/api/assets/grafana-tag')
-def add_grafana_tag_collection(name:str=Form(...),grafana_url:str=Form(...),tag:str=Form(...),duration:int=Form(60),scale:float=Form(1.0),kiosk:bool=Form(True),u=Depends(auth)):
- name=name.strip();grafana_url=grafana_url.strip().rstrip('/');tag=tag.strip()
- if not name or not tag:raise HTTPException(400,'Vyplň název a tag')
- if not grafana_url.startswith(('http://','https://')):raise HTTPException(400,'URL Grafany musí začínat http:// nebo https://')
- if not .5<=scale<=3:raise HTTPException(400,'Měřítko musí být 0.5 až 3.0')
- found=_grafana_discover(grafana_url,tag)
- if not found:raise HTTPException(404,'Pod tímto tagem nebyl nalezen žádný dashboard dostupný pro Guest účet')
- config={'grafana_url':grafana_url,'tag':tag,'kiosk':bool(kiosk)}
- c=con();position=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0]
- q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,NULL,?)',(name,'grafana-tag',_grafana_json.dumps(config,ensure_ascii=False),max(5,duration),position,scale));c.commit();c.close()
- return {'ok':True,'dashboards':len(found),'id':q.lastrowid}
+def add_grafana_collection(name: str = Form(...), grafana_url: str = Form(...), tag: str = Form(...), duration: int = Form(60),
+                           scale: float = Form(1.0), kiosk: bool = Form(True), u=Depends(auth)):
+    scale = _scale(scale)
+    name, grafana_url, tag, found = _grafana_fields(name, grafana_url, tag)
+    config = {'grafana_url': grafana_url, 'tag': tag, 'kiosk': bool(kiosk)}
+    c = con()
+    asset_id = c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,NULL,?)',
+                         (name, 'grafana-tag', json.dumps(config, ensure_ascii=False), max(5, duration), _next_position(c), scale)).lastrowid
+    c.commit()
+    c.close()
+    return {'ok': True, 'dashboards': len(found), 'id': asset_id}
+
+
+@app.put('/api/grafana-collections/{asset_id}')
+async def update_grafana_collection(asset_id: int, request: Request, u=Depends(auth)):
+    data = await request.json()
+    row = rows("SELECT * FROM assets WHERE id=? AND kind='grafana-tag'", (asset_id,))
+    if not row:
+        raise HTTPException(404, 'Grafana kolekce nebyla nalezena')
+    row, config = row[0], json.loads(row[0]['source'] or '{}')
+    scale = _scale(data.get('scale', row['scale'] or 1.0), 'Měřítko musí být 50 až 300 %')
+    duration = _duration(data.get('duration'), row['duration'] or 60)
+    name, grafana_url, tag, found = _grafana_fields(data.get('name') or row['name'], data.get('grafana_url', config.get('grafana_url', '')),
+                                                    data.get('tag', config.get('tag', '')))
+    config = {'grafana_url': grafana_url, 'tag': tag, 'kiosk': bool(data.get('kiosk', config.get('kiosk', True)))}
+    c = con()
+    c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=? WHERE id=?', (name, json.dumps(config, ensure_ascii=False), duration, scale, asset_id))
+    c.commit()
+    c.close()
+    return {'ok': True, 'dashboards': len(found), 'scale': scale}
+
 
 @app.post('/api/grafana/discover')
-def test_grafana_tag(grafana_url:str=Form(...),tag:str=Form(...),u=Depends(auth)):
- result=_grafana_discover(grafana_url.strip(),tag.strip())
- return {'ok':True,'count':len(result),'dashboards':result[:50]}
+def try_grafana_tag(grafana_url: str = Form(...), tag: str = Form(...), u=Depends(auth)):
+    result = _grafana_discover(grafana_url.strip(), tag.strip())
+    return {'ok': True, 'count': len(result), 'dashboards': result[:50]}
+
 
 def expanded_player_playlist():
- output=[];web_dark=_web_dark()
- for asset in rows('SELECT * FROM assets ORDER BY position,id'):
-  if asset.get('kind')!='grafana-tag':
-   if asset.get('kind')=='web':asset['dark']=_dark_of(asset,web_dark)
-   output.append(asset);continue
-  dark=_dark_of(asset,web_dark)
-  try:
-   config=_grafana_json.loads(asset.get('source') or '{}')
-   discovered=_grafana_cached(config.get('grafana_url',''),config.get('tag',''))
-   for index,dashboard in enumerate(discovered):
-    separator='&' if '?' in dashboard['url'] else '?'
-    url=dashboard['url']
-    if config.get('kiosk',True):url=url+separator+'kiosk=1';separator='&'
-    if dark!='off':url=url+separator+'theme=dark'   # Grafana's own dark theme
-    output.append({'id':int(asset['id'])*100000+index,'parent_id':asset['id'],'name':asset['name']+' · '+dashboard['title'],'kind':'web','source':url,'duration':asset['duration'],'position':asset['position'],'auth_profile_id':None,'scale':asset.get('scale') or 1.0,'dark':'dark' if dark=='force' else dark})
-  except Exception as error:
-   print('Grafana collection error',asset.get('id'),error,flush=True)
- return output
+    """The playlist as the player plays it: a Grafana collection becomes its dashboards (id = collection * 100000 +
+    index), every website gets its resulting dark mode."""
+    output, web_dark = [], _web_dark()
+    for asset in rows('SELECT * FROM assets ORDER BY position,id'):
+        if asset.get('kind') != 'grafana-tag':
+            if asset.get('kind') == 'web':
+                asset['dark'] = _dark_of(asset, web_dark)
+            output.append(asset)
+            continue
+        dark = _dark_of(asset, web_dark)
+        try:
+            config = json.loads(asset.get('source') or '{}')
+            for index, dashboard in enumerate(_grafana_cached(config.get('grafana_url', ''), config.get('tag', ''))):
+                url = dashboard['url']
+                params = (['kiosk=1'] if config.get('kiosk', True) else []) + (['theme=dark'] if dark != 'off' else [])
+                if params:
+                    url += ('&' if '?' in url else '?') + '&'.join(params)
+                output.append({'id': int(asset['id']) * 100000 + index, 'parent_id': asset['id'],
+                               'name': asset['name'] + ' · ' + dashboard['title'], 'kind': 'web', 'source': url,
+                               'duration': asset['duration'], 'position': asset['position'], 'auth_profile_id': None,
+                               'scale': asset.get('scale') or 1.0, 'dark': 'dark' if dark == 'force' else dark})
+        except Exception as error:
+            print('Grafana collection error', asset.get('id'), error, flush=True)
+    return output
+
+
+# ------------------------------------------------------------------ website logins
+
+def _profile_type(value):
+    return 'http' if str(value or '').strip().lower() == 'http' else 'form'
+
+
+@app.get('/api/profiles')
+def profiles(u=Depends(auth)):
+    return rows("SELECT id,name,login_url,target_url,user_selector,pass_selector,submit_selector,"
+                "COALESCE(auth_type,'form') AS auth_type FROM auth_profiles")
+
+
+@app.post('/api/profiles')
+def add_profile(name: str = Form(...), login_url: str = Form(''), target_url: str = Form(...), username: str = Form(...),
+                password: str = Form(...), user_selector: str = Form('input[name="name"],input[name="username"]'),
+                pass_selector: str = Form('input[name="password"]'),
+                submit_selector: str = Form('button[type="submit"],input[type="submit"]'), auth_type: str = Form('form'),
+                u=Depends(auth)):
+    auth_type = _profile_type(auth_type)
+    login_url = login_url.strip() or (target_url.strip() if auth_type == 'http' else '')
+    if not target_url.strip().startswith(('http://', 'https://')) or not login_url.startswith(('http://', 'https://')):
+        raise HTTPException(400, 'URL musí začínat http:// nebo https://')
+    c = con()
+    c.execute('INSERT INTO auth_profiles(name,login_url,target_url,username_enc,password_enc,user_selector,pass_selector,'
+              'submit_selector,auth_type) VALUES(?,?,?,?,?,?,?,?,?)',
+              (name, login_url, target_url.strip(), vault.encrypt(username.encode()), vault.encrypt(password.encode()),
+               user_selector, pass_selector, submit_selector, auth_type))
+    c.commit()
+    c.close()
+    return {'ok': 1}
+
+
+@app.put('/api/profiles/{profile_id}')
+async def edit_profile(profile_id: int, request: Request, u=Depends(auth)):
+    """Empty user name or password keep the stored ones; an HTTP login needs no form and no selectors."""
+    data = await request.json()
+    r = rows('SELECT * FROM auth_profiles WHERE id=?', (profile_id,))
+    if not r:
+        raise HTTPException(404, 'Profil nebyl nalezen')
+    r = r[0]
+    auth_type = _profile_type(data.get('auth_type', r['auth_type']))
+    name = str(data.get('name', '')).strip()
+    login, target = str(data.get('login_url', '')).strip(), str(data.get('target_url', '')).strip()
+    us, ps, ss = (str(data.get(k, '')).strip() for k in ('user_selector', 'pass_selector', 'submit_selector'))
+    if auth_type == 'http':
+        login = login or target
+        us = us or r['user_selector'] or 'input[name="username"]'
+        ps = ps or r['pass_selector'] or 'input[name="password"]'
+        ss = ss or r['submit_selector'] or 'button[type="submit"]'
+    if not name or not login.startswith(('http://', 'https://')) or not target.startswith(('http://', 'https://')) or not us or not ps or not ss:
+        raise HTTPException(400, 'Zkontroluj povinna pole a URL')
+    username, password = str(data.get('username', '')), str(data.get('password', ''))
+    ue = vault.encrypt(username.encode()) if username.strip() else r['username_enc']
+    pe = vault.encrypt(password.encode()) if password else r['password_enc']
+    c = con()
+    c.execute('UPDATE auth_profiles SET name=?,login_url=?,target_url=?,username_enc=?,password_enc=?,user_selector=?,'
+              'pass_selector=?,submit_selector=?,auth_type=? WHERE id=?', (name, login, target, ue, pe, us, ps, ss, auth_type, profile_id))
+    c.commit()
+    c.close()
+    return {'ok': True}
+
+
+@app.delete('/api/profiles/{profile_id}')
+def delete_profile(profile_id: int, u=Depends(auth)):
+    c = con()
+    c.execute('UPDATE assets SET auth_profile_id=NULL WHERE auth_profile_id=?', (profile_id,))
+    c.execute('DELETE FROM auth_profiles WHERE id=?', (profile_id,))
+    c.commit()
+    c.close()
+    return {'ok': True}
+
+
+# ------------------------------------------------------------------ player
+
+# The player's state and the commands for it live in one small file shared by the app's workers: the player reports
+# what it shows every second (/api/v2/player/heartbeat) and asks for the latest command (/api/v6/player/command).
+# The key names stay as they are: the file outlives updates.
+_CC2_FILE = DATA / 'player-control-v2.json'
+_CC2_LOCK = threading.Lock()
+
+
+def _cc2_read():
+    with _CC2_LOCK:
+        state = {'current_id': None, 'current_name': '', 'frozen': False, 'remaining': None, 'duration': None, 'updated': 0}
+        try:
+            state.update(json.loads(_CC2_FILE.read_text(encoding='utf-8')))
+        except Exception:
+            pass
+        return state
+
+
+def _cc2_write(state):
+    with _CC2_LOCK:
+        tmp = _CC2_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(_CC2_FILE)
+
+
+@app.get('/api/player/playlist')
+def player_playlist(req: Request):
+    _local_only(req)
+    return rows('SELECT * FROM assets ORDER BY position,id')
+
 
 @app.get('/api/player/playlist-expanded')
-def expanded_player_playlist_route(req:Request):
- _local_only(req);return expanded_player_playlist()
+def player_playlist_expanded(req: Request):
+    _local_only(req)
+    return expanded_player_playlist()
 
 
-# CARACAL_GRAFANA_COLLECTION_EDIT_V1
-@app.put('/api/grafana-collections/{asset_id}')
-async def update_grafana_collection(asset_id:int,request:Request,u=Depends(auth)):
- data=await request.json();c=con();row=c.execute('SELECT * FROM assets WHERE id=? AND kind=?',(asset_id,'grafana-tag')).fetchone()
- if not row:c.close();raise HTTPException(404,'Grafana kolekce nebyla nalezena')
- try:scale=float(data.get('scale',row['scale'] or 1.0));duration=max(5,int(data.get('duration',row['duration'] or 60)))
- except (TypeError,ValueError):c.close();raise HTTPException(400,'Neplatné měřítko nebo doba zobrazení')
- if not .5<=scale<=3:c.close();raise HTTPException(400,'Měřítko musí být 50 až 300 %')
- config=_grafana_json.loads(row['source'] or '{}');name=str(data.get('name',row['name'])).strip() or row['name'];tag=str(data.get('tag',config.get('tag',''))).strip();grafana_url=str(data.get('grafana_url',config.get('grafana_url',''))).strip().rstrip('/');kiosk=bool(data.get('kiosk',config.get('kiosk',True)))
- if not grafana_url.startswith(('http://','https://')):c.close();raise HTTPException(400,'URL Grafany musí začínat http:// nebo https://')
- if not tag:c.close();raise HTTPException(400,'Tag nesmí být prázdný')
- found=_grafana_discover(grafana_url,tag)
- if not found:c.close();raise HTTPException(404,'Pod tímto tagem nebyl nalezen žádný dashboard')
- config={'grafana_url':grafana_url,'tag':tag,'kiosk':kiosk};c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=? WHERE id=?',(name,_grafana_json.dumps(config,ensure_ascii=False),duration,scale,asset_id));c.commit();c.close();return {'ok':True,'dashboards':len(found),'scale':scale}
+@app.get('/api/player/profile/{i}')
+def player_profile(i: int, req: Request):
+    """The login of a website with its credentials, only for the player of this device."""
+    _local_only(req)
+    r = rows('SELECT * FROM auth_profiles WHERE id=?', (i,))
+    if not r:
+        raise HTTPException(404)
+    d = r[0]
+    d['username'] = vault.decrypt(d.pop('username_enc')).decode()
+    d['password'] = vault.decrypt(d.pop('password_enc')).decode()
+    return d
 
 
-# CARACAL_GRAFANA_LIVE_SELECT_V1
+@app.post('/api/v2/player/heartbeat')
+async def player_heartbeat(req: Request):
+    _local_only(req)
+    d = await req.json()
+    state = _cc2_read()
+    for k in ('current_id', 'current_name', 'frozen', 'remaining', 'duration'):
+        if k in d:
+            state[k] = d[k]
+    state['updated'] = time.time()
+    _cc2_write(state)
+    return {'ok': True}
+
+
+@app.get('/api/v2/player/status')
+def player_status(u=Depends(auth)):
+    state = _cc2_read()
+    state['player_online'] = time.time() - float(state.get('updated') or 0) < 8
+    return state
+
+
 @app.get('/api/v5/player/live-options')
-def caracal_live_options_v5(u=Depends(auth)):
-    raw=rows('SELECT * FROM assets ORDER BY position,id')
-    expanded=expanded_player_playlist()
-    options=[]
-    for asset in raw:
-        if asset.get('kind')=='grafana-tag':
-            children=[x for x in expanded if x.get('parent_id')==asset['id']]
-            options.append({'type':'collection','id':asset['id'],'name':asset['name'],'count':len(children)})
-            for child in children:
-                options.append({'type':'dashboard','id':child['id'],'parent_id':asset['id'],'name':child['name']})
+def live_options(u=Depends(auth)):
+    """What the live control can show: items, Grafana collections and their single dashboards."""
+    expanded, options = expanded_player_playlist(), []
+    for asset in rows('SELECT * FROM assets ORDER BY position,id'):
+        if asset.get('kind') == 'grafana-tag':
+            children = [x for x in expanded if x.get('parent_id') == asset['id']]
+            options.append({'type': 'collection', 'id': asset['id'], 'name': asset['name'], 'count': len(children)})
+            options += [{'type': 'dashboard', 'id': x['id'], 'parent_id': asset['id'], 'name': x['name']} for x in children]
         else:
-            options.append({'type':'asset','id':asset['id'],'name':asset['name'],'kind':asset['kind']})
+            options.append({'type': 'asset', 'id': asset['id'], 'name': asset['name'], 'kind': asset['kind']})
     return options
 
-@app.get('/api/v5/player/command')
-def caracal_command_v5(req:Request):
-    _local_only(req)
-    state=_cc2_read();return {'command_id':state.get('v5_command_id',0),'action':state.get('v5_action',''),'item_id':state.get('v5_item_id'),'collection_id':state.get('v5_collection_id')}
 
-@app.post('/api/v5/player/control')
-async def caracal_control_v5(req:Request,u=Depends(auth)):
-    data=await req.json();action=str(data.get('action',''));item_id=data.get('item_id');collection_id=data.get('collection_id')
-    if action not in ('show','freeze','freeze_collection','unfreeze','next'):raise HTTPException(400,'Neznámá akce')
-    expanded=expanded_player_playlist();raw=rows('SELECT * FROM assets ORDER BY position,id')
-    if action in ('show','freeze'):
-        try:item_id=int(item_id)
-        except:raise HTTPException(400,'Vyber dashboard nebo položku')
-        if not any(int(x['id'])==item_id for x in expanded):raise HTTPException(404,'Vybraná položka už není dostupná')
-    if action=='freeze_collection':
-        try:collection_id=int(collection_id)
-        except:raise HTTPException(400,'Vyber Grafana kolekci')
-        if not any(x['id']==collection_id and x['kind']=='grafana-tag' for x in raw):raise HTTPException(404,'Grafana kolekce nebyla nalezena')
-        if not any(x.get('parent_id')==collection_id for x in expanded):raise HTTPException(404,'Kolekce neobsahuje žádné dostupné dashboardy')
-    state=_cc2_read();state['v5_command_id']=int(state.get('v5_command_id',0))+1;state['v5_action']=action;state['v5_item_id']=item_id;state['v5_collection_id']=collection_id;state['updated']=time.time();_cc2_write(state)
-    return {'ok':True,'command_id':state['v5_command_id']}
+def _player_command(action, item_id=None, collection_id=None):
+    """Validate a live control command and hand it to the player (used by the admin UI and by Fleet)."""
+    if action not in ('show', 'freeze', 'show_collection', 'freeze_collection', 'unfreeze', 'next'):
+        raise HTTPException(400, 'Neznámá akce')
+    if action in ('show', 'freeze', 'show_collection', 'freeze_collection'):
+        expanded = expanded_player_playlist()
+        if action in ('show', 'freeze'):
+            try:
+                item_id = int(item_id)
+            except (TypeError, ValueError):
+                raise HTTPException(400, 'Vyber položku nebo dashboard')
+            if not any(int(x['id']) == item_id for x in expanded):
+                raise HTTPException(404, 'Vybraná položka není dostupná')
+        else:
+            try:
+                collection_id = int(collection_id)
+            except (TypeError, ValueError):
+                raise HTTPException(400, 'Vyber Grafana kolekci')
+            if not rows("SELECT id FROM assets WHERE id=? AND kind='grafana-tag'", (collection_id,)):
+                raise HTTPException(404, 'Grafana kolekce nebyla nalezena')
+            if not any(x.get('parent_id') == collection_id for x in expanded):
+                raise HTTPException(404, 'Kolekce neobsahuje dostupné dashboardy')
+    # 'updated' is the player's liveness timestamp, so it is not touched here
+    state = _cc2_read()
+    state['v6_command_id'] = int(state.get('v6_command_id', 0)) + 1
+    state.update(v6_action=action, v6_item_id=item_id, v6_collection_id=collection_id)
+    _cc2_write(state)
+    return state['v6_command_id']
 
 
-# CARACAL_COLLECTION_CONTROL_FIX_V2
 @app.post('/api/v6/player/control')
-async def caracal_control_v6(req:Request,u=Depends(auth)):
- data=await req.json();action=str(data.get('action',''));item_id=data.get('item_id');collection_id=data.get('collection_id')
- if action not in ('show','freeze','show_collection','freeze_collection','unfreeze','next'):raise HTTPException(400,'Neznámá akce')
- expanded=expanded_player_playlist();raw=rows('SELECT * FROM assets ORDER BY position,id')
- if action in ('show','freeze'):
-  try:item_id=int(item_id)
-  except:raise HTTPException(400,'Vyber položku nebo dashboard')
-  if not any(int(x['id'])==item_id for x in expanded):raise HTTPException(404,'Vybraná položka není dostupná')
- if action in ('show_collection','freeze_collection'):
-  try:collection_id=int(collection_id)
-  except:raise HTTPException(400,'Vyber Grafana kolekci')
-  if not any(x['id']==collection_id and x['kind']=='grafana-tag' for x in raw):raise HTTPException(404,'Grafana kolekce nebyla nalezena')
-  if not any(x.get('parent_id')==collection_id for x in expanded):raise HTTPException(404,'Kolekce neobsahuje dostupné dashboardy')
- state=_cc2_read();state['v6_command_id']=int(state.get('v6_command_id',0))+1;state['v6_action']=action;state['v6_item_id']=item_id;state['v6_collection_id']=collection_id;state['updated']=time.time();_cc2_write(state)
- return {'ok':True,'command_id':state['v6_command_id']}
+async def player_control(req: Request, u=Depends(auth)):
+    d = await req.json()
+    return {'ok': True, 'command_id': _player_command(str(d.get('action', '')), d.get('item_id'), d.get('collection_id'))}
+
+
 @app.get('/api/v6/player/command')
-def caracal_command_v6(req:Request):
- _local_only(req)
- s=_cc2_read();return {'command_id':s.get('v6_command_id',0),'action':s.get('v6_action',''),'item_id':s.get('v6_item_id'),'collection_id':s.get('v6_collection_id'),'restart_id':s.get('restart_player_request',0)}
+def player_command(req: Request):
+    _local_only(req)
+    s = _cc2_read()
+    return {'command_id': s.get('v6_command_id', 0), 'action': s.get('v6_action', ''), 'item_id': s.get('v6_item_id'),
+            'collection_id': s.get('v6_collection_id'), 'restart_id': s.get('restart_player_request', 0)}
 
 
-# CARACAL_SCALE_PERSIST_FIX_V7
-@app.put('/api/v7/assets/{asset_id}/scale')
-async def caracal_save_scale_v7(asset_id:int,request:Request,u=Depends(auth)):
- data=await request.json()
- try:scale=float(data.get('scale'))
- except (TypeError,ValueError):raise HTTPException(400,'Neplatné měřítko')
- if scale<0.5 or scale>3.0:raise HTTPException(400,'Měřítko musí být 50 až 300 %')
- c=con();asset=c.execute('SELECT id,kind FROM assets WHERE id=?',(asset_id,)).fetchone()
- if not asset:c.close();raise HTTPException(404,'Položka nebyla nalezena')
- if asset['kind'] not in ('web','grafana-tag'):c.close();raise HTTPException(400,'Měřítko lze měnit jen u webu nebo Grafana kolekce')
- c.execute('UPDATE assets SET scale=? WHERE id=?',(scale,asset_id));c.commit()
- saved=c.execute('SELECT scale FROM assets WHERE id=?',(asset_id,)).fetchone()['scale'];c.close()
- return {'ok':True,'asset_id':asset_id,'scale':float(saved)}
+@app.post('/api/v3/player/restart')
+def restart_player(u=Depends(auth)):
+    request_player_restart()
+    return {'ok': True}
 
 
-# CARACAL_ADD_WEB_SCALE_FIX_V9
-@app.post('/api/v9/assets/web')
-async def caracal_add_web_v9(request:Request,u=Depends(auth)):
- data=await request.json()
- name=str(data.get('name','')).strip()
- source=str(data.get('source','')).strip()
- if not name:raise HTTPException(400,'Vyplň název')
- if not source.startswith(('http://','https://')):raise HTTPException(400,'URL musí začínat http:// nebo https://')
- try:duration=max(5,int(data.get('duration',30)))
- except (TypeError,ValueError):raise HTTPException(400,'Neplatná doba zobrazení')
- raw_scale=str(data.get('scale','1')).strip().replace(',','.')
- try:scale=float(raw_scale)
- except (TypeError,ValueError):raise HTTPException(400,'Neplatné měřítko')
- if scale<0.5 or scale>3.0:raise HTTPException(400,'Měřítko musí být 0,5 až 3,0')
- raw_profile=data.get('auth_profile_id')
- try:profile_id=int(raw_profile) if raw_profile not in (None,'','null') else None
- except (TypeError,ValueError):raise HTTPException(400,'Neplatný přihlašovací profil')
- if profile_id is not None and not rows('SELECT id FROM auth_profiles WHERE id=?',(profile_id,)):raise HTTPException(404,'Přihlašovací profil nebyl nalezen')
- c=con();position=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM assets').fetchone()[0]
- cursor=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale) VALUES(?,?,?,?,?,?,?)',(name,'web',source,duration,position,profile_id,scale));asset_id=cursor.lastrowid;c.commit()
- saved=c.execute('SELECT scale FROM assets WHERE id=?',(asset_id,)).fetchone()['scale'];c.close()
- return {'ok':True,'id':asset_id,'scale':float(saved)}
+def _overlay_state():
+    state = _cc2_read()
+    return {'enabled': bool(state.get('overlay_enabled', True)), 'size': int(state.get('overlay_size', 16))}
 
 
-# CARACAL_FLEET_API_V2
+def _save_overlay(data):
+    """The countdown bar at the bottom of the screen: on/off and its height."""
+    state, current = _cc2_read(), _overlay_state()
+    enabled = bool(data.get('enabled', current['enabled']))
+    try:
+        size = int(data.get('size', current['size']))
+    except (TypeError, ValueError):
+        raise HTTPException(400, 'Neplatná velikost odpočtu')
+    if size < 1:
+        raise HTTPException(400, 'Velikost odpočtu musí být kladné celé číslo')
+    state['overlay_enabled'], state['overlay_size'] = enabled, size
+    _cc2_write(state)
+    return {'ok': True, 'enabled': enabled, 'size': size}
+
+
+@app.get('/api/v4/player/overlay-settings')
+def overlay_settings(u=Depends(auth)):
+    return _overlay_state()
+
+
+@app.put('/api/v4/player/overlay-settings')
+async def save_overlay_settings(request: Request, u=Depends(auth)):
+    return _save_overlay(await request.json())
+
+
+# ------------------------------------------------------------------ the device
+
+@app.get('/api/system')
+def system(u=Depends(auth)):
+    try:
+        temperature = float(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000
+    except (OSError, ValueError):
+        temperature = None
+    return {'hostname': socket.gethostname(), 'cpu': psutil.cpu_percent(), 'ram': psutil.virtual_memory().percent,
+            'disk': psutil.disk_usage('/').percent, 'temperature': temperature, 'uptime': time.time() - psutil.boot_time(),
+            'version': _caracal_version(), 'runtime': RUNTIME}
+
+
+@app.post('/api/system/reboot')
+async def reboot_device(request: Request, u=Depends(auth)):
+    if (await request.json()).get('confirm') != 'REBOOT':
+        raise HTTPException(400, 'Restart nebyl potvrzen')
+    request_reboot()
+    return {'ok': True}
+
+
+# ------------------------------------------------------------------ CARACAL Fleet API
 # Local API for the CARACAL Fleet Agent (CARACAL Fleet repository, docs/LOCAL-API.md).
 # Authenticated with the shared key in /etc/caracal-fleet-key, written by the agent when it is enrolled.
 # Replaces the hand-applied CARACAL_FLEET_API_V1 patch: the snapshot returns the live v2 player state.
-import hmac as _fleet_hmac
 _FLEET_KEY_FILE=Path(os.getenv('CARACAL_FLEET_KEY_FILE','/etc/caracal-fleet-key'))
 _FLEET_MEDIA_MAX=2*1024**3
 _FLEET_IMAGE={'.png','.jpg','.jpeg','.webp','.gif'};_FLEET_VIDEO={'.mp4','.webm','.mkv'}
 def _fleet_auth(req:Request):
  try:key=_FLEET_KEY_FILE.read_text().strip()
  except OSError:raise HTTPException(503,'Fleet Agent is not configured')
- if not key or not _fleet_hmac.compare_digest(req.headers.get('X-Fleet-Key',''),key):raise HTTPException(401,'Invalid Fleet key')
+ if not key or not hmac.compare_digest(req.headers.get('X-Fleet-Key',''),key):raise HTTPException(401,'Invalid Fleet key')
 def _fleet_duration(value):
  try:return max(5,int(float(value)))
  except (TypeError,ValueError):raise HTTPException(400,'Invalid duration')
@@ -741,7 +840,7 @@ def _fleet_collections():
  for asset in rows("SELECT id,name,source FROM assets WHERE kind='grafana-tag' ORDER BY position,id"):
   item={'id':asset['id'],'name':asset['name'],'dashboards':[]}
   try:
-   config=_grafana_json.loads(asset.get('source') or '{}')
+   config=json.loads(asset.get('source') or '{}')
    for index,dashboard in enumerate(_grafana_cached(config.get('grafana_url',''),config.get('tag',''))[:500]):
     item['dashboards'].append({'id':int(asset['id'])*100000+index,'name':dashboard['title'],'source':dashboard['url']})
   except Exception as error:item['error']=str(getattr(error,'detail',error))[:300]
@@ -754,7 +853,7 @@ def fleet_snapshot(req:Request):
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
  return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows('SELECT * FROM assets ORDER BY position,id'),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications(),
   'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))},
-  'collections':_fleet_collections(),'screenshot':_shot_info(),'player_settings':_player_settings()}
+  'collections':_fleet_collections(),'screenshot':_shot_info(),'player_settings':_player_settings(),'display':_display_info()}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -788,7 +887,7 @@ async def fleet_add_grafana_tag(req:Request):
  _fleet_auth(req);d=await req.json();name=str(d.get('name','')).strip()
  if not name:raise HTTPException(400,'Name must not be empty')
  config=_fleet_grafana_config(d);duration=_fleet_duration(d.get('duration',60));scale=_fleet_scale(d.get('scale',1));dark=_dark_value(d.get('dark'))
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale,dark) VALUES(?,?,?,?,?,NULL,?,?)',(name,'grafana-tag',_grafana_json.dumps(config,ensure_ascii=False),duration,_fleet_position(c),scale,dark));c.commit();c.close()
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale,dark) VALUES(?,?,?,?,?,NULL,?,?)',(name,'grafana-tag',json.dumps(config,ensure_ascii=False),duration,_fleet_position(c),scale,dark));c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.post('/api/fleet/v1/assets/upload')
@@ -829,9 +928,9 @@ async def fleet_update_asset(asset_id:int,req:Request):
   if not source.startswith(('http://','https://')):raise HTTPException(400,'URL must start with http:// or https://')
  if a['kind']=='web' and 'auth_profile_id' in d:profile_id=_fleet_profile_id(d['auth_profile_id'])
  if a['kind']=='grafana-tag' and any(k in d for k in ('grafana_url','tag','kiosk')):
-  try:current=_grafana_json.loads(a['source'] or '{}')
+  try:current=json.loads(a['source'] or '{}')
   except ValueError:current={}
-  source=_grafana_json.dumps(_fleet_grafana_config(d,current),ensure_ascii=False)
+  source=json.dumps(_fleet_grafana_config(d,current),ensure_ascii=False)
  dark=_dark_value(d['dark']) if 'dark' in d and a['kind'] in ('web','grafana-tag') else a.get('dark')
  c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=?,auth_profile_id=?,dark=? WHERE id=?',(name,source,duration,scale,profile_id,dark,asset_id));c.commit();c.close()
  return {'ok':True}
@@ -878,14 +977,13 @@ def fleet_delete_profile(profile_id:int,req:Request):
  return {'ok':True,'unassigned':n}
 
 
-# CARACAL_NOTIFY_V1
+# ------------------------------------------------------------------ notifications
 # On-screen notifications. Apps send them to /api/notify/v1 with their own token (one token per app, revocable,
 # rate limited). The app keeps a single queue and the overlay shows one notification at a time, asking
 # GET /api/notify/overlay what to show. Queue rules: higher level first, the same 'key' replaces a waiting
 # notification, a full queue drops the oldest of the lowest level, waiting notifications expire.
 # See docs/NOTIFICATIONS.md.
-import base64 as _ntf_base64,hashlib as _ntf_hashlib,re as _ntf_re,threading as _ntf_threading,urllib.parse as _ntf_urlparse
-_NTF_LOCK=_ntf_threading.Lock()
+_NTF_LOCK=threading.Lock()
 _NTF_LEVELS={'info':1,'success':1,'warning':2,'critical':3}
 _NTF_CRITICAL={'critical','crit','error','err','fatal','emergency','alert','disaster','high','highest','blocker','immediate','page','urgent','max','down','5'}
 _NTF_WARNING={'warning','warn','average','degraded','major','4'}
@@ -895,7 +993,6 @@ _NTF_DEFAULTS={'enabled':'1','position':'top-right','duration':'8','max_queue':'
 # The look of notifications on the screen, drawn by the overlay with Tk: colours, an icon per level, the shape (a stripe,
 # a solid colour or a border), the font, the width (100 = a banner across the screen), opacity, what is shown and the
 # animation. Edited visually in the admin UI (and in CARACAL Fleet) by static/notify-style.js.
-import json as _ntf_json
 # With Pillow the overlay draws the notification as a picture (player/notify_render.py), which adds rounded corners,
 # a gradient, see-through or blurred (glass) background, a shadow, a border colour, an uploaded picture and sizes.
 _NTF_STYLE={'bg':'#111926','title':'#f8fafc','text':'#cbd5e1','muted':'#94a3b8','fill':'stripe','stripe':100,'font':'DejaVu Sans','bold':True,
@@ -910,9 +1007,9 @@ _NTF_STYLE_RANGES={'stripe':(0,300),'opacity':(50,100),'width':(0,100),'speed':(
  'image_size':(10,60),'image_dim':(0,90),'title_size':(50,250),'text_size':(50,250),'padding':(50,250),'margin':(0,300),'progress_size':(50,400)}
 def _ntf_style(d,base=None):
  # missing keys keep the base (the stored look); raises ValueError with what is wrong
- out=_ntf_json.loads(_ntf_json.dumps(base or _NTF_STYLE))
+ out=json.loads(json.dumps(base or _NTF_STYLE))
  if not isinstance(d,dict):raise ValueError('vzhled musí být objekt')
- color=lambda v:isinstance(v,str) and _ntf_re.fullmatch(r'#[0-9a-fA-F]{6}',v)
+ color=lambda v:isinstance(v,str) and re.fullmatch(r'#[0-9a-fA-F]{6}',v)
  for k in ('bg','title','text','muted','bg2'):
   if k in d:
    if not color(d[k]):raise ValueError(f'{k}: barva ve tvaru #RRGGBB')
@@ -946,7 +1043,7 @@ def _ntf_style(d,base=None):
    out['levels'][level]['icon']=icon
  return out
 def _ntf_style_stored(raw):
- try:return _ntf_style(_ntf_json.loads(raw) if raw else {})
+ try:return _ntf_style(json.loads(raw) if raw else {})
  except (ValueError,TypeError):return _ntf_style({})
 # sound: which levels play a chime by themselves - off (none), critical, warning (and critical), all.
 # A notification sent with sound=true always plays; volume 0 mutes the screen completely.
@@ -967,13 +1064,13 @@ if 'look' not in [r[1] for r in c.execute('PRAGMA table_info(notifications)').fe
 c.commit();c.close()
 # notifications.done: 0 waiting or on screen, 1 shown, 2 dropped or expired, 3 removed by the administrator
 
-def _ntf_hash(token):return _ntf_hashlib.sha256(token.encode()).hexdigest()
+def _ntf_hash(token):return hashlib.sha256(token.encode()).hexdigest()
 def _ntf_settings():
  s=dict(_NTF_DEFAULTS);s.update({r['key']:r['value'] for r in rows('SELECT key,value FROM notify_settings')})
  return {'enabled':s['enabled']=='1','position':s['position'] if s['position'] in _NTF_POSITIONS else 'top-right','duration':int(s['duration']),'max_queue':int(s['max_queue']),'scale':int(s['scale']),'sound':s['sound'] if s['sound'] in _NTF_SOUNDS else 'off','volume':int(s['volume']),'sound_device':s['sound_device'],'history_max':int(s['history_max']),'history_days':int(s['history_days']),'style':_ntf_style_stored(s['style'])}
 def _ntf_text(value,limit):
- text=_ntf_re.sub(r'[\x00-\x08\x0b-\x1f\x7f]','',str(value if value is not None else '')).strip()
- text=_ntf_re.sub(r'\n{3,}','\n\n',text)
+ text=re.sub(r'[\x00-\x08\x0b-\x1f\x7f]','',str(value if value is not None else '')).strip()
+ text=re.sub(r'\n{3,}','\n\n',text)
  return text[:limit-1]+'…' if len(text)>limit else text
 def _ntf_level(value,default='info'):
  v=str(value if value is not None else '').strip().lower()
@@ -1002,7 +1099,7 @@ def _ntf_picture(d,headers=None):
   lo,hi=_NTF_STYLE_RANGES['image_size']
   if not lo<=n<=hi:raise HTTPException(400,f'image_size: {lo} to {hi}')
   out['image_size']=n
- return _ntf_json.dumps(out) if out else None
+ return json.dumps(out) if out else None
 def _ntf_sound(value):
  # per-notification override: true / false, or None for the screen's sound setting
  if value is None or value=='':return None
@@ -1115,7 +1212,7 @@ def _ntf_token(req:Request):
  if header.lower().startswith('bearer '):token=header[7:].strip()
  elif header.lower().startswith('basic '):
   # Basic auth for senders that only support it: any user name, the token as the password
-  try:token=_ntf_base64.b64decode(header[6:].strip()).decode().partition(':')[2].strip()
+  try:token=base64.b64decode(header[6:].strip()).decode().partition(':')[2].strip()
   except Exception:token=''
  token=token or req.headers.get('x-caracal-token','').strip() or req.query_params.get('token','').strip()
  r=rows('SELECT * FROM notify_tokens WHERE token_hash=?',(_ntf_hash(token),)) if token else []
@@ -1140,9 +1237,9 @@ async def _ntf_payload(req:Request):
  if len(body)>_NTF_BODY_MAX:raise HTTPException(413,'Notification too large')
  ctype=req.headers.get('content-type','').lower();text=body.decode('utf-8',errors='replace').strip()
  if 'json' in ctype or text[:1] in ('{','['):
-  try:return _grafana_json.loads(text)
+  try:return json.loads(text)
   except ValueError:raise HTTPException(400,'Invalid JSON')
- if 'x-www-form-urlencoded' in ctype:return {k:v[-1] for k,v in _ntf_urlparse.parse_qs(text).items() if k!='token'}
+ if 'x-www-form-urlencoded' in ctype:return {k:v[-1] for k,v in urllib.parse.parse_qs(text).items() if k!='token'}
  # plain text body (curl -d, ntfy style): title, level etc. from headers or the query string
  d={k:v for k,v in req.query_params.items() if k!='token'};d['message']=text or d.get('message','');return d
 async def _ntf_receive(req:Request,token_id,source):
@@ -1173,7 +1270,7 @@ def notify_overlay(req:Request):
  current=None
  if cur and s['enabled']:
   current={k:cur[k] for k in ('id','title','message','level','source','duration')};current['remaining']=max(0.0,cur['shown_at']+cur['duration']-now)
-  try:current['look']=_ntf_json.loads(cur['look']) if cur['look'] else {}
+  try:current['look']=json.loads(cur['look']) if cur['look'] else {}
   except (ValueError,IndexError,KeyError):current['look']={}
   current['sound']=cur['sound']==1 or (cur['sound']!=0 and (cur['priority'] or 1)>=_NTF_SOUNDS[s['sound']])
  return {'enabled':s['enabled'],'position':s['position'],'scale':s['scale'],'volume':s['volume'],'sound_device':s['sound_device'],'sounds':{k:v['sha256'][:16] for k,v in _snd_meta().items()},'style':s['style'],'current':current,'waiting':waiting,
@@ -1204,11 +1301,11 @@ def _ntf_save_settings(d,req,actor):
  if s['sound'] not in _NTF_SOUNDS:raise HTTPException(400,'Neplatné nastavení zvuku')
  if not 0<=s['volume']<=100:raise HTTPException(400,'Hlasitost musí být 0 až 100 %')
  # ALSA device name passed to aplay -D, e.g. default, hdmi:CARD=vc4hdmi0,DEV=0, plughw:1,0
- if not _ntf_re.fullmatch(r'[A-Za-z0-9:=,._-]{0,100}',s['sound_device']):raise HTTPException(400,'Neplatný název zvukového zařízení')
+ if not re.fullmatch(r'[A-Za-z0-9:=,._-]{0,100}',s['sound_device']):raise HTTPException(400,'Neplatný název zvukového zařízení')
  if not 50<=s['history_max']<=5000:raise HTTPException(400,'Historie musí mít 50 až 5000 záznamů')
  if not 1<=s['history_days']<=90:raise HTTPException(400,'Historii jde držet 1 až 90 dní')
  before=_ntf_settings();c=con()
- for k in _NTF_DEFAULTS:c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',(k,('1' if s[k] else '0') if k=='enabled' else _ntf_json.dumps(s[k],ensure_ascii=False) if k=='style' else str(s[k])))
+ for k in _NTF_DEFAULTS:c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',(k,('1' if s[k] else '0') if k=='enabled' else json.dumps(s[k],ensure_ascii=False) if k=='style' else str(s[k])))
  c.commit();c.close()
  changes=', '.join('vzhled oznámení' if k=='style' else f'{k}: {before[k]} → {s[k]}' for k in _NTF_DEFAULTS if before[k]!=s[k])
  if changes:_ntf_audit(req,actor,'Nastavení změněno',changes)
@@ -1290,11 +1387,11 @@ async def fleet_notify(req:Request):
  _fleet_auth(req);_ntf_rate('fleet',120,'CARACAL Fleet',req);return await _ntf_receive(req,0,'CARACAL Fleet')
 
 
-# CARACAL_NOTIFY_WATCHERS_V1
+# ------------------------------------------------------------------ notification watchers
 # Watchers: the node itself asks another app's REST API (new tickets, issues, orders, ...) every few seconds and
 # puts a notification into the queue for every item whose ID it has not seen yet. The first check only remembers
 # what is already there. Credentials are encrypted with the vault key and never returned by the API.
-_WCH_LOCK=_ntf_threading.Lock()
+_WCH_LOCK=threading.Lock()
 _WCH_AUTH=('none','bearer','basic','header','oauth2')
 _WCH_GRANTS=('client_credentials','password','refresh_token')
 _WCH_SECRETS=('username','secret','client_secret','refresh_token')   # stored encrypted in credentials_enc
@@ -1319,10 +1416,10 @@ def _wch_get(obj,path):
 def _wch_render(template,item):
  def value(match):
   v=_wch_get(item,match.group(1).strip())
-  return '' if v is None else _grafana_json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else str(v)
- return _ntf_re.sub(r'\{([^{}]+)\}',value,str(template or ''))
+  return '' if v is None else json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else str(v)
+ return re.sub(r'\{([^{}]+)\}',value,str(template or ''))
 def _wch_credentials(row):
- try:return _grafana_json.loads(vault.decrypt(row['credentials_enc']).decode()) if row and row['credentials_enc'] else {}
+ try:return json.loads(vault.decrypt(row['credentials_enc']).decode()) if row and row['credentials_enc'] else {}
  except Exception:return {}
 
 def _wch_error_text(error):
@@ -1330,14 +1427,14 @@ def _wch_error_text(error):
  try:raw=error.read(65536).decode('utf-8','replace')
  except Exception:return ''
  try:
-  d=_grafana_json.loads(raw)
+  d=json.loads(raw)
   if isinstance(d,dict):
    nested=d.get('error') if isinstance(d.get('error'),dict) else {}
    parts=[d.get('error') if isinstance(d.get('error'),str) else None,d.get('error_description'),nested.get('message'),d.get('message'),d.get('detail'),d.get('title')]
    text=' – '.join(dict.fromkeys(str(x) for x in parts if x))
    if text:return text[:300]
  except ValueError:pass
- text=_ntf_re.sub(r'\s+',' ',_ntf_re.sub(r'<(script|style)[^>]*>.*?</\1>|<[^>]+>',' ',raw,flags=_ntf_re.S|_ntf_re.I)).strip()
+ text=re.sub(r'\s+',' ',re.sub(r'<(script|style)[^>]*>.*?</\1>|<[^>]+>',' ',raw,flags=re.S|re.I)).strip()
  return text[:300]
 
 # OAuth2 access tokens, kept in memory until shortly before they expire: (watcher id, revision) -> (token, valid until)
@@ -1352,25 +1449,25 @@ def _wch_oauth_token(w,creds,watcher_id=None,fresh=False):
   if not creds.get('refresh_token'):raise ValueError('OAuth2: chybí refresh token')
   data['refresh_token']=creds['refresh_token']
  if w['oauth_scope']:data['scope']=w['oauth_scope']
- for key,value in _ntf_urlparse.parse_qsl(w['oauth_extra'] or ''):data.setdefault(key,value)
+ for key,value in urllib.parse.parse_qsl(w['oauth_extra'] or ''):data.setdefault(key,value)
  headers={'Accept':'application/json','Content-Type':'application/x-www-form-urlencoded','User-Agent':'CARACAL/1.0'}
  client_id=w['oauth_client_id'] or '';client_secret=creds.get('client_secret') or ''
  if w['oauth_client_auth']=='basic':
-  q=lambda x:_ntf_urlparse.quote(x,safe='')
-  headers['Authorization']='Basic '+_ntf_base64.b64encode(f'{q(client_id)}:{q(client_secret)}'.encode()).decode()
+  q=lambda x:urllib.parse.quote(x,safe='')
+  headers['Authorization']='Basic '+base64.b64encode(f'{q(client_id)}:{q(client_secret)}'.encode()).decode()
  else:
   if client_id:data['client_id']=client_id
   if client_secret:data['client_secret']=client_secret
- context=None if w['verify_tls'] else _grafana_ssl._create_unverified_context()
+ context=None if w['verify_tls'] else ssl._create_unverified_context()
  try:
-  request=_grafana_urlrequest.Request(w['oauth_token_url'],data=_ntf_urlparse.urlencode(data).encode(),headers=headers,method='POST')
-  with _grafana_urlrequest.urlopen(request,timeout=20,context=context) as response:body=response.read(1024**2)
- except _grafana_urlrequest.HTTPError as error:
+  request=urllib.request.Request(w['oauth_token_url'],data=urllib.parse.urlencode(data).encode(),headers=headers,method='POST')
+  with urllib.request.urlopen(request,timeout=20,context=context) as response:body=response.read(1024**2)
+ except urllib.request.HTTPError as error:
   # e.g. "invalid_client – Client authentication failed"; servers that do not follow RFC 6749 get their text shown
   sent=', '.join(sorted(data))+(', Basic' if 'Authorization' in headers else '')
   raise ValueError(f'OAuth2 token: HTTP {error.code} {_wch_error_text(error) or error.reason} (odesláno: {sent})')
  except Exception as error:raise ValueError(f'OAuth2 token nedostupný: {getattr(error,"reason",None) or error}')
- try:answer=_grafana_json.loads(body.decode('utf-8','replace'));token=str(answer['access_token'])
+ try:answer=json.loads(body.decode('utf-8','replace'));token=str(answer['access_token'])
  except (ValueError,KeyError,TypeError):raise ValueError('OAuth2: odpověď neobsahuje access_token')
  try:expires=max(30,int(float(answer.get('expires_in') or 3600)))
  except (TypeError,ValueError):expires=3600
@@ -1383,29 +1480,29 @@ def _wch_oauth_token(w,creds,watcher_id=None,fresh=False):
    r=rows('SELECT credentials_enc FROM notify_watchers WHERE id=?',(watcher_id,))
    if r:
     stored=_wch_credentials(r[0]);stored['refresh_token']=rotated
-    c=con();c.execute('UPDATE notify_watchers SET credentials_enc=? WHERE id=?',(vault.encrypt(_grafana_json.dumps(stored).encode()),watcher_id));c.commit();c.close()
+    c=con();c.execute('UPDATE notify_watchers SET credentials_enc=? WHERE id=?',(vault.encrypt(json.dumps(stored).encode()),watcher_id));c.commit();c.close()
  return token
 
 def _wch_fetch(w,creds,watcher_id=None):
- context=None if w['verify_tls'] else _grafana_ssl._create_unverified_context()
+ context=None if w['verify_tls'] else ssl._create_unverified_context()
  def get(fresh=False):
   headers={'Accept':'application/json','User-Agent':'CARACAL/1.0'};secret=str(creds.get('secret') or '')
   if w['auth_type']=='bearer':headers['Authorization']='Bearer '+secret
-  elif w['auth_type']=='basic':headers['Authorization']='Basic '+_ntf_base64.b64encode(f"{creds.get('username') or ''}:{secret}".encode()).decode()
+  elif w['auth_type']=='basic':headers['Authorization']='Basic '+base64.b64encode(f"{creds.get('username') or ''}:{secret}".encode()).decode()
   elif w['auth_type']=='header':headers[w['auth_header'] or 'Authorization']=secret
   elif w['auth_type']=='oauth2':headers['Authorization']='Bearer '+_wch_oauth_token(w,creds,watcher_id,fresh)
-  with _grafana_urlrequest.urlopen(_grafana_urlrequest.Request(w['url'],headers=headers),timeout=20,context=context) as response:return response.read(_WCH_RESPONSE_MAX+1)
+  with urllib.request.urlopen(urllib.request.Request(w['url'],headers=headers),timeout=20,context=context) as response:return response.read(_WCH_RESPONSE_MAX+1)
  try:
   try:raw=get()
-  except _grafana_urlrequest.HTTPError as error:
+  except urllib.request.HTTPError as error:
    # a cached OAuth2 token may have been revoked before it expired: one more try with a new one
    if error.code!=401 or w['auth_type']!='oauth2':raise
    raw=get(fresh=True)
  except ValueError:raise
- except _grafana_urlrequest.HTTPError as error:raise ValueError(f'HTTP {error.code} {_wch_error_text(error) or error.reason}')
+ except urllib.request.HTTPError as error:raise ValueError(f'HTTP {error.code} {_wch_error_text(error) or error.reason}')
  except Exception as error:raise ValueError(f'Nedostupné: {getattr(error,"reason",None) or error}')
  if len(raw)>_WCH_RESPONSE_MAX:raise ValueError('Odpověď je větší než 5 MB')
- try:data=_grafana_json.loads(raw.decode('utf-8',errors='replace'))
+ try:data=json.loads(raw.decode('utf-8',errors='replace'))
  except ValueError:raise ValueError('Odpověď není JSON')
  items=_wch_get(data,w['list_path']) if w['list_path'] else data
  if isinstance(items,dict) and w['list_path']:items=list(items.values())
@@ -1435,7 +1532,7 @@ def _wch_check(w):
   except ValueError as error:
    c=con();c.execute('UPDATE notify_watchers SET last_check=?,last_error=? WHERE id=?',(now,str(error)[:300],w['id']));c.commit();c.close()
    return {'ok':False,'error':str(error)}
-  seen=_grafana_json.loads(w['seen'] or '[]');known=set(seen);new=[(i,it) for i,it in items if i not in known]
+  seen=json.loads(w['seen'] or '[]');known=set(seen);new=[(i,it) for i,it in items if i not in known]
   sent=0
   if w['initialized'] and new:
    notes=[_wch_note(w,i,it) for i,it in new]
@@ -1449,7 +1546,7 @@ def _wch_check(w):
   # are remembered only up to the limit, so a ticket that comes back (reopened) is not announced again soon
   seen=current+[x for x in seen if x not in current_set][:max(0,_WCH_SEEN_MAX-len(current))]
   # a watcher edited during the check keeps its reset state (revision check)
-  c=con();c.execute('UPDATE notify_watchers SET seen=?,initialized=1,last_check=?,last_error=NULL,last_count=?,last_new=? WHERE id=? AND revision=?',(_grafana_json.dumps(seen),now,len(items),len(new) if w['initialized'] else 0,w['id'],w['revision']));c.commit();c.close()
+  c=con();c.execute('UPDATE notify_watchers SET seen=?,initialized=1,last_check=?,last_error=NULL,last_count=?,last_new=? WHERE id=? AND revision=?',(json.dumps(seen),now,len(items),len(new) if w['initialized'] else 0,w['id'],w['revision']));c.commit();c.close()
   return {'ok':True,'count':len(items),'new':len(new) if w['initialized'] else 0,'sent':sent,'first':not w['initialized']}
 
 def _wch_loop():
@@ -1460,7 +1557,7 @@ def _wch_loop():
   except Exception as error:print('watcher error',error,flush=True)
   time.sleep(5)
 @app.on_event('startup')
-def _wch_start():_ntf_threading.Thread(target=_wch_loop,daemon=True,name='caracal-watchers').start()
+def _wch_start():threading.Thread(target=_wch_loop,daemon=True,name='caracal-watchers').start()
 
 def _wch_fields(d,current=None):
  current=current or {};out={}
@@ -1490,7 +1587,7 @@ def _wch_fields(d,current=None):
   if out['oauth_grant']=='client_credentials' and not out['oauth_client_id']:raise HTTPException(400,'Vyplň Client ID')
   if out['oauth_grant']=='password' and not (creds.get('username') and creds.get('secret')):raise HTTPException(400,'Vyplň uživatele a heslo')
   if out['oauth_grant']=='refresh_token' and not creds.get('refresh_token'):raise HTTPException(400,'Vlož refresh token')
- out['credentials_enc']=vault.encrypt(_grafana_json.dumps(creds).encode()) if creds else None
+ out['credentials_enc']=vault.encrypt(json.dumps(creds).encode()) if creds else None
  return out
 
 @app.get('/api/notify/watchers')
@@ -1542,7 +1639,7 @@ async def notify_watcher_preview(req:Request,u=Depends(auth)):
  return {'ok':True,'count':len(items),'samples':[_wch_note(w,i,it) for i,it in items[:3]]}
 
 
-# CARACAL_FLEET_NOTIFY_V1
+# ------------------------------------------------------------------ notifications from CARACAL Fleet
 # Notifications managed by CARACAL Fleet: settings, the queue and watchers (agent contract: docs/LOCAL-API.md in the
 # CARACAL Fleet repository). Authenticated with the Fleet key; the node's audit log names "CARACAL Fleet".
 _FLEET_ACTOR='CARACAL Fleet'
@@ -1585,11 +1682,10 @@ def fleet_watcher_check(watcher_id:int,req:Request):
  return _wch_check(r[0])
 
 
-# CARACAL_NOTIFY_SOUNDS_V1
+# ------------------------------------------------------------------ notification sounds
 # Custom notification sounds: one MP3 per level instead of the generated chime, uploaded in the admin UI or from
 # CARACAL Fleet. Stored as DATA/notify-sounds/<level>.mp3 (details in notify_settings 'sound_file_<level>'); the
 # overlay downloads it once, converts it to WAV with mpg123 and plays at most 15 s with the volume of the settings.
-import hashlib as _snd_hashlib
 _SND_DIR=DATA/'notify-sounds';_SND_DIR.mkdir(exist_ok=True)
 _SND_MAX=5*1024**2
 def _snd_level(level):
@@ -1600,7 +1696,7 @@ def _snd_meta():
  for r in rows("SELECT key,value FROM notify_settings WHERE key LIKE 'sound_file_%'"):
   level=r['key'][len('sound_file_'):]
   if level in _NTF_LEVELS and (_SND_DIR/f'{level}.mp3').is_file():
-   try:out[level]=_grafana_json.loads(r['value'])
+   try:out[level]=json.loads(r['value'])
    except ValueError:pass
  return out
 def _snd_is_mp3(head):
@@ -1610,7 +1706,7 @@ async def _snd_store(level,upload,req,actor):
  level=_snd_level(level)
  if upload is None or not hasattr(upload,'read'):raise HTTPException(400,'Chybí soubor')
  name=_ntf_text(Path(upload.filename or 'zvuk.mp3').name,120) or 'zvuk.mp3'
- tmp=_SND_DIR/f'{level}.part';size=0;digest=_snd_hashlib.sha256()
+ tmp=_SND_DIR/f'{level}.part';size=0;digest=hashlib.sha256()
  try:
   with tmp.open('wb') as f:
    while chunk:=await upload.read(1048576):
@@ -1622,7 +1718,7 @@ async def _snd_store(level,upload,req,actor):
   tmp.replace(_SND_DIR/f'{level}.mp3')
  finally:tmp.unlink(missing_ok=True)
  meta={'name':name,'size':size,'sha256':digest.hexdigest(),'uploaded':time.time()}
- c=con();c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',('sound_file_'+level,_grafana_json.dumps(meta,ensure_ascii=False)));c.commit();c.close()
+ c=con();c.execute('INSERT OR REPLACE INTO notify_settings(key,value) VALUES(?,?)',('sound_file_'+level,json.dumps(meta,ensure_ascii=False)));c.commit();c.close()
  _ntf_audit(req,actor,'Zvuk oznámení nahrán',f'{level}: {name}')
  return {'ok':True,'level':level,**meta}
 def _snd_delete(level,req,actor):
@@ -1657,7 +1753,7 @@ def fleet_notify_sound_delete(level:str,req:Request):
  _fleet_auth(req);return _snd_delete(level,req,_FLEET_ACTOR)
 
 
-# CARACAL_NOTIFY_IMAGE_V1
+# ------------------------------------------------------------------ the picture of the notification look
 # A picture for the notification look (a logo, a photo, a background): PNG, JPEG, GIF or WebP up to 5 MB, stored as
 # DATA/notify-image (details in notify_settings 'image_file'). Shown when the look has 'image' on; the overlay
 # downloads it once per version (the overlay poll carries the first 16 characters of its SHA-256).
@@ -1670,12 +1766,12 @@ def _img_type(head):
 def _img_meta():
  r=rows("SELECT value FROM notify_settings WHERE key='image_file'")
  if not r or not _IMG_FILE.is_file():return {}
- try:return _grafana_json.loads(r[0]['value'])
+ try:return json.loads(r[0]['value'])
  except ValueError:return {}
 async def _img_store(upload,req,actor):
  if upload is None or not hasattr(upload,'read'):raise HTTPException(400,'Chybí soubor')
  name=_ntf_text(Path(upload.filename or 'obrazek').name,120) or 'obrazek'
- tmp=DATA/'notify-image.part';size=0;digest=_snd_hashlib.sha256();kind=''
+ tmp=DATA/'notify-image.part';size=0;digest=hashlib.sha256();kind=''
  try:
   with tmp.open('wb') as f:
    while chunk:=await upload.read(1048576):
@@ -1689,7 +1785,7 @@ async def _img_store(upload,req,actor):
   tmp.replace(_IMG_FILE)
  finally:tmp.unlink(missing_ok=True)
  meta={'name':name,'size':size,'type':kind,'sha256':digest.hexdigest(),'uploaded':time.time()}
- c=con();c.execute("INSERT OR REPLACE INTO notify_settings(key,value) VALUES('image_file',?)",(_grafana_json.dumps(meta,ensure_ascii=False),));c.commit();c.close()
+ c=con();c.execute("INSERT OR REPLACE INTO notify_settings(key,value) VALUES('image_file',?)",(json.dumps(meta,ensure_ascii=False),));c.commit();c.close()
  _ntf_audit(req,actor,'Obrázek oznámení nahrán',name)
  return {'ok':True,**meta}
 def _img_delete(req,actor):
@@ -1720,11 +1816,10 @@ def fleet_notify_image_delete(req:Request):
  _fleet_auth(req);return _img_delete(req,_FLEET_ACTOR)
 
 
-# CARACAL_SCREENSHOT_V1
+# ------------------------------------------------------------------ the screen picture
 # What the TV shows right now. The admin UI (or CARACAL Fleet) asks for a picture; the overlay, which runs on the
 # device's display, sees the request in its next poll (about a second), reads the whole screen (page, countdown and
 # notifications) and uploads a JPEG here. Kept as DATA/screenshot.jpg until the next one.
-import asyncio as _shot_asyncio
 _SHOT_FILE=DATA/'screenshot.jpg';_SHOT_MAX=8*1024**2;_SHOT_WAIT=60
 _shot={'request':'','requested':0.0,'id':'','taken':0.0,'error':''}
 def _shot_info():
@@ -1759,13 +1854,13 @@ async def screenshot_upload(req:Request,id:str='',error:str=''):
 async def fleet_screenshot(req:Request):
  # asks for a picture and waits for it (up to 15 s); answers the JPEG itself
  _fleet_auth(req);request=_shot_request();deadline=time.time()+15
- while time.time()<deadline and _shot['id']!=request:await _shot_asyncio.sleep(.25)
+ while time.time()<deadline and _shot['id']!=request:await asyncio.sleep(.25)
  if _shot['id']!=request:raise HTTPException(504,'The screen did not answer; is the overlay running (caracal-overlay)?')
  if _shot['error']:raise HTTPException(409,_shot['error'])
  return FileResponse(_SHOT_FILE,media_type='image/jpeg',headers={'Cache-Control':'no-store'})
 
 
-# CARACAL_FLEET_PARITY_V1
+# ------------------------------------------------------------------ what the web administration offers, also for CARACAL Fleet
 # What the node's web administration can do, CARACAL Fleet can do as well: the web administrator account, the
 # countdown on the TV, the notification queue, history and audit log, the node's notification tokens, trying a
 # watcher before saving it and trying a Grafana tag. Authenticated with the Fleet key.
@@ -1826,14 +1921,11 @@ async def fleet_grafana_discover(req:Request):
  found=_grafana_discover(url,tag);return {'ok':True,'count':len(found),'dashboards':found[:50]}
 
 
-# CARACAL_WEB_DARK_V1
+# ------------------------------------------------------------------ websites in dark mode
 # Websites in dark mode: a setting of the node for every website and Grafana collection, and a choice of each item
 # (NULL = as the node). 'dark' asks the pages for their own dark look (prefers-color-scheme: dark), 'force' also
 # darkens pages that have none (Chromium's automatic dark mode). Grafana dashboards get its dark theme.
 _DARK_MODES=('off','dark','force')
-c=con();c.execute('CREATE TABLE IF NOT EXISTS player_settings(key TEXT PRIMARY KEY,value TEXT)')
-if 'dark' not in [r[1] for r in c.execute('PRAGMA table_info(assets)').fetchall()]:c.execute('ALTER TABLE assets ADD COLUMN dark TEXT')
-c.commit();c.close()
 def _dark_value(value,item=True):
  # an item may follow the node (None); the node's own setting must be one of the modes
  v=str(value or '').strip().lower()
@@ -1865,3 +1957,33 @@ async def asset_dark(asset_id:int,request:Request,u=Depends(auth)):
  d=await request.json();return _set_asset_dark(asset_id,d.get('dark') if isinstance(d,dict) else None)
 @app.put('/api/fleet/v1/player/settings')
 async def fleet_player_settings(req:Request):_fleet_auth(req);return {'ok':True,**_save_player_settings(await _fleet_json(req))}
+
+
+# ------------------------------------------------------------------ black screen watch
+# Black screen watch: the overlay reports once a minute whether the whole screen is black. A website that stays black
+# for 5 minutes gets the player restarted (at most every 30 minutes); a black picture or video is left alone, it may
+# be meant so. CARACAL Fleet sees the state in the snapshot.
+_BLACK_RESTART_AFTER,_BLACK_RESTART_EVERY=300,1800
+_display={'black_since':None,'checked':0.0,'restarted':0.0}
+def _display_info():
+ fresh=time.time()-_display['checked']<300
+ return {'black_since':_display['black_since'] if fresh else None,'checked':_display['checked'] or None,'restarted':_display['restarted'] or None}
+def _current_kind():
+ cur=_cc2_read().get('current_id')
+ if cur is None:return ''
+ try:cur=int(cur)
+ except (TypeError,ValueError):return ''
+ if cur>=100000:return 'web'   # a dashboard of a Grafana collection
+ r=rows('SELECT kind FROM assets WHERE id=?',(cur,))
+ return r[0]['kind'] if r else ''
+@app.post('/api/display/health')
+async def display_health(req:Request):
+ _local_only(req);d=await req.json();now=time.time()
+ black=bool(isinstance(d,dict) and d.get('black'))
+ _display['checked']=now
+ if not black:_display['black_since']=None;return {'ok':True}
+ _display['black_since']=_display['black_since'] or now
+ if now-_display['black_since']>=_BLACK_RESTART_AFTER and now-_display['restarted']>=_BLACK_RESTART_EVERY and _current_kind()=='web':
+  print('The screen has been black for',int(now-_display['black_since']),'s on a website: restarting the player',flush=True)
+  _display['restarted']=now;request_player_restart()
+ return {'ok':True,'black_since':_display['black_since']}
