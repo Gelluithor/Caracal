@@ -456,9 +456,18 @@ dialog[open]::backdrop { animation: fade .25s ease-out; }
   *, *::before, *::after { animation-duration: .01ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: 0s !important; }
   .screen-prog { animation: none !important; }
 }
-.stream-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2.2fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 6px; }
+.stream-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2.2fr) minmax(0, 1fr) minmax(0, 1fr) auto auto; gap: 8px; align-items: center; margin-bottom: 6px; }
 .cam-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 details.onvif { padding: 10px 14px; border-radius: var(--r); background: var(--fill-2); }
 details.onvif summary { cursor: pointer; font-weight: 600; }
 @media (max-width: 760px) { .stream-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
 details.onvif .form-actions, details.onvif .row2 { margin-top: 8px; }
+
+/* camera preview and recorder channels */
+.stream-list { display: grid; gap: 1px; max-height: 320px; overflow: auto; border-radius: 12px; background: var(--line); margin-top: 8px; }
+.stream-pick { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--panel); }
+.stream-pick > div { flex: 1; min-width: 0; display: grid; }
+.stream-pick small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cam-preview { display: block; max-width: 100%; border-radius: 10px; margin: 8px 0; background: #000; }
+.cam-preview-box:empty { display: none; }
+.validity summary { cursor: pointer; font-weight: 500; }

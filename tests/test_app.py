@@ -5,6 +5,7 @@ Runs the app in-process with a temporary data folder (CARACAL_DATA). Grafana is 
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -213,7 +214,8 @@ def test_removed_patch_endpoints(client):
 
 
 def fake_onvif():
-    """An ONVIF camera: device service, media service with two profiles; requires a password digest."""
+    """An ONVIF camera (two profiles) or, for the user "nvr", a recorder with 16 channels and two profiles each;
+    requires a password digest."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -223,19 +225,24 @@ def fake_onvif():
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers['Content-Length'])).decode()
-            if 'PasswordDigest' not in body or '<Username>admin</Username>' not in body:
+            nvr = '<Username>nvr</Username>' in body
+            if 'PasswordDigest' not in body or not ('<Username>admin</Username>' in body or nvr):
                 self.send_response(401)
                 self.end_headers()
                 return
             port = self.server.server_address[1]
             if 'GetCapabilities' in body:
                 xml = f'<tds:Capabilities><tt:Media><tt:XAddr>http://127.0.0.1:{port}/onvif/media</tt:XAddr></tt:Media></tds:Capabilities>'
+            elif 'GetProfiles' in body and nvr:
+                xml = ''.join(f'<trt:Profiles token="ch{c}{q}"><tt:Name>Channel {c} {q}</tt:Name><tt:VideoSourceConfiguration>'
+                              f'<tt:SourceToken>src{c}</tt:SourceToken></tt:VideoSourceConfiguration></trt:Profiles>'
+                              for c in range(1, 17) for q in ('main', 'sub'))
             elif 'GetProfiles' in body:
                 xml = ('<trt:Profiles token="main"><tt:Name>Main</tt:Name><tt:VideoEncoderConfiguration><tt:Resolution><tt:Width>1920</tt:Width>'
                        '<tt:Height>1080</tt:Height></tt:Resolution></tt:VideoEncoderConfiguration></trt:Profiles>'
                        '<trt:Profiles token="sub"><tt:Name>Sub</tt:Name></trt:Profiles>')
             else:
-                token = 'main' if '>main<' in body else 'sub'
+                token = re.search(r'<ProfileToken>([^<]+)</ProfileToken>', body).group(1)
                 xml = f'<trt:MediaUri><tt:Uri>rtsp://127.0.0.1:554/{token}</tt:Uri></trt:MediaUri>'
             out = ('<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" '
                    'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl">'
@@ -285,9 +292,60 @@ def test_onvif(client, fleet):
     port = fake_onvif()
     r = client.post('/api/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'admin', 'password': 'x'})
     assert r.status_code == 200, r.text
-    assert r.json()['streams'] == [{'name': 'Main 1920×1080', 'url': 'rtsp://127.0.0.1:554/main'}, {'name': 'Sub', 'url': 'rtsp://127.0.0.1:554/sub'}]
+    assert r.json()['streams'] == [{'name': 'Main 1920×1080', 'url': 'rtsp://127.0.0.1:554/main', 'source': ''},
+                                   {'name': 'Sub', 'url': 'rtsp://127.0.0.1:554/sub', 'source': ''}]
+    # a recorder: every channel, not only the first nine profiles
+    nvr = client.post('/api/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'nvr', 'password': 'x'}).json()['streams']
+    assert len(nvr) == 32 and nvr[-1] == {'name': 'Channel 16 sub', 'url': 'rtsp://127.0.0.1:554/ch16sub', 'source': 'src16'}
     assert client.post('/api/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'nobody', 'password': 'x'}).status_code == 401
     assert client.post('/api/cameras/onvif', json={'host': 'bad host!', 'port': 80}).status_code == 400
     assert fleet.post('/api/fleet/v1/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'admin', 'password': 'x'}).json()['streams'][1]['name'] == 'Sub'
     found = client.post('/api/cameras/discover')   # 503 where the network has no multicast route
     assert found.status_code == 503 or isinstance(found.json()['cameras'], list)
+
+
+def test_validity(client, local, fleet):
+    """Items shown only from / until a time are left out of the player's playlist outside it."""
+    import time as _time
+    now = _time.time()
+    a = client.post('/api/v9/assets/web', json={'name': 'Akce', 'source': 'https://example.com/akce'}).json()['id']
+    playing = lambda: [x['id'] for x in local.get('/api/player/playlist-expanded').json()]
+    assert a in playing()
+    assert client.put(f'/api/assets/{a}/validity', json={'valid_from': now + 3600, 'valid_until': None}).status_code == 200
+    assert a not in playing()
+    listed = next(x for x in client.get('/api/assets').json() if x['id'] == a)
+    assert listed['valid_from'] == now + 3600 and listed['valid_until'] is None
+    client.put(f'/api/assets/{a}/validity', json={'valid_from': now - 3600, 'valid_until': now - 60})
+    assert a not in playing()
+    assert client.put(f'/api/assets/{a}/validity', json={'valid_from': now, 'valid_until': now - 10}).status_code == 400
+    assert client.put(f'/api/assets/{a}/validity', json={'valid_from': 'zitra'}).status_code == 400
+    # Fleet: set with the item, changed and removed with an update
+    b = fleet.post('/api/fleet/v1/assets/web', json={'name': 'Víkend', 'source': 'https://example.com/v',
+                                                       'valid_until': now + 7200}).json()['id']
+    assert b in playing()
+    fleet.put(f'/api/fleet/v1/assets/{b}', json={'valid_from': now + 60})
+    assert b not in playing()
+    fleet.put(f'/api/fleet/v1/assets/{b}', json={'valid_from': None, 'valid_until': None})
+    assert b in playing()
+    assert 'valid_until' in fleet.get('/api/fleet/v1/snapshot').json()['assets'][0]
+    for i in (a, b):
+        client.delete(f'/api/assets/{i}')
+
+
+def test_camera_preview(app_mod, client, fleet, monkeypatch, tmp_path):
+    """A picture of a stream through mpv (replaced here by a script writing a JPEG)."""
+    fake = tmp_path / 'mpv'
+    fake.write_text('#!/bin/sh\nfor a; do case "$a" in --vo-image-outdir=*) d="${a#*=}";; esac; done\n'
+                    'case "$*" in *nothing*) exit 2;; esac\nprintf "\\377\\330jpeg" > "$d/00000001.jpg"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv('PATH', f"{tmp_path}:{os.environ['PATH']}")
+    r = client.post('/api/cameras/preview', json={'url': 'rtsp://10.0.0.5/live', 'username': 'a', 'password': 'b'})
+    assert r.status_code == 200, r.text
+    import base64 as _b64
+    assert _b64.b64decode(r.json()['image']).startswith(b'\xff\xd8')
+    assert client.post('/api/cameras/preview', json={'url': 'rtsp://10.0.0.5/nothing'}).status_code == 502
+    assert client.post('/api/cameras/preview', json={'url': 'file:///etc/passwd'}).status_code == 400
+    cid = fleet.post('/api/fleet/v1/assets/camera', json={'name': 'Brána', 'streams': [{'url': 'rtsp://10.0.0.9/live'}]}).json()['id']
+    assert fleet.post('/api/fleet/v1/cameras/preview', json={'id': cid, 'index': 0}).status_code == 200
+    assert fleet.post('/api/fleet/v1/cameras/preview', json={'id': cid, 'index': 3}).status_code == 404
+    client.delete(f'/api/assets/{cid}')

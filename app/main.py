@@ -92,7 +92,7 @@ def rows(q, a=()):
 
 
 # every column of the playlist items except the encrypted credentials of cameras
-_ASSETS_QUERY = 'SELECT id,name,kind,source,duration,position,auth_profile_id,scale,dark FROM assets ORDER BY position,id'
+_ASSETS_QUERY = 'SELECT id,name,kind,source,duration,position,auth_profile_id,scale,dark,valid_from,valid_until FROM assets ORDER BY position,id'
 
 
 def _columns(c, table):
@@ -117,6 +117,9 @@ CREATE TABLE IF NOT EXISTS player_settings(key TEXT PRIMARY KEY, value TEXT);
         c.execute('ALTER TABLE assets ADD COLUMN dark TEXT')
     if 'secret_enc' not in _columns(c, 'assets'):    # encrypted credentials of a camera's streams
         c.execute('ALTER TABLE assets ADD COLUMN secret_enc BLOB')
+    for col in ('valid_from', 'valid_until'):         # an item shown only from / until a time (Unix time)
+        if col not in _columns(c, 'assets'):
+            c.execute(f'ALTER TABLE assets ADD COLUMN {col} REAL')
     # login profiles: 'form' fills in the page's log-in form, 'http' answers the browser's HTTP Basic/Digest pop-up
     if 'auth_type' not in _columns(c, 'auth_profiles'):
         c.execute("ALTER TABLE auth_profiles ADD COLUMN auth_type TEXT DEFAULT 'form'")
@@ -504,11 +507,62 @@ def try_grafana_tag(grafana_url: str = Form(...), tag: str = Form(...), u=Depend
     return {'ok': True, 'count': len(result), 'dashboards': result[:50]}
 
 
+# ---------------------------------------------------------------- validity: an item shown only from / until a time
+# Unix time, so the time zone of the container does not matter (the admin UI and Fleet convert from the local time).
+
+def _validity_value(value, what):
+    if value in (None, ''):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f'{what}: neplatný čas')
+    if not 946684800 <= v <= 4102444800:   # 2000 to 2100
+        raise HTTPException(400, f'{what}: neplatný čas')
+    return v
+
+
+def _validity(d, current=None):
+    """(valid_from, valid_until) from a request; keys left out keep the current values."""
+    current = current or {}
+    start = _validity_value(d['valid_from'], 'Od') if 'valid_from' in d else current.get('valid_from')
+    end = _validity_value(d['valid_until'], 'Do') if 'valid_until' in d else current.get('valid_until')
+    if start and end and end <= start:
+        raise HTTPException(400, 'Konec platnosti musí být po začátku')
+    return start, end
+
+
+def _set_validity(c, asset_id, d, current=None):
+    if 'valid_from' in d or 'valid_until' in d:
+        c.execute('UPDATE assets SET valid_from=?, valid_until=? WHERE id=?', (*_validity(d, current), asset_id))
+
+
+def _active(asset, now=None):
+    """Whether an item plays now: no validity, or now is inside it."""
+    now = now or time.time()
+    return (not asset.get('valid_from') or asset['valid_from'] <= now) and (not asset.get('valid_until') or now < asset['valid_until'])
+
+
+@app.put('/api/assets/{asset_id}/validity')
+async def save_validity(asset_id: int, request: Request, u=Depends(auth)):
+    d = await request.json()
+    current = rows('SELECT * FROM assets WHERE id=?', (asset_id,))
+    if not current:
+        raise HTTPException(404, 'Položka nebyla nalezena')
+    c = con()
+    _set_validity(c, asset_id, {'valid_from': d.get('valid_from'), 'valid_until': d.get('valid_until')})
+    c.commit()
+    c.close()
+    return {'ok': True}
+
+
 def expanded_player_playlist():
     """The playlist as the player plays it: a Grafana collection becomes its dashboards (id = collection * 100000 +
-    index), every website gets its resulting dark mode."""
-    output, web_dark = [], _web_dark()
+    index), every website gets its resulting dark mode. Items outside their validity are left out."""
+    output, web_dark, now = [], _web_dark(), time.time()
     for asset in rows(_ASSETS_QUERY):
+        if not _active(asset, now):
+            continue
         if asset.get('kind') != 'grafana-tag':
             if asset.get('kind') == 'web':
                 asset['dark'] = _dark_of(asset, web_dark)
@@ -885,7 +939,7 @@ async def fleet_add_web(req:Request):
  _fleet_auth(req);d=await req.json();name=str(d.get('name','')).strip();source=str(d.get('source','')).strip()
  if not name or not source.startswith(('http://','https://')):raise HTTPException(400,'Invalid name or URL')
  duration=_fleet_duration(d.get('duration',30));scale=_fleet_scale(d.get('scale',1));profile_id=_fleet_profile_id(d.get('auth_profile_id'));dark=_dark_value(d.get('dark'))
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,scale,auth_profile_id,dark) VALUES(?,?,?,?,?,?,?,?)',(name,'web',source,duration,_fleet_position(c),scale,profile_id,dark));c.commit();c.close()
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,scale,auth_profile_id,dark) VALUES(?,?,?,?,?,?,?,?)',(name,'web',source,duration,_fleet_position(c),scale,profile_id,dark));_set_validity(c,q.lastrowid,d);c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.post('/api/fleet/v1/assets/grafana-tag')
@@ -893,7 +947,7 @@ async def fleet_add_grafana_tag(req:Request):
  _fleet_auth(req);d=await req.json();name=str(d.get('name','')).strip()
  if not name:raise HTTPException(400,'Name must not be empty')
  config=_fleet_grafana_config(d);duration=_fleet_duration(d.get('duration',60));scale=_fleet_scale(d.get('scale',1));dark=_dark_value(d.get('dark'))
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale,dark) VALUES(?,?,?,?,?,NULL,?,?)',(name,'grafana-tag',json.dumps(config,ensure_ascii=False),duration,_fleet_position(c),scale,dark));c.commit();c.close()
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position,auth_profile_id,scale,dark) VALUES(?,?,?,?,?,NULL,?,?)',(name,'grafana-tag',json.dumps(config,ensure_ascii=False),duration,_fleet_position(c),scale,dark));_set_validity(c,q.lastrowid,d);c.commit();c.close()
  return {'ok':True,'id':q.lastrowid}
 
 @app.post('/api/fleet/v1/assets/upload')
@@ -913,7 +967,8 @@ async def fleet_upload(req:Request):
     f.write(chunk)
  except BaseException:
   (MEDIA/fn).unlink(missing_ok=True);raise
- c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position) VALUES(?,?,?,?,?)',(name,kind,'/media/'+fn,duration,_fleet_position(c)));c.commit();c.close()
+ c=con();q=c.execute('INSERT INTO assets(name,kind,source,duration,position) VALUES(?,?,?,?,?)',(name,kind,'/media/'+fn,duration,_fleet_position(c)))
+ _set_validity(c,q.lastrowid,{k:str(form.get(k)) for k in ('valid_from','valid_until') if form.get(k) is not None});c.commit();c.close()
  return {'ok':True,'id':q.lastrowid,'kind':kind}
 
 @app.get('/api/fleet/v1/assets/{asset_id}/file')
@@ -938,7 +993,7 @@ async def fleet_update_asset(asset_id:int,req:Request):
   except ValueError:current={}
   source=json.dumps(_fleet_grafana_config(d,current),ensure_ascii=False)
  dark=_dark_value(d['dark']) if 'dark' in d and a['kind'] in ('web','grafana-tag') else a.get('dark')
- c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=?,auth_profile_id=?,dark=? WHERE id=?',(name,source,duration,scale,profile_id,dark,asset_id));c.commit();c.close()
+ c=con();c.execute('UPDATE assets SET name=?,source=?,duration=?,scale=?,auth_profile_id=?,dark=? WHERE id=?',(name,source,duration,scale,profile_id,dark,asset_id));_set_validity(c,asset_id,d,a);c.commit();c.close()
  return {'ok':True}
 
 @app.delete('/api/fleet/v1/assets/{asset_id}')
@@ -2061,6 +2116,7 @@ def _save_camera(data, asset_id=None):
     else:
         asset_id = c.execute('INSERT INTO assets(name,kind,source,duration,position,secret_enc) VALUES(?,?,?,?,?,?)',
                              (name, 'camera', source, duration, _next_position(c), enc)).lastrowid
+    _set_validity(c, asset_id, data, old[0] if old else None)
     c.commit()
     c.close()
     return {'ok': True, 'id': asset_id}
@@ -2095,16 +2151,51 @@ def player_camera(asset_id: int, req: Request):
     if not r:
         raise HTTPException(404)
     src, sec = json.loads(r[0]['source'] or '{}'), _camera_secrets(r[0])
-    out = []
-    for i, s in enumerate(src.get('streams', [])):
-        c = sec[i] if i < len(sec) else {}
-        url = s['url']
-        if c.get('username'):
-            p = urllib.parse.urlsplit(url)
-            auth_part = urllib.parse.quote(c['username'], safe='') + (':' + urllib.parse.quote(c.get('password', ''), safe='') if c.get('password') else '')
-            url = urllib.parse.urlunsplit((p.scheme, f'{auth_part}@{p.netloc}', p.path, p.query, p.fragment))
-        out.append({'name': s.get('name', ''), 'url': url})
+    out = [{'name': s.get('name', ''), 'url': _with_credentials(s['url'], sec[i] if i < len(sec) else {})}
+           for i, s in enumerate(src.get('streams', []))]
     return {'layout': src.get('layout', 'auto'), 'audio': bool(src.get('audio')), 'streams': out}
+
+
+def _with_credentials(url, cred):
+    if not cred.get('username'):
+        return url
+    p = urllib.parse.urlsplit(url)
+    auth_part = urllib.parse.quote(cred['username'], safe='') + (':' + urllib.parse.quote(cred.get('password', ''), safe='') if cred.get('password') else '')
+    return urllib.parse.urlunsplit((p.scheme, f'{auth_part}@{p.netloc}', p.path, p.query, p.fragment))
+
+
+def camera_preview(d):
+    """One picture of a stream (JPEG, at most 640 px wide, as base64): an address with credentials, or the stream
+    of a stored camera (id, index), so the right camera can be picked before it goes on the screen."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+    if d.get('id') not in (None, ''):
+        r = rows("SELECT * FROM assets WHERE id=? AND kind='camera'", (int(d['id']),))
+        if not r:
+            raise HTTPException(404, 'Kamera nebyla nalezena')
+        src, sec = json.loads(r[0]['source'] or '{}'), _camera_secrets(r[0])
+        i = int(d.get('index') or 0)
+        if not 0 <= i < len(src.get('streams', [])):
+            raise HTTPException(404, 'Stream nebyl nalezen')
+        url = _with_credentials(src['streams'][i]['url'], sec[i] if i < len(sec) else {})
+    else:
+        public, secrets_ = _camera_streams([{'url': d.get('url'), 'username': d.get('username'), 'password': d.get('password')}])
+        url = _with_credentials(public[0]['url'], secrets_[0])
+    if not _shutil.which('mpv'):
+        raise HTTPException(503, 'Pro náhled kamery chybí přehrávač mpv')
+    with _tempfile.TemporaryDirectory() as tmp:
+        try:
+            _subprocess.run(['mpv', '--no-config', '--really-quiet', '--vo=image', '--vo-image-format=jpg', '--vo-image-jpeg-quality=75',
+                             f'--vo-image-outdir={tmp}', '--frames=1', '--ao=null', '--no-audio', '--vf=scale=640:-2',
+                             '--rtsp-transport=tcp', '--network-timeout=10', '--', url],
+                            capture_output=True, timeout=25, check=False)
+        except _subprocess.TimeoutExpired:
+            raise HTTPException(504, 'Kamera neposlala obraz včas')
+        pictures = sorted(Path(tmp).glob('*.jpg'))
+        if not pictures:
+            raise HTTPException(502, 'Ze streamu nepřišel žádný obraz (adresa, přihlášení nebo síť)')
+        return {'image': base64.b64encode(pictures[0].read_bytes()).decode(), 'type': 'image/jpeg'}
 
 
 # ONVIF: SOAP over HTTP with a WS-Security user name token (password digest)
@@ -2150,6 +2241,9 @@ def _host_port(host, port):
     return host, port
 
 
+_ONVIF_PROFILES_MAX = 64
+
+
 def onvif_streams(host, port=80, username='', password='', xaddr=''):
     """The stream addresses of an ONVIF camera: [{name, url}] for each of its media profiles."""
     host, port = _host_port(host, port)
@@ -2161,8 +2255,9 @@ def onvif_streams(host, port=80, username='', password='', xaddr=''):
         media = found.text.strip()
     profiles = _onvif_call(media, f'<GetProfiles xmlns="{_ONVIF_MEDIA}"/>', username, password)
     out = []
-    for p in profiles.findall('.//{*}Profiles')[:_CAMERA_MAX]:
+    for p in profiles.findall('.//{*}Profiles')[:_ONVIF_PROFILES_MAX]:   # an NVR has two or three per channel
         token = p.get('token')
+        source = p.findtext('.//{*}VideoSourceConfiguration/{*}SourceToken') or ''
         name = (p.findtext('{*}Name') or token or '').strip()
         res = p.find('.//{*}VideoEncoderConfiguration/{*}Resolution')
         size = f" {res.findtext('{*}Width')}×{res.findtext('{*}Height')}" if res is not None else ''
@@ -2170,29 +2265,34 @@ def onvif_streams(host, port=80, username='', password='', xaddr=''):
                                  f'<Transport xmlns="http://www.onvif.org/ver10/schema"><Protocol>RTSP</Protocol></Transport></StreamSetup>'
                                  f'<ProfileToken>{_xml_text(token)}</ProfileToken></GetStreamUri>', username, password).findtext('.//{*}Uri')
         if uri:
-            out.append({'name': (name + size).strip(), 'url': uri.strip()})
+            out.append({'name': (name + size).strip(), 'url': uri.strip(), 'source': source.strip()})
     if not out:
         raise HTTPException(404, 'Kamera nenabízí žádný stream')
     return out
 
 
 def onvif_discover(timeout=3.0):
-    """ONVIF cameras in the local network (WS-Discovery probe): [{address, name, xaddr, hardware}]."""
+    """ONVIF cameras and recorders in the local network (WS-Discovery): [{address, name, xaddr, hardware, kind}]."""
     import socket as _socket
     import uuid as _uuid
+    probe_id = str(_uuid.uuid4())
     probe = ('<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" '
              'xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
              'xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header>'
-             f'<w:MessageID>uuid:{_uuid.uuid4()}</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
+             f'<w:MessageID>uuid:{probe_id}</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
              '<w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header>'
-             '<e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>')
+             '<e:Body><d:Probe><d:Types>{types}</d:Types></d:Probe></e:Body></e:Envelope>')
+    # cameras answer as NetworkVideoTransmitter, many recorders (NVR) only as a Device
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM, _socket.IPPROTO_UDP)
     s.setsockopt(_socket.IPPROTO_IP, _socket.IP_MULTICAST_TTL, 2)
     s.settimeout(0.5)
     found, end = {}, time.time() + timeout
     try:
         try:
-            s.sendto(probe.encode(), ('239.255.255.250', 3702))
+            for types, ns in (('dn:NetworkVideoTransmitter', ''), ('tds:Device', ' xmlns:tds="http://www.onvif.org/ver10/device/wsdl"')):
+                message = probe.replace('{types}', types).replace('<d:Probe>', f'<d:Probe{ns}>').replace(
+                    probe_id, str(_uuid.uuid4()))   # every probe has its own message id
+                s.sendto(message.encode(), ('239.255.255.250', 3702))
         except OSError as e:
             raise HTTPException(503, f'Hledání kamer v síti tu nejde (multicast): {e}')
         while time.time() < end:
@@ -2206,9 +2306,14 @@ def onvif_discover(timeout=3.0):
                 continue
             xaddrs = (doc.findtext('.//{*}XAddrs') or '').split()
             scopes = (doc.findtext('.//{*}Scopes') or '').split()
+            types = doc.findtext('.//{*}Types') or ''
+            if not any('onvif' in x.lower() for x in scopes + xaddrs + [types]):
+                continue          # a printer or a computer answering WS-Discovery
             scope = lambda key: next((urllib.parse.unquote(x.rsplit('/', 1)[1]) for x in scopes if f'/{key}/' in x), '')
+            text_all = ' '.join(scopes + [types]).lower()
             found[address] = {'address': address, 'xaddr': next((x for x in xaddrs if address in x), xaddrs[0] if xaddrs else ''),
-                              'name': scope('name'), 'hardware': scope('hardware')}
+                              'name': scope('name'), 'hardware': scope('hardware'),
+                              'kind': 'recorder' if any(k in text_all for k in ('recorder', '/nvr', 'nvr/', 'type/nvs', 'storage')) else 'camera'}
     finally:
         s.close()
     return sorted(found.values(), key=lambda x: x['address'])
@@ -2227,6 +2332,11 @@ async def camera_onvif(request: Request, u=Depends(auth)):
 @app.post('/api/cameras/discover')
 async def camera_discover(u=Depends(auth)):
     return {'cameras': await asyncio.to_thread(onvif_discover)}
+
+
+@app.post('/api/cameras/preview')
+async def camera_preview_route(request: Request, u=Depends(auth)):
+    return await asyncio.to_thread(camera_preview, await request.json())
 
 
 @app.post('/api/fleet/v1/assets/camera')
@@ -2253,3 +2363,9 @@ async def fleet_camera_onvif(req: Request):
 async def fleet_camera_discover(req: Request):
     _fleet_auth(req)
     return {'cameras': await asyncio.to_thread(onvif_discover)}
+
+
+@app.post('/api/fleet/v1/cameras/preview')
+async def fleet_camera_preview(req: Request):
+    _fleet_auth(req)
+    return await asyncio.to_thread(camera_preview, await _fleet_json(req))

@@ -29,6 +29,7 @@ const ICONS = {
   dash: 'M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z',
   playlist: 'M4 6h12M4 12h12M4 18h8M18 15v6l4-3z',
   lock: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4M12 15v2',
+  clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2',
   bell: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0',
   web: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18',
   image: 'M4 4h16v16H4zM4 16l5-5 4 4 3-3 4 4M15 9h.01',
@@ -590,6 +591,24 @@ function sourceText(a) {
   }
   return String(a.source || '').split('/').pop();
 }
+// An item shown only from / until a time (the browser's local time, stored as Unix time)
+const toLocalInput = ts => (ts ? new Date(ts * 1000 - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '');
+const fromLocalInput = v => (v ? Math.round(new Date(v).getTime() / 1000) : null);
+const fmtWhen = ts => new Date(ts * 1000).toLocaleString(S.lang === 'en' ? 'en-GB' : 'cs-CZ', { day: 'numeric', month: 'numeric', hour: '2-digit', minute: '2-digit' });
+function validityText(a) {
+  return a.valid_from && a.valid_until ? `${fmtWhen(a.valid_from)} – ${fmtWhen(a.valid_until)}` : a.valid_from ? T('od ', 'from ') + fmtWhen(a.valid_from) : T('do ', 'until ') + fmtWhen(a.valid_until);
+}
+function validityTag(a) {
+  if (!a.valid_from && !a.valid_until) return '';
+  const now = Date.now() / 1000;
+  const [cls, label] = a.valid_until && now >= a.valid_until ? ['', T('Skončila', 'Ended')] : a.valid_from && now < a.valid_from ? ['accent', T('Čeká', 'Waiting')] : ['ok', T('Platí', 'Valid')];
+  return `<span class="tag ${cls}" title="${esc(validityText(a))}">${icon('clock')}${label} · ${esc(validityText(a))}</span>`;
+}
+const validityFields = (a = {}) => `<details class="validity" ${a.valid_from || a.valid_until ? 'open' : ''}><summary>${T('Platnost', 'Validity')}</summary>
+  <p class="muted">${T('Položka se přehrává jen v tomto období. Mimo něj ji player přeskočí; prázdné = bez omezení.', 'The item plays only in this period. Outside it the player skips it; empty = no limit.')}</p>
+  <div class="row2"><label>${T('Od', 'From')}<input type="datetime-local" name="valid_from" value="${toLocalInput(a.valid_from)}"></label><label>${T('Do', 'Until')}<input type="datetime-local" name="valid_until" value="${toLocalInput(a.valid_until)}"></label></div></details>`;
+const validityBody = f => ({ valid_from: fromLocalInput(f.get('valid_from')), valid_until: fromLocalInput(f.get('valid_until')) });
+const saveValidity = (id, f) => api(`/api/assets/${id}/validity`, { method: 'PUT', json: validityBody(f) });
 function dashboardsOf(id) { return S.options.filter(o => o.type === 'dashboard' && String(o.parent_id) === String(id)); }
 function plRow(a, i) {
   const scalable = a.kind === 'web' || a.kind === 'grafana-tag';
@@ -601,7 +620,7 @@ function plRow(a, i) {
     <button class="handle" draggable="true" title="${T('Přetáhněte pro změnu pořadí', 'Drag to change the order')}" aria-label="${T('Přesunout', 'Move')}">${icon('drag')}</button>
     <span class="idx">${i + 1}</span><span class="kind k-${k}">${kindIcon(a.kind)}</span>
     <div class="pl-main"><b>${esc(a.name)}</b><small>${esc(sourceText(a))}</small>
-      <div class="row-tags">${scalable ? `<button class="tag" data-do="toggleScale" data-id="${a.id}" title="${T('Velikost obsahu', 'Content size')}">${pct(a.scale)} %</button>` : ''}
+      <div class="row-tags">${validityTag(a)}${scalable ? `<button class="tag" data-do="toggleScale" data-id="${a.id}" title="${T('Velikost obsahu', 'Content size')}">${pct(a.scale)} %</button>` : ''}
         ${scalable && a.dark ? `<span class="tag" title="${T('Tmavý režim', 'Dark mode')}">${icon('moon')}${(DARK_MODES().find(([m]) => m === a.dark) || [])[1] || ''}</span>` : ''}
         ${a.auth_profile_id ? `<span class="tag accent">${icon('lock')}${esc(prof ? prof.name : T('Přihlášení', 'Login'))}</span>` : ''}
         ${a.kind === 'grafana-tag' ? `<button class="expand ${open ? 'open' : ''}" data-do="toggleDash" data-id="${a.id}">${icon('chev')}${dashes.length} ${T('dashboardů', 'dashboards')}</button>` : ''}</div></div>
@@ -785,12 +804,14 @@ Object.assign(ACT, {
       body: `<div class="form"><label>${T('Název', 'Name')}<input name="name" value="${esc(a.name)}" required></label>
         ${web ? `<label>URL<input name="source" type="url" value="${esc(a.source)}" required></label>` : `<label>${T('Soubor', 'File')}<input value="${esc(sourceText(a))}" disabled></label>`}
         <div class="row2"><label>${T('Doba zobrazení (s)', 'Display time (s)')}<input name="duration" type="number" min="5" value="${a.duration}" required></label>${web ? scaleField(a.scale) : '<span></span>'}</div>
-        ${web ? `<label>${T('Přihlašovací profil', 'Login profile')}<select name="auth_profile_id">${await profileOptions(a.auth_profile_id)}</select></label>${darkField(a.dark || '')}` : ''}</div>`,
+        ${web ? `<label>${T('Přihlašovací profil', 'Login profile')}<select name="auth_profile_id">${await profileOptions(a.auth_profile_id)}</select></label>${darkField(a.dark || '')}` : ''}
+        ${validityFields(a)}</div>`,
       onSubmit: async f => {
         const scale = web ? parseScale(f.get('scale')) : null;
         await api('/api/assets/' + a.id, { method: 'PUT', json: { name: f.get('name').trim(), source: web ? f.get('source').trim() : a.source, duration: Number(f.get('duration')), auth_profile_id: web ? (f.get('auth_profile_id') || null) : null } });
         if (web) await api(`/api/v7/assets/${a.id}/scale`, { method: 'PUT', json: { scale } });
         if (web && (f.get('dark') || '') !== (a.dark || '')) await saveDark(a.id, f);
+        await saveValidity(a.id, f);
         toast(T('Položka uložena', 'Item saved'));
         render(true);
       },
@@ -823,6 +844,7 @@ const streamRow = (s = {}) => `<div class="stream-row" data-stream>
   <input data-f="url" placeholder="rtsp://192.168.1.20:554/stream1" value="${esc(s.url || '')}" required spellcheck="false">
   <input data-f="username" placeholder="${T('Uživatel', 'User')}" value="${esc(s.username || '')}" autocomplete="off">
   <input data-f="password" type="password" placeholder="${s.has_password ? T('beze změny', 'unchanged') : T('Heslo', 'Password')}" autocomplete="new-password">
+  <button type="button" class="icon-btn" data-preview-row title="${T('Náhled', 'Preview')}">${icon('eye')}</button>
   <button type="button" class="icon-btn danger" data-del-stream title="${T('Odebrat', 'Remove')}">${icon('x')}</button></div>`;
 async function cameraDialog(a = null) {
   const c = a ? await api('/api/assets/camera/' + a.id) : { streams: [{}], layout: 'auto' };
@@ -833,6 +855,7 @@ async function cameraDialog(a = null) {
       <label>${T('Doba zobrazení (s)', 'Display time (s)')}<input name="duration" type="number" min="5" value="${a ? a.duration : 30}" required></label></div>
       <div class="row2"><label>${T('Rozložení', 'Layout')}<select name="layout">${[['auto', T('Automaticky', 'Automatic')], ['2', T('Dvě vedle sebe', 'Two side by side')], ['2x2', '2 × 2'], ['3x3', '3 × 3']].map(([v, l]) => `<option value="${v}" ${c.layout === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <label class="check"><input type="checkbox" class="switch" name="audio" ${c.audio ? 'checked' : ''}>${T('Zvuk prvního streamu', 'Sound of the first stream')}</label></div>
+      ${validityFields(a || {})}
       <h3>${T('Streamy', 'Streams')}</h3><div id="streamRows">${c.streams.map(streamRow).join('')}</div>
       <div class="form-actions start"><button type="button" class="btn sm" data-add-stream>${icon('plus')}${T('Přidat stream', 'Add a stream')}</button></div>
       <details class="onvif"><summary>${T('Najít kameru přes ONVIF', 'Find a camera with ONVIF')}</summary>
@@ -844,8 +867,24 @@ async function cameraDialog(a = null) {
         <div class="form-actions start"><button type="button" class="btn sm primary" data-onvif-load>${icon('camera')}${T('Načíst streamy', 'Load the streams')}</button></div><div id="camStreams"></div></details></div>`,
     onOpen: form => {
       const rowsBox = $('#streamRows', form), ov = k => $(`[data-onvif="${k}"]`, form);
+      // a picture of a stream: what is in the row, or the stored stream of this camera when its password is left empty
+      const preview = async (payload, box) => {
+        box.innerHTML = `<div class="note">${T('Node se připojuje ke kameře…', 'Connecting to the camera…')}</div>`;
+        try {
+          const r = await api('/api/cameras/preview', { method: 'POST', json: payload });
+          box.innerHTML = `<img class="cam-preview" alt="" src="data:${esc(r.type)};base64,${r.image}">`;
+        } catch (err) { box.innerHTML = `<div class="note bad">${esc(err.message)}</div>`; }
+      };
       form.addEventListener('click', async e => {
         if (e.target.closest('[data-add-stream]')) rowsBox.insertAdjacentHTML('beforeend', streamRow());
+        const pr = e.target.closest('[data-preview-row]');
+        if (pr) {
+          const row = pr.closest('[data-stream]'), f = k => $(`[data-f=${k}]`, row).value.trim();
+          const index = $$('[data-stream]', form).indexOf(row);
+          let box = row.nextElementSibling;
+          if (!box || !box.classList.contains('cam-preview-box')) { row.insertAdjacentHTML('afterend', '<div class="cam-preview-box"></div>'); box = row.nextElementSibling; }
+          preview(a && !f('password') && !f('username') ? { id: a.id, index } : { url: f('url'), username: f('username'), password: $('[data-f=password]', row).value }, box);
+        }
         const del = e.target.closest('[data-del-stream]');
         if (del && $$('[data-stream]', form).length > 1) del.closest('[data-stream]').remove();
         const disc = e.target.closest('[data-discover]');
@@ -853,7 +892,7 @@ async function cameraDialog(a = null) {
           disc.classList.add('busy');
           try {
             const r = await api('/api/cameras/discover', { method: 'POST' });
-            $('#camFound', form).innerHTML = r.cameras.length ? `<div class="cam-list">${r.cameras.map(x => `<button type="button" class="btn sm" data-pick-cam="${esc(x.address)}" data-xaddr="${esc(x.xaddr)}">${icon('camera')}${esc(x.name || x.hardware || x.address)} <small class="muted">${esc(x.address)}</small></button>`).join('')}</div>`
+            $('#camFound', form).innerHTML = r.cameras.length ? `<div class="cam-list">${r.cameras.map(x => `<button type="button" class="btn sm" data-pick-cam="${esc(x.address)}" data-xaddr="${esc(x.xaddr)}">${icon('camera')}${esc(x.name || x.hardware || x.address)} <small class="muted">${esc(x.address)}${x.kind === 'recorder' ? ' · ' + T('záznamník (NVR)', 'recorder (NVR)') : ''}</small></button>`).join('')}</div>`
               : `<div class="note">${T('V síti se žádná kamera ONVIF neozvala.', 'No ONVIF camera answered in the network.')}</div>`;
           } catch (err) { $('#camFound', form).innerHTML = `<div class="note bad">${esc(err.message)}</div>`; } finally { disc.classList.remove('busy'); }
         }
@@ -864,25 +903,33 @@ async function cameraDialog(a = null) {
           load.classList.add('busy');
           try {
             const r = await api('/api/cameras/onvif', { method: 'POST', json: { host: ov('host').value.trim(), port: Number(ov('port').value) || 80, username: ov('username').value, password: ov('password').value, xaddr: ov('xaddr').value } });
-            $('#camStreams', form).innerHTML = `<div class="cam-list">${r.streams.map((x, i) => `<button type="button" class="btn sm" data-use-stream="${i}">${icon('plus')}${esc(x.name || x.url)}</button>`).join('')}</div>`;
-            $$('[data-use-stream]', form).forEach(b => {
-              b.onclick = () => {
-                const x = r.streams[Number(b.dataset.useStream)], empty = $$('[data-stream]', form).find(row => !$('[data-f=url]', row).value);
-                const html = streamRow({ name: x.name, url: x.url, username: ov('username').value });
-                if (empty) empty.outerHTML = html; else rowsBox.insertAdjacentHTML('beforeend', html);
-                const last = $$('[data-stream]', form).find(row => $('[data-f=url]', row).value === x.url);
-                if (last) $('[data-f=password]', last).value = ov('password').value;
-                if (!form.name.value) form.name.value = x.name || ov('host').value;
-                b.disabled = true;
-              };
-            });
+            const channels = new Set(r.streams.map(x => x.source).filter(Boolean));
+            $('#camStreams', form).innerHTML = `${channels.size > 1 ? `<div class="note">${T(`Záznamník: ${channels.size} kanálů, ${r.streams.length} streamů.`, `Recorder: ${channels.size} channels, ${r.streams.length} streams.`)} <button type="button" class="btn sm" data-use-mains>${icon('plus')}${T('Přidat hlavní stream každého kanálu', 'Add the main stream of every channel')}</button></div>` : ''}
+              <div class="stream-list">${r.streams.map((x, i) => `<div class="stream-pick"><div><b>${esc(x.name || x.url)}</b><small class="muted">${esc(x.url)}</small></div>
+              <button type="button" class="btn sm ghost" data-preview-stream="${i}">${icon('eye')}${T('Náhled', 'Preview')}</button><button type="button" class="btn sm" data-use-stream="${i}">${icon('plus')}${T('Přidat', 'Add')}</button></div>`).join('')}</div><div class="cam-preview-box" id="camFoundPreview"></div>`;
+            const use = i => {
+              const x = r.streams[i], empty = $$('[data-stream]', form).find(row => !$('[data-f=url]', row).value);
+              if ($$('[data-stream]', form).some(row => $('[data-f=url]', row).value === x.url)) return;
+              if (!empty && $$('[data-stream]', form).length >= 9) return toast(T('Jedna kamera má nejvýš 9 streamů.', 'A camera has at most 9 streams.'), 'err');
+              const html = streamRow({ name: x.name, url: x.url, username: ov('username').value });
+              if (empty) empty.outerHTML = html; else rowsBox.insertAdjacentHTML('beforeend', html);
+              const last = $$('[data-stream]', form).find(row => $('[data-f=url]', row).value === x.url);
+              if (last) $('[data-f=password]', last).value = ov('password').value;
+              if (!form.name.value) form.name.value = x.name || ov('host').value;
+              const b = $(`[data-use-stream="${i}"]`, form);
+              if (b) b.disabled = true;
+            };
+            $$('[data-use-stream]', form).forEach(b => { b.onclick = () => use(Number(b.dataset.useStream)); });
+            $$('[data-preview-stream]', form).forEach(b => { b.onclick = () => { const x = r.streams[Number(b.dataset.previewStream)]; preview({ url: x.url, username: ov('username').value, password: ov('password').value }, $('#camFoundPreview', form)); }; });
+            const mains = $('[data-use-mains]', form);
+            if (mains) mains.onclick = () => { const seen = new Set(); r.streams.forEach((x, i) => { if (x.source && !seen.has(x.source)) { seen.add(x.source); use(i); } }); };
           } catch (err) { $('#camStreams', form).innerHTML = `<div class="note bad">${esc(err.message)}</div>`; } finally { load.classList.remove('busy'); }
         }
       });
     },
     onSubmit: async f => {
       const streams = $$('#streamRows [data-stream]').map(row => Object.fromEntries($$('[data-f]', row).map(i => [i.dataset.f, i.value.trim()])));
-      const body = { name: f.get('name').trim(), duration: Number(f.get('duration')), layout: f.get('layout'), audio: f.get('audio') === 'on', streams };
+      const body = { name: f.get('name').trim(), duration: Number(f.get('duration')), layout: f.get('layout'), audio: f.get('audio') === 'on', streams, ...validityBody(f) };
       await api(a ? '/api/assets/camera/' + a.id : '/api/assets/camera', { method: a ? 'PUT' : 'POST', json: body });
       toast(a ? T('Kamera uložena', 'Camera saved') : T('Kamera přidána', 'Camera added'));
       render(true);
@@ -901,6 +948,7 @@ function grafanaDialog(a = null) {
       <label>${T('Tag dashboardů', 'Dashboard tag')}<input name="tag" required value="${esc(c.tag || '')}" placeholder="caracal-tv"></label></div>
       <div class="row2"><label>${T('Doba jednoho dashboardu (s)', 'Time per dashboard (s)')}<input name="duration" type="number" min="5" value="${a ? a.duration : 60}" required></label>${scaleField(a ? a.scale : 1)}</div>
       ${darkField(a ? a.dark || '' : '', true)}
+      ${validityFields(a || {})}
       <label class="check"><input type="checkbox" class="switch" name="kiosk" ${c.kiosk !== false ? 'checked' : ''}>${T('Kiosk režim Grafany (bez menu a lišt)', 'Grafana kiosk mode (no menus and bars)')}</label>
       <div class="form-actions start"><button type="button" class="btn sm" data-do="testTag">${icon('check')}${T('Vyzkoušet tag', 'Try the tag')}</button></div><div class="result-box" id="tagResult"></div></div>`,
     submit: a ? T('Uložit', 'Save') : T('Přidat', 'Add'),
@@ -910,6 +958,7 @@ function grafanaDialog(a = null) {
         const r = await api('/api/grafana-collections/' + a.id, { method: 'PUT', json: { name: f.get('name').trim(), grafana_url: f.get('grafana_url').trim(), tag: f.get('tag').trim(), duration: Number(f.get('duration')), scale, kiosk: f.get('kiosk') === 'on' } });
         await api(`/api/v7/assets/${a.id}/scale`, { method: 'PUT', json: { scale } });
         if ((f.get('dark') || '') !== (a.dark || '')) await saveDark(a.id, f);
+        await saveValidity(a.id, f);
         toast(T(`Kolekce uložena · ${r.dashboards} dashboardů`, `Collection saved · ${r.dashboards} dashboards`));
       } else {
         const fd = new FormData();
@@ -918,6 +967,7 @@ function grafanaDialog(a = null) {
         if (f.get('kiosk') === 'on') fd.set('kiosk', 'on');
         const r = await api('/api/assets/grafana-tag', { form: fd });
         if (f.get('dark') && r.id) await saveDark(r.id, f);
+        if (r.id && (f.get('valid_from') || f.get('valid_until'))) await saveValidity(r.id, f);
         toast(T(`Kolekce přidána · ${r.dashboards} dashboardů`, `Collection added · ${r.dashboards} dashboards`));
       }
       render(true);
