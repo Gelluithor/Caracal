@@ -8,7 +8,8 @@ images and videos with a web admin. Many screens can be managed centrally with
 and a test notification on the screen](docs/caracal.gif)
 
 - Czech and English admin UI with dark mode and built-in help, in the same look as CARACAL Fleet
-- web pages, images and videos in one playlist, drag-and-drop ordering
+- web pages, images, videos and IP cameras (RTSP, HTTP; ONVIF search, a grid of up to 9 streams played by mpv) in one
+  playlist, drag-and-drop ordering
 - per-item duration and zoom (when adding, editing or live with a slider)
 - encrypted login profiles with automatic sign-in (log-in forms and HTTP Basic/Digest, the browser's pop-up), automatic acceptance of common cookie banners
 - Grafana collections: all dashboards with a tag, read through Grafana's guest access on every cycle

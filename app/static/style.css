@@ -456,3 +456,9 @@ dialog[open]::backdrop { animation: fade .25s ease-out; }
   *, *::before, *::after { animation-duration: .01ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: 0s !important; }
   .screen-prog { animation: none !important; }
 }
+.stream-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2.2fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 6px; }
+.cam-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+details.onvif { padding: 10px 14px; border-radius: var(--r); background: var(--fill-2); }
+details.onvif summary { cursor: pointer; font-weight: 600; }
+@media (max-width: 760px) { .stream-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+details.onvif .form-actions, details.onvif .row2 { margin-top: 8px; }

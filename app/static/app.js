@@ -33,6 +33,8 @@ const ICONS = {
   web: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18',
   image: 'M4 4h16v16H4zM4 16l5-5 4 4 3-3 4 4M15 9h.01',
   video: 'M3 6h13v12H3zM16 10l5-3v10l-5-3z',
+  camera: 'M3 8h4l2-3h6l2 3h4v12H3zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
+  search: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM21 21l-5-5',
   grafana: 'M4 20V10M10 20V4M16 20v-7M22 20H2',
   play: 'M7 4l13 8-13 8z',
   next: 'M5 4l10 8-10 8zM19 5v14',
@@ -368,8 +370,8 @@ function kindOf(id) {
   if (a) return a.kind;
   return Number(id) >= 100000 ? 'grafana-tag' : 'web';
 }
-const kindIcon = k => icon(k === 'grafana-tag' ? 'grafana' : k === 'image' ? 'image' : k === 'video' ? 'video' : 'web');
-const kindLabel = k => ({ web: T('Webová stránka', 'Web page'), image: T('Obrázek', 'Picture'), video: 'Video', 'grafana-tag': T('Kolekce Grafany', 'Grafana collection') }[k] || k);
+const kindIcon = k => icon(k === 'grafana-tag' ? 'grafana' : k === 'image' ? 'image' : k === 'video' ? 'video' : k === 'camera' ? 'camera' : 'web');
+const kindLabel = k => ({ web: T('Webová stránka', 'Web page'), image: T('Obrázek', 'Picture'), video: 'Video', camera: T('Kamera', 'Camera'), 'grafana-tag': T('Kolekce Grafany', 'Grafana collection') }[k] || k);
 
 function liveSelectHtml() {
   let html = '', open = false;
@@ -580,6 +582,12 @@ const hostOf = u => { try { return new URL(u).host; } catch (e) { return u; } };
 function sourceText(a) {
   if (a.kind === 'grafana-tag') { const c = grafanaCfg(a); return `${T('tag', 'tag')} ${c.tag || '?'} · ${hostOf(c.grafana_url || '')}`; }
   if (a.kind === 'web') return a.source;
+  if (a.kind === 'camera') {
+    let c = {};
+    try { c = JSON.parse(a.source || '{}'); } catch { /* ignore */ }
+    const streams = c.streams || [];
+    return `${streams.length} ${T(streams.length === 1 ? 'stream' : 'streamy', streams.length === 1 ? 'stream' : 'streams')} · ${[...new Set(streams.map(x => hostOf(x.url)))].join(', ')}`;
+  }
   return String(a.source || '').split('/').pop();
 }
 function dashboardsOf(id) { return S.options.filter(o => o.type === 'dashboard' && String(o.parent_id) === String(id)); }
@@ -666,6 +674,7 @@ VIEWS.playlist = async (root, changed) => {
   if (changed || !$('#plList')) {
     root.innerHTML = `<section class="card flush"><div class="toolbar"><h2 class="grow">Playlist <span class="badge" id="plCount"></span></h2>
         <button class="btn" data-do="addGrafana">${icon('grafana')}<span>${T('Grafana podle tagu', 'Grafana by tag')}</span></button>
+        <button class="btn" data-do="addCamera">${icon('camera')}<span>${T('Kamera', 'Camera')}</span></button>
         <button class="btn" data-do="upload">${icon('upload')}<span>${T('Nahrát médium', 'Upload media')}</span></button>
         <button class="btn primary" data-do="addWeb">${icon('plus')}<span>${T('Přidat web', 'Add website')}</span></button></div>
       <ol class="list" id="plList"></ol></section>
@@ -769,6 +778,7 @@ Object.assign(ACT, {
     const a = S.assets.find(x => String(x.id) === b.dataset.id);
     if (!a) return;
     if (a.kind === 'grafana-tag') return grafanaDialog(a);
+    if (a.kind === 'camera') return cameraDialog(a);
     const web = a.kind === 'web';
     modal({
       title: T('Upravit položku', 'Edit item'),
@@ -806,6 +816,80 @@ Object.assign(ACT, {
     drawPlaylist();
   },
 });
+
+// A camera: one or more streams (RTSP, HTTP) shown as a grid; ONVIF cameras can be found and asked for their streams.
+const streamRow = (s = {}) => `<div class="stream-row" data-stream>
+  <input data-f="name" placeholder="${T('Název (nepovinný)', 'Name (optional)')}" value="${esc(s.name || '')}">
+  <input data-f="url" placeholder="rtsp://192.168.1.20:554/stream1" value="${esc(s.url || '')}" required spellcheck="false">
+  <input data-f="username" placeholder="${T('Uživatel', 'User')}" value="${esc(s.username || '')}" autocomplete="off">
+  <input data-f="password" type="password" placeholder="${s.has_password ? T('beze změny', 'unchanged') : T('Heslo', 'Password')}" autocomplete="new-password">
+  <button type="button" class="icon-btn danger" data-del-stream title="${T('Odebrat', 'Remove')}">${icon('x')}</button></div>`;
+async function cameraDialog(a = null) {
+  const c = a ? await api('/api/assets/camera/' + a.id) : { streams: [{}], layout: 'auto' };
+  modal({
+    title: a ? T('Upravit kameru', 'Edit camera') : T('Přidat kameru', 'Add a camera'), wide: true, submit: a ? T('Uložit', 'Save') : T('Přidat', 'Add'),
+    body: `<div class="form"><p class="muted">${T('Video z IP kamer a záznamníků (RTSP) nebo z adresy HTTP (MJPEG, HLS). Víc streamů se zobrazí jako mřížka. Hesla se ukládají šifrovaně.', 'Video from IP cameras and recorders (RTSP) or an HTTP address (MJPEG, HLS). Several streams are shown as a grid. Passwords are stored encrypted.')}</p>
+      <div class="row2"><label>${T('Název', 'Name')}<input name="name" required value="${esc(a ? a.name : '')}" placeholder="${T('např. Vstup a parkoviště', 'e.g. Entrance and parking')}"></label>
+      <label>${T('Doba zobrazení (s)', 'Display time (s)')}<input name="duration" type="number" min="5" value="${a ? a.duration : 30}" required></label></div>
+      <div class="row2"><label>${T('Rozložení', 'Layout')}<select name="layout">${[['auto', T('Automaticky', 'Automatic')], ['2', T('Dvě vedle sebe', 'Two side by side')], ['2x2', '2 × 2'], ['3x3', '3 × 3']].map(([v, l]) => `<option value="${v}" ${c.layout === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label class="check"><input type="checkbox" class="switch" name="audio" ${c.audio ? 'checked' : ''}>${T('Zvuk prvního streamu', 'Sound of the first stream')}</label></div>
+      <h3>${T('Streamy', 'Streams')}</h3><div id="streamRows">${c.streams.map(streamRow).join('')}</div>
+      <div class="form-actions start"><button type="button" class="btn sm" data-add-stream>${icon('plus')}${T('Přidat stream', 'Add a stream')}</button></div>
+      <details class="onvif"><summary>${T('Najít kameru přes ONVIF', 'Find a camera with ONVIF')}</summary>
+        <p class="muted">${T('Node se zeptá kamery na adresy jejích streamů. Kameru zadejte adresou, nebo ji vyhledejte v síti.', 'The node asks the camera for the addresses of its streams. Enter the camera address, or search the network.')}</p>
+        <div class="form-actions start"><button type="button" class="btn sm" data-discover>${icon('search')}${T('Hledat kamery v síti', 'Search the network')}</button></div><div id="camFound"></div>
+        <div class="row2"><label>${T('Adresa kamery', 'Camera address')}<input data-onvif="host" placeholder="192.168.1.20"></label><label>Port<input data-onvif="port" type="number" value="80"></label></div>
+        <div class="row2"><label>${T('Uživatel', 'User')}<input data-onvif="username" autocomplete="off"></label><label>${T('Heslo', 'Password')}<input data-onvif="password" type="password" autocomplete="new-password"></label></div>
+        <input type="hidden" data-onvif="xaddr">
+        <div class="form-actions start"><button type="button" class="btn sm primary" data-onvif-load>${icon('camera')}${T('Načíst streamy', 'Load the streams')}</button></div><div id="camStreams"></div></details></div>`,
+    onOpen: form => {
+      const rowsBox = $('#streamRows', form), ov = k => $(`[data-onvif="${k}"]`, form);
+      form.addEventListener('click', async e => {
+        if (e.target.closest('[data-add-stream]')) rowsBox.insertAdjacentHTML('beforeend', streamRow());
+        const del = e.target.closest('[data-del-stream]');
+        if (del && $$('[data-stream]', form).length > 1) del.closest('[data-stream]').remove();
+        const disc = e.target.closest('[data-discover]');
+        if (disc) {
+          disc.classList.add('busy');
+          try {
+            const r = await api('/api/cameras/discover', { method: 'POST' });
+            $('#camFound', form).innerHTML = r.cameras.length ? `<div class="cam-list">${r.cameras.map(x => `<button type="button" class="btn sm" data-pick-cam="${esc(x.address)}" data-xaddr="${esc(x.xaddr)}">${icon('camera')}${esc(x.name || x.hardware || x.address)} <small class="muted">${esc(x.address)}</small></button>`).join('')}</div>`
+              : `<div class="note">${T('V síti se žádná kamera ONVIF neozvala.', 'No ONVIF camera answered in the network.')}</div>`;
+          } catch (err) { $('#camFound', form).innerHTML = `<div class="note bad">${esc(err.message)}</div>`; } finally { disc.classList.remove('busy'); }
+        }
+        const pick = e.target.closest('[data-pick-cam]');
+        if (pick) { ov('host').value = pick.dataset.pickCam; ov('xaddr').value = pick.dataset.xaddr; ov('username').focus(); }
+        const load = e.target.closest('[data-onvif-load]');
+        if (load) {
+          load.classList.add('busy');
+          try {
+            const r = await api('/api/cameras/onvif', { method: 'POST', json: { host: ov('host').value.trim(), port: Number(ov('port').value) || 80, username: ov('username').value, password: ov('password').value, xaddr: ov('xaddr').value } });
+            $('#camStreams', form).innerHTML = `<div class="cam-list">${r.streams.map((x, i) => `<button type="button" class="btn sm" data-use-stream="${i}">${icon('plus')}${esc(x.name || x.url)}</button>`).join('')}</div>`;
+            $$('[data-use-stream]', form).forEach(b => {
+              b.onclick = () => {
+                const x = r.streams[Number(b.dataset.useStream)], empty = $$('[data-stream]', form).find(row => !$('[data-f=url]', row).value);
+                const html = streamRow({ name: x.name, url: x.url, username: ov('username').value });
+                if (empty) empty.outerHTML = html; else rowsBox.insertAdjacentHTML('beforeend', html);
+                const last = $$('[data-stream]', form).find(row => $('[data-f=url]', row).value === x.url);
+                if (last) $('[data-f=password]', last).value = ov('password').value;
+                if (!form.name.value) form.name.value = x.name || ov('host').value;
+                b.disabled = true;
+              };
+            });
+          } catch (err) { $('#camStreams', form).innerHTML = `<div class="note bad">${esc(err.message)}</div>`; } finally { load.classList.remove('busy'); }
+        }
+      });
+    },
+    onSubmit: async f => {
+      const streams = $$('#streamRows [data-stream]').map(row => Object.fromEntries($$('[data-f]', row).map(i => [i.dataset.f, i.value.trim()])));
+      const body = { name: f.get('name').trim(), duration: Number(f.get('duration')), layout: f.get('layout'), audio: f.get('audio') === 'on', streams };
+      await api(a ? '/api/assets/camera/' + a.id : '/api/assets/camera', { method: a ? 'PUT' : 'POST', json: body });
+      toast(a ? T('Kamera uložena', 'Camera saved') : T('Kamera přidána', 'Camera added'));
+      render(true);
+    },
+  });
+}
+ACT.addCamera = () => cameraDialog();
 
 function grafanaDialog(a = null) {
   const c = a ? grafanaCfg(a) : { kiosk: true };

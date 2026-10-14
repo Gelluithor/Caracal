@@ -162,8 +162,55 @@ def apply_dark(page,mode):
   if CDP is not None:CDP.send('Emulation.setAutoDarkModeOverride',{'enabled':True} if mode=='force' else {})
  except Exception as e:print('automatic dark mode',e,flush=True)
  dark_applied=mode
+# Cameras: the streams of a camera item play in mpv windows over the browser, as a grid (Chromium cannot play RTSP).
+# They stay for the item's display time; a stream that drops is started again.
+CAMERA_TAG='caracal-camera'
+cameras={'procs':[],'item':None,'specs':[]}
+def camera_grid(n,w,h,layout='auto'):
+ cols={'1':1,'2':2,'2x2':2,'3x3':3}.get(layout) or (1 if n<=1 else 2 if n<=4 else 3)
+ rows=max(1,-(-n//cols)) if layout!='2' else 1
+ cols=max(cols,-(-n//rows)) if layout=='2' else cols
+ cw,ch=w//cols,h//rows
+ return [(cw,ch,(i%cols)*cw,(i//cols)*ch) for i in range(n)]
+def camera_args(url,cell,audio=False):
+ cw,ch,x,y=cell
+ return ['mpv','--no-config','--really-quiet','--title='+CAMERA_TAG,'--no-border','--ontop','--no-osc','--no-input-default-bindings',
+  '--input-vo-keyboard=no','--cursor-autohide=always','--keepaspect=yes','--profile=low-latency','--untimed','--cache=no',
+  '--rtsp-transport=tcp','--hwdec=auto-safe','--network-timeout=10',f'--geometry={cw}x{ch}+{x}+{y}']+([] if audio else ['--no-audio'])+[url]
+def stop_cameras():
+ for p in cameras['procs']:
+  try:p.terminate()
+  except Exception:pass
+ for p in cameras['procs']:
+  try:p.wait(3)
+  except Exception:
+   try:p.kill()
+   except Exception:pass
+ cameras.update(procs=[],item=None,specs=[])
+def start_cameras(a):
+ import shutil
+ cam=get('/api/player/camera/'+str(a['id']))
+ if not cam or not cam.get('streams'):return 'Kamera nemá žádný stream'
+ if not shutil.which('mpv'):return 'Pro kamery chybí přehrávač mpv'
+ w,h=display_size();env=dict(os.environ,DISPLAY=os.getenv('DISPLAY',':0'))
+ cells=camera_grid(len(cam['streams']),w,h,cam.get('layout','auto'))
+ specs=[camera_args(s['url'],cells[i],cam.get('audio') and i==0) for i,s in enumerate(cam['streams'])]
+ cameras.update(item=a['id'],specs=specs,procs=[subprocess.Popen(x,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) for x in specs])
+ return ''
+def watch_cameras():
+ # a camera that dropped (network, reboot of the camera) is started again
+ env=dict(os.environ,DISPLAY=os.getenv('DISPLAY',':0'))
+ for i,p in enumerate(cameras['procs']):
+  if p.poll() is not None:
+   print('camera stream ended, starting it again',flush=True)
+   cameras['procs'][i]=subprocess.Popen(cameras['specs'][i],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 def show(page,a):
+ if cameras['procs']:stop_cameras()
  apply_dark(page,a.get('dark') if a['kind']=='web' else 'off')
+ if a['kind']=='camera':
+  error=start_cameras(a)
+  page.set_content('<body style="margin:0;background:#000;color:#94a3b8;display:grid;place-items:center;height:100vh;font:26px DejaVu Sans,sans-serif">'+(error or '')+'</body>')
+  return
  if a['kind']=='web':
   pid=a.get('auth_profile_id');pr=get('/api/player/profile/'+str(pid)) if pid else None
   if pr and pr.get('auth_type')=='http':show_http_auth(page,a,pr)
@@ -189,6 +236,7 @@ resume_index=0   # where the playlist continues after the browser was restarted
 def run():
  global CDP,resume_index,dark_applied
  CDP=None;dark_applied=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
+ stop_cameras();subprocess.run(['pkill','-f','--title='+CAMERA_TAG],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)   # left over by a restart
  with sync_playwright() as pw:
   ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=chromium_args(w,h))
   if LOW_MEMORY:print(f'Small memory ({TOTAL_MB} MB): Chromium runs in its low-end mode',flush=True)
@@ -221,12 +269,16 @@ def run():
        except Exception:idx=(idx+1)%len(items) if items else 0
       cur=None;remaining=0
    if not items:
+    if cameras['procs']:stop_cameras()
     if cur is not None:cur=None;page.set_content('<body style="margin:0;background:#000;color:#fff;display:grid;place-items:center;height:100vh;font:30px system-ui">CARACAL<br><small>Playlist je prázdný</small></body>')
     post('/api/v2/player/heartbeat',{'current_id':None,'current_name':'','frozen':False,'collection_frozen':False,'remaining':None,'duration':None});time.sleep(1);continue
    if cur is None:cur=items[idx%len(items)];show(page,cur);duration=max(5,int(cur.get('duration') or 30));remaining=duration;fullscreen()
    frozen=mode=='single-freeze';collection_frozen=mode in ('collection-freeze','collection-temporary')
    post('/api/v2/player/heartbeat',{'current_id':cur['id'],'current_name':cur['name'],'frozen':frozen,'collection_frozen':collection_frozen,'collection_id':collection_id,'remaining':None if frozen else remaining,'duration':duration})
-   if time.time()-last_fs>4:fullscreen(True);last_fs=time.time()
+   if time.time()-last_fs>4:
+    if cameras['procs']:watch_cameras()
+    else:fullscreen(True)
+    last_fs=time.time()
    time.sleep(1)
    if not frozen:
     remaining-=1

@@ -210,3 +210,84 @@ def test_removed_patch_endpoints(client):
                          ('put', '/api/assets/reorder'), ('post', '/api/v5/player/control')]:
         # 422: /api/assets/reorder now only matches PUT /api/assets/{id} with an invalid id
         assert getattr(client, method)(path).status_code in (404, 405, 422), path
+
+
+def fake_onvif():
+    """An ONVIF camera: device service, media service with two profiles; requires a password digest."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers['Content-Length'])).decode()
+            if 'PasswordDigest' not in body or '<Username>admin</Username>' not in body:
+                self.send_response(401)
+                self.end_headers()
+                return
+            port = self.server.server_address[1]
+            if 'GetCapabilities' in body:
+                xml = f'<tds:Capabilities><tt:Media><tt:XAddr>http://127.0.0.1:{port}/onvif/media</tt:XAddr></tt:Media></tds:Capabilities>'
+            elif 'GetProfiles' in body:
+                xml = ('<trt:Profiles token="main"><tt:Name>Main</tt:Name><tt:VideoEncoderConfiguration><tt:Resolution><tt:Width>1920</tt:Width>'
+                       '<tt:Height>1080</tt:Height></tt:Resolution></tt:VideoEncoderConfiguration></trt:Profiles>'
+                       '<trt:Profiles token="sub"><tt:Name>Sub</tt:Name></trt:Profiles>')
+            else:
+                token = 'main' if '>main<' in body else 'sub'
+                xml = f'<trt:MediaUri><tt:Uri>rtsp://127.0.0.1:554/{token}</tt:Uri></trt:MediaUri>'
+            out = ('<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" '
+                   'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:trt="http://www.onvif.org/ver10/media/wsdl">'
+                   f'<s:Body><x>{xml}</x></s:Body></s:Envelope>').encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/soap+xml')
+            self.send_header('Content-Length', str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+    srv = HTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+
+def test_cameras(app_mod, client, local, fleet):
+    r = client.post('/api/assets/camera', json={'name': 'Vstup', 'duration': 20, 'layout': '2x2', 'streams': [
+        {'name': 'Brána', 'url': 'rtsp://admin:tajne%40heslo@10.0.0.5:554/stream1'},
+        {'url': 'http://10.0.0.6/mjpeg', 'username': 'view', 'password': 'pw2'}]})
+    assert r.status_code == 200, r.text
+    cid = r.json()['id']
+    listed = next(a for a in client.get('/api/assets').json() if a['id'] == cid)
+    assert listed['kind'] == 'camera' and 'secret_enc' not in listed and 'heslo' not in listed['source']
+    assert json.loads(listed['source'])['streams'][0]['url'] == 'rtsp://10.0.0.5:554/stream1'
+    details = client.get(f'/api/assets/camera/{cid}').json()
+    assert details['streams'][0]['username'] == 'admin' and details['streams'][0]['has_password'] and 'password' not in details['streams'][0]
+    assert TestClient(app_mod.app).get(f'/api/player/camera/{cid}').status_code == 403
+    cam = local.get(f'/api/player/camera/{cid}').json()
+    assert cam['layout'] == '2x2' and cam['streams'][0]['url'] == 'rtsp://admin:tajne%40heslo@10.0.0.5:554/stream1'
+    assert cam['streams'][1]['url'] == 'http://view:pw2@10.0.0.6/mjpeg'
+    # an empty password keeps the stored one
+    client.put(f'/api/assets/camera/{cid}', json={'name': 'Vstup 2', 'streams': [{'url': 'rtsp://10.0.0.5:554/stream1', 'username': 'admin'}]})
+    assert local.get(f'/api/player/camera/{cid}').json()['streams'] == [{'name': '', 'url': 'rtsp://admin:tajne%40heslo@10.0.0.5:554/stream1'}]
+    assert client.post('/api/assets/camera', json={'name': 'x', 'streams': [{'url': 'file:///etc/passwd'}]}).status_code == 400
+    assert client.post('/api/assets/camera', json={'name': 'x', 'streams': []}).status_code == 400
+    assert any(x['id'] == cid and x['kind'] == 'camera' for x in local.get('/api/player/playlist-expanded').json())
+    # Fleet: the snapshot has no credentials; cameras are added and changed like other items
+    snap = fleet.get('/api/fleet/v1/snapshot').text
+    assert 'tajne' not in snap and 'pw2' not in snap
+    fid = fleet.post('/api/fleet/v1/assets/camera', json={'name': 'Sklad', 'streams': [{'url': 'rtsp://10.0.0.9/live', 'username': 'u', 'password': 'p'}]}).json()['id']
+    assert fleet.put(f'/api/fleet/v1/assets/camera/{fid}', json={'name': 'Sklad 2', 'layout': '2', 'streams': [{'url': 'rtsp://10.0.0.9/live2'}]}).status_code == 200
+    assert local.get(f'/api/player/camera/{fid}').json()['streams'][0]['url'] == 'rtsp://u:p@10.0.0.9/live2'
+    for i in (cid, fid):
+        client.delete(f'/api/assets/{i}')
+
+
+def test_onvif(client, fleet):
+    port = fake_onvif()
+    r = client.post('/api/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'admin', 'password': 'x'})
+    assert r.status_code == 200, r.text
+    assert r.json()['streams'] == [{'name': 'Main 1920×1080', 'url': 'rtsp://127.0.0.1:554/main'}, {'name': 'Sub', 'url': 'rtsp://127.0.0.1:554/sub'}]
+    assert client.post('/api/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'nobody', 'password': 'x'}).status_code == 401
+    assert client.post('/api/cameras/onvif', json={'host': 'bad host!', 'port': 80}).status_code == 400
+    assert fleet.post('/api/fleet/v1/cameras/onvif', json={'host': '127.0.0.1', 'port': port, 'username': 'admin', 'password': 'x'}).json()['streams'][1]['name'] == 'Sub'
+    found = client.post('/api/cameras/discover')   # 503 where the network has no multicast route
+    assert found.status_code == 503 or isinstance(found.json()['cameras'], list)
