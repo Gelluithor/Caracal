@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,7 +50,15 @@ vault = Fernet(VF.read_bytes())          # website logins are stored encrypted
 secret = SF.read_text()                 # signs the session cookies
 pwd = CryptContext(schemes=['bcrypt'], deprecated='auto')
 STATIC = Path(__file__).parent / 'static'
-app = FastAPI(docs_url=None, redoc_url=None)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    _wch_start()                        # background threads, defined further down
+    yield
+
+
+app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount('/static', StaticFiles(directory=STATIC), name='static')
 app.mount('/media', StaticFiles(directory=MEDIA), name='media')
 _UPLOAD_MAX = 2 * 1024 ** 3
@@ -1617,7 +1626,6 @@ def _wch_loop():
     if time.time()>=float(w['last_check'] or 0)+int(w['interval'] or 60):_wch_check(w)
   except Exception as error:print('watcher error',error,flush=True)
   time.sleep(5)
-@app.on_event('startup')
 def _wch_start():threading.Thread(target=_wch_loop,daemon=True,name='caracal-watchers').start()
 
 def _wch_fields(d,current=None):
