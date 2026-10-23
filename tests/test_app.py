@@ -349,3 +349,60 @@ def test_camera_preview(app_mod, client, fleet, monkeypatch, tmp_path):
     assert fleet.post('/api/fleet/v1/cameras/preview', json={'id': cid, 'index': 0}).status_code == 200
     assert fleet.post('/api/fleet/v1/cameras/preview', json={'id': cid, 'index': 3}).status_code == 404
     client.delete(f'/api/assets/{cid}')
+
+
+def test_plays(app_mod, client, local, fleet):
+    """Every item on the screen is one play; the same item again (a playlist of one) too; a player that stops ends it."""
+    a = fleet.post('/api/fleet/v1/assets/web', json={'name': 'Hraje', 'source': 'https://example.com/p', 'duration': 5}).json()['id']
+    beat = lambda **d: local.post('/api/v2/player/heartbeat', json=d)
+    beat(current_id=None)   # whatever earlier tests left on the screen ends
+    start = fleet.get('/api/fleet/v1/plays').json()['last_id']
+    beat(current_id=a, current_name='Hraje', remaining=5, duration=5)
+    beat(current_id=a, current_name='Hraje', remaining=4, duration=5)
+    beat(current_id=a, current_name='Hraje', remaining=5, duration=5)    # shown again
+    beat(current_id=None)
+    plays = fleet.get(f'/api/fleet/v1/plays?after={start}').json()['plays']
+    assert [(p['name'], p['kind'], p['asset_id']) for p in plays] == [('Hraje', 'web', a)] * 2
+    assert all(p['ended'] >= p['started'] for p in plays)
+    # an unfinished play stops the list there, so the position never skips one
+    beat(current_id=a, current_name='Hraje', remaining=5, duration=5)
+    assert len(fleet.get(f'/api/fleet/v1/plays?after={start}').json()['plays']) == 2
+    beat(current_id=None)
+    assert fleet.get('/api/fleet/v1/plays', headers={'X-Fleet-Key': 'wrong'}).status_code in (401, 403)
+    client.delete(f'/api/assets/{a}')
+
+
+def test_takeover(app_mod, client, local, fleet):
+    """An emergency message replaces the playlist at once and ends by itself or when CARACAL Fleet ends it."""
+    a = fleet.post('/api/fleet/v1/assets/web', json={'name': 'Normál', 'source': 'https://example.com/n'}).json()['id']
+    assert fleet.post('/api/fleet/v1/takeover', json={}).status_code == 400
+    assert fleet.post('/api/fleet/v1/takeover', json={'title': 'Evakuace', 'message': 'Ven', 'level': 'nope'}).status_code == 200
+    items = local.get('/api/player/playlist-expanded').json()
+    assert [(x['id'], x['kind'], x['name']) for x in items] == [(-1, 'takeover', 'Evakuace')]
+    cmd = local.get('/api/v6/player/command').json()
+    assert (cmd['action'], cmd['item_id']) == ('freeze', -1)
+    t = local.get('/api/player/takeover').json()
+    assert t['level'] == 'critical' and t['message'] == 'Ven'
+    assert fleet.get('/api/fleet/v1/snapshot').json()['takeover']['title'] == 'Evakuace'
+    assert 'takeover.js' in client.get('/takeover').text
+    fleet.delete('/api/fleet/v1/takeover')
+    assert a in [x['id'] for x in local.get('/api/player/playlist-expanded').json()]
+    assert local.get('/api/v6/player/command').json()['action'] == 'unfreeze'
+    # with an end: the player's next question ends it
+    fleet.post('/api/fleet/v1/takeover', json={'title': 'Krátce', 'until': __import__('time').time() - 1})
+    local.get('/api/v6/player/command')
+    assert fleet.get('/api/fleet/v1/snapshot').json()['takeover'] is None
+    client.delete(f'/api/assets/{a}')
+
+
+def test_widgets(app_mod, client, fleet, monkeypatch):
+    page = client.get('/widgets?type=clock')
+    assert page.status_code == 200 and '/static/widgets.js' in page.text and 'https:' in page.headers['Content-Security-Policy']
+    monkeypatch.setattr(app_mod, '_fetch_feed', lambda url: 'csv;' + url)
+    assert client.get('/api/widgets/feed?url=https://e.com/a.csv').json() == {'text': 'csv;https://e.com/a.csv'}
+    # from another computer only with a session of the admin UI
+    lan = TestClient(app_mod.app)
+    assert lan.get('/api/widgets/feed?url=https://e.com/a.csv').status_code == 401
+    monkeypatch.undo()
+    assert client.get('/api/widgets/feed?url=file:///etc/passwd').status_code == 400
+    assert fleet.post('/api/fleet/v1/assets/web', json={'name': 'W', 'source': 'http://127.0.0.1:8080/widgets?type=clock'}).status_code == 200

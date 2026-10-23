@@ -80,6 +80,9 @@ _SECURITY_HEADERS = {
 @app.middleware('http')
 async def _security_headers(request: Request, call_next):
     response = await call_next(request)
+    if request.url.path == '/widgets':   # news may carry pictures from other sites
+        response.headers.setdefault('Content-Security-Policy', _SECURITY_HEADERS['Content-Security-Policy'].replace(
+            "img-src 'self' data: blob:", "img-src 'self' data: blob: https:"))
     for k, v in _SECURITY_HEADERS.items():
         response.headers.setdefault(k, v)
     if request.url.path.startswith('/api/'):
@@ -117,6 +120,8 @@ CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, name TEXT, kind TEXT, 
 CREATE TABLE IF NOT EXISTS auth_profiles(id INTEGER PRIMARY KEY, name TEXT, login_url TEXT, target_url TEXT,
   username_enc BLOB, password_enc BLOB, user_selector TEXT, pass_selector TEXT, submit_selector TEXT);
 CREATE TABLE IF NOT EXISTS player_settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS plays(id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id INTEGER, name TEXT, kind TEXT, started REAL,
+  ended REAL);
 """)
     # columns added by later versions
     if 'scale' not in _columns(c, 'assets'):
@@ -568,6 +573,10 @@ async def save_validity(asset_id: int, request: Request, u=Depends(auth)):
 def expanded_player_playlist():
     """The playlist as the player plays it: a Grafana collection becomes its dashboards (id = collection * 100000 +
     index), every website gets its resulting dark mode. Items outside their validity are left out."""
+    takeover = _takeover()
+    if takeover:   # an emergency message replaces the whole playlist until it ends
+        return [{'id': TAKEOVER_ID, 'kind': 'takeover', 'name': takeover.get('title') or 'CARACAL', 'source': '',
+                 'duration': 3600, 'position': 0, 'auth_profile_id': None, 'scale': 1.0, 'dark': None}]
     output, web_dark, now = [], _web_dark(), time.time()
     for asset in rows(_ASSETS_QUERY):
         if not _active(asset, now):
@@ -722,10 +731,12 @@ async def player_heartbeat(req: Request):
     _local_only(req)
     d = await req.json()
     state = _cc2_read()
+    now = time.time()
+    _record_play(state, d, now)
     for k in ('current_id', 'current_name', 'frozen', 'remaining', 'duration'):
         if k in d:
             state[k] = d[k]
-    state['updated'] = time.time()
+    state['updated'] = now
     _cc2_write(state)
     return {'ok': True}
 
@@ -790,6 +801,7 @@ async def player_control(req: Request, u=Depends(auth)):
 @app.get('/api/v6/player/command')
 def player_command(req: Request):
     _local_only(req)
+    _takeover()   # an emergency message whose time is up ends here (the player asks every second)
     s = _cc2_read()
     return {'command_id': s.get('v6_command_id', 0), 'action': s.get('v6_action', ''), 'item_id': s.get('v6_item_id'),
             'collection_id': s.get('v6_collection_id'), 'restart_id': s.get('restart_player_request', 0)}
@@ -922,7 +934,8 @@ def fleet_snapshot(req:Request):
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
  return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows(_ASSETS_QUERY),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications(),
   'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))},
-  'collections':_fleet_collections(),'screenshot':_shot_info(),'player_settings':_player_settings(),'display':_display_info()}
+  'collections':_fleet_collections(),'screenshot':_shot_info(),'player_settings':_player_settings(),'display':_display_info(),
+  'takeover':_takeover()}
 
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
@@ -2377,3 +2390,156 @@ async def fleet_camera_discover(req: Request):
 async def fleet_camera_preview(req: Request):
     _fleet_auth(req)
     return await asyncio.to_thread(camera_preview, await _fleet_json(req))
+
+
+# ------------------------------------------------------------------ proof of play
+
+_PLAY_GAP = 15                # seconds without a heartbeat of the player: the item on the screen stopped then
+_PLAY_KEEP = 90 * 86400       # how long the node keeps what it played (CARACAL Fleet collects it earlier)
+
+
+def _play_kind(item_id):
+    if item_id == TAKEOVER_ID:
+        return 'takeover'
+    r = rows('SELECT kind FROM assets WHERE id=?', (item_id,))
+    return r[0]['kind'] if r else 'dashboard' if isinstance(item_id, int) and item_id >= 100000 else ''
+
+
+def _record_play(state, d, now):
+    """One row per item on the screen: it starts when the player shows it (also the same item again) and ends when
+    another one comes, the player stops sending heartbeats or the screen gets empty."""
+    current = d.get('current_id', state.get('current_id'))
+    last = float(state.get('updated') or 0)
+    open_id, gap = state.get('play_id'), now - last > _PLAY_GAP
+    again = d.get('remaining') is not None and state.get('remaining') is not None and d['remaining'] > state['remaining']
+    c = con()
+    if open_id and (gap or current != state.get('current_id') or again):
+        c.execute('UPDATE plays SET ended=? WHERE id=? AND ended IS NULL', (last if gap else now, open_id))
+        open_id = None
+    if current is not None and not open_id:
+        open_id = c.execute('INSERT INTO plays(asset_id, name, kind, started) VALUES(?,?,?,?)',
+                            (current, str(d.get('current_name') or state.get('current_name') or '')[:200],
+                             _play_kind(current), now)).lastrowid
+        if open_id % 200 == 0:
+            c.execute('DELETE FROM plays WHERE started<?', (now - _PLAY_KEEP,))
+    c.commit()
+    c.close()
+    state['play_id'] = open_id
+
+
+@app.get('/api/fleet/v1/plays')
+def fleet_plays(req: Request, after: int = 0):
+    """What the screen showed, oldest first: only finished plays and only up to the first unfinished one, so the
+    position (after) never skips a play."""
+    _fleet_auth(req)
+    out = []
+    for r in rows('SELECT id, asset_id, name, kind, started, ended FROM plays WHERE id>? ORDER BY id LIMIT 2000', (after,)):
+        if r['ended'] is None:
+            break
+        out.append(r)
+    last = rows('SELECT COALESCE(MAX(id), 0) last FROM plays')[0]['last']
+    return {'last_id': last, 'plays': out}
+
+
+# ------------------------------------------------------------------ emergency message (from CARACAL Fleet)
+
+TAKEOVER_ID = -1
+_TAKEOVER_LEVELS = ('info', 'warning', 'critical')
+
+
+def _takeover():
+    """The emergency message on the screen, or None. One whose time is up is ended here."""
+    t = _cc2_read().get('takeover')
+    if not isinstance(t, dict):
+        return None
+    if t.get('until') and time.time() >= float(t['until']):
+        _takeover_end()
+        return None
+    return t
+
+
+def _takeover_end():
+    state = _cc2_read()
+    if state.pop('takeover', None) is not None:
+        _cc2_write(state)
+        _player_command('unfreeze')   # the playlist goes on
+
+
+@app.post('/api/fleet/v1/takeover')
+async def fleet_takeover(req: Request):
+    _fleet_auth(req)
+    d = await _fleet_json(req)
+    try:
+        until = float(d['until']) if d.get('until') else None
+    except (TypeError, ValueError):
+        raise HTTPException(400, 'Invalid end')
+    t = {'id': str(d.get('id') or '')[:64], 'title': str(d.get('title') or '').strip()[:200],
+         'message': str(d.get('message') or '').strip()[:2000],
+         'level': d.get('level') if d.get('level') in _TAKEOVER_LEVELS else 'critical', 'until': until, 'started': time.time()}
+    if not t['title'] and not t['message']:
+        raise HTTPException(400, 'Empty message')
+    state = _cc2_read()
+    state['takeover'] = t
+    _cc2_write(state)
+    _player_command('freeze', TAKEOVER_ID)   # right away, not after the current item
+    return {'ok': True}
+
+
+@app.delete('/api/fleet/v1/takeover')
+def fleet_takeover_end(req: Request):
+    _fleet_auth(req)
+    _takeover_end()
+    return {'ok': True}
+
+
+@app.get('/api/player/takeover')
+def player_takeover():
+    return _takeover() or {}
+
+
+@app.get('/takeover', response_class=HTMLResponse)
+def takeover_page():
+    return FileResponse(STATIC / 'takeover.html', headers={'Cache-Control': 'no-store'})
+
+
+# ------------------------------------------------------------------ widgets: clock, weather, news, table, text
+
+_FEED_MAX = 2 * 1024 * 1024
+_feed_cache = {}
+
+
+def _fetch_feed(url):
+    """Text of a feed for a widget (RSS, CSV, weather), fetched by the node (pages cannot read other sites)."""
+    url = str(url or '').strip()
+    if not url.lower().startswith(('http://', 'https://')) or len(url) > 4000:
+        raise HTTPException(400, 'Invalid address')
+    hit = _feed_cache.get(url)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    req = urllib.request.Request(url, headers={'User-Agent': 'CARACAL widget', 'Accept': '*/*'})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            raw = r.read(_FEED_MAX + 1)
+            charset = r.headers.get_content_charset() or 'utf-8'
+    except Exception as e:
+        raise HTTPException(502, f'Feed not available: {e}'[:300])
+    if len(raw) > _FEED_MAX:
+        raise HTTPException(413, 'Feed too large')
+    text = raw.decode(charset, errors='replace')
+    if len(_feed_cache) > 100:
+        _feed_cache.clear()
+    _feed_cache[url] = (time.time(), text)
+    return text
+
+
+@app.get('/widgets', response_class=HTMLResponse)
+def widgets_page():
+    return FileResponse(STATIC / 'widgets.html', headers={'Cache-Control': 'no-cache'})
+
+
+@app.get('/api/widgets/feed')
+async def widget_feed(req: Request, url: str = ''):
+    # the player's browser on this device, or a signed-in administrator (preview)
+    if not req.client or req.client.host not in ('127.0.0.1', '::1'):
+        auth(req)
+    return {'text': await asyncio.to_thread(_fetch_feed, url)}

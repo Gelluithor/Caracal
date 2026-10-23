@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CARACAL</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { display: grid; grid-template-rows: auto 1fr auto; font-family: "DejaVu Sans", system-ui, sans-serif; color: #fff;
+    background: #b91c1c; transition: background .4s; }
+  body.warning { background: #b45309; }
+  body.info { background: #1d4ed8; }
+  header { display: flex; align-items: center; gap: 2vw; padding: 4vh 5vw 0; font-size: 3vh; letter-spacing: .08em; opacity: .85; }
+  header svg { width: 5vh; height: 5vh; fill: none; stroke: #fff; stroke-width: 2; }
+  main { display: flex; flex-direction: column; justify-content: center; padding: 0 5vw; }
+  h1 { margin: 0 0 4vh; font-size: 11vh; line-height: 1.05; font-weight: 800; }
+  p { margin: 0; font-size: 5.5vh; line-height: 1.35; white-space: pre-wrap; max-width: 80vw; }
+  footer { display: flex; justify-content: space-between; padding: 0 5vw 4vh; font-size: 4vh; opacity: .9; font-variant-numeric: tabular-nums; }
+  body.critical h1 { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .75; } }
+  @media (prefers-reduced-motion: reduce) { body.critical h1 { animation: none; } }
+</style>
+</head>
+<body class="critical">
+<header><svg viewBox="0 0 24 24"><path d="M12 3 2 21h20zM12 10v5M12 18h.01"/></svg><span id="label"></span></header>
+<main><h1 id="title"></h1><p id="message"></p></main>
+<footer><span id="date"></span><span id="clock"></span></footer>
+<script src="/static/takeover.js"></script>
+</body>
+</html>

@@ -207,6 +207,8 @@ def watch_cameras():
 def show(page,a):
  if cameras['procs']:stop_cameras()
  apply_dark(page,a.get('dark') if a['kind']=='web' else 'off')
+ if a['kind']=='takeover':   # an emergency message from CARACAL Fleet
+  page.goto(BASE+'/takeover',wait_until='domcontentloaded',timeout=45000);return
  if a['kind']=='camera':
   error=start_cameras(a)
   page.set_content('<body style="margin:0;background:#000;color:#94a3b8;display:grid;place-items:center;height:100vh;font:26px DejaVu Sans,sans-serif">'+(error or '')+'</body>')
