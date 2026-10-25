@@ -115,7 +115,7 @@ def test_playlist(app_mod, client, local):
     assert client.put(f'/api/assets/{web}/dark', json={'dark': 'force'}).json()['dark'] == 'force'
     assert client.put(f"/api/assets/{items['Pic']['id']}/dark", json={'dark': 'dark'}).status_code == 400
     assert client.put('/api/player/settings', json={'web_dark': 'dim'}).status_code == 400
-    assert client.put('/api/player/settings', json={'web_dark': 'dark'}).json() == {'web_dark': 'dark'}
+    assert client.put('/api/player/settings', json={'web_dark': 'dark'}).json() == {'web_dark': 'dark', 'layout': {}}
     assert client.post('/api/grafana/discover', data={'grafana_url': 'https://g', 'tag': 'x'}).json()['count'] == 2
 
     # what the player gets
@@ -406,3 +406,18 @@ def test_widgets(app_mod, client, fleet, monkeypatch):
     monkeypatch.undo()
     assert client.get('/api/widgets/feed?url=file:///etc/passwd').status_code == 400
     assert fleet.post('/api/fleet/v1/assets/web', json={'name': 'W', 'source': 'http://127.0.0.1:8080/widgets?type=clock'}).status_code == 200
+
+
+def test_layout_and_qr(app_mod, client, local, fleet):
+    """Zones next to the playlist (a side panel, a bar at the bottom) and the QR code of the QR widget."""
+    assert fleet.put('/api/fleet/v1/player/settings', json={'layout': {'side': {'width': 30}}}).status_code == 400
+    r = fleet.put('/api/fleet/v1/player/settings', json={'layout': {'side': {'width': 80, 'position': 'left', 'widget': 'type=clock'},
+                                                                    'ticker': {'height': 2, 'widget': 'type=ticker&text=Ahoj'}}})
+    assert r.status_code == 200
+    lay = local.get('/api/player/layout').json()
+    assert lay == {'side': {'width': 40, 'widget': 'type=clock', 'position': 'left'}, 'ticker': {'height': 5, 'widget': 'type=ticker&text=Ahoj'}}
+    assert fleet.get('/api/fleet/v1/snapshot').json()['player_settings']['layout'] == lay
+    fleet.put('/api/fleet/v1/player/settings', json={'layout': {}})
+    assert local.get('/api/player/layout').json() == {}
+    svg = client.get('/api/widgets/qr?text=https://example.com')
+    assert svg.status_code == 200 and svg.headers['content-type'].startswith('image/svg') and b'<svg' in svg.content

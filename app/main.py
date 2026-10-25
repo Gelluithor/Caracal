@@ -28,7 +28,7 @@ import jwt
 import psutil
 from cryptography.fernet import Fernet
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
 
@@ -2018,12 +2018,37 @@ def _web_dark():
  r=rows("SELECT value FROM player_settings WHERE key='web_dark'")
  return r[0]['value'] if r and r[0]['value'] in _DARK_MODES else 'off'
 def _dark_of(asset,default):return asset.get('dark') if asset.get('dark') in _DARK_MODES else default
-def _player_settings():return {'web_dark':_web_dark()}
+def _layout():
+ r=rows("SELECT value FROM player_settings WHERE key='layout'")
+ try:return json.loads(r[0]['value']) if r and r[0]['value'] else {}
+ except ValueError:return {}
+def _layout_value(v):
+ # zones next to the playlist: a side panel and a bar at the bottom, each with a widget ({} = the whole screen)
+ if not v:return {}
+ if not isinstance(v,dict):raise HTTPException(400,'Layout must be an object')
+ out={}
+ for zone,size,lo,hi in (('side','width',15,40),('ticker','height',5,25)):
+  z=v.get(zone)
+  if not z:continue
+  if not isinstance(z,dict):raise HTTPException(400,'Invalid zone')
+  widget=str(z.get('widget') or '').strip()
+  if not widget.startswith('type=') or len(widget)>3000 or any(ch.isspace() for ch in widget):raise HTTPException(400,'A zone needs a widget')
+  try:n=int(z.get(size) or (25 if zone=='side' else 8))
+  except (TypeError,ValueError):raise HTTPException(400,'Invalid zone size')
+  out[zone]={size:max(lo,min(hi,n)),'widget':widget}
+  if zone=='side':out[zone]['position']='left' if z.get('position')=='left' else 'right'
+ return out
+def _player_settings():return {'web_dark':_web_dark(),'layout':_layout()}
 def _save_player_settings(d):
  if not isinstance(d,dict):raise HTTPException(400,'Expected a JSON object')
  if 'web_dark' in d:
   c=con();c.execute("INSERT OR REPLACE INTO player_settings(key,value) VALUES('web_dark',?)",(_dark_value(d['web_dark'],False),));c.commit();c.close()
+ if 'layout' in d:
+  c=con();c.execute("INSERT OR REPLACE INTO player_settings(key,value) VALUES('layout',?)",(json.dumps(_layout_value(d['layout'])),));c.commit();c.close()
  return _player_settings()
+@app.get('/api/player/layout')
+def player_layout(req:Request):
+ _local_only(req);return _layout()
 def _set_asset_dark(asset_id,value):
  dark=_dark_value(value);c=con();a=c.execute('SELECT kind FROM assets WHERE id=?',(asset_id,)).fetchone()
  if not a:c.close();raise HTTPException(404,'Položka nebyla nalezena')
@@ -2543,3 +2568,16 @@ async def widget_feed(req: Request, url: str = ''):
     if not req.client or req.client.host not in ('127.0.0.1', '::1'):
         auth(req)
     return {'text': await asyncio.to_thread(_fetch_feed, url)}
+
+
+@app.get('/api/widgets/qr')
+def widget_qr(text: str = ''):
+    """A QR code as SVG for the QR widget (works without internet)."""
+    import io
+    import segno
+    text = str(text or '')[:1000]
+    if not text:
+        raise HTTPException(400, 'Empty text')
+    buf = io.BytesIO()
+    segno.make(text, error='m').save(buf, kind='svg', scale=10, border=2, dark='#000', light='#fff', xmldecl=False, svgns=True)
+    return Response(buf.getvalue(), media_type='image/svg+xml', headers={'Cache-Control': 'max-age=86400'})

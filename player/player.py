@@ -33,8 +33,10 @@ def meminfo():
 # browser restart between two items when memory runs out (long-running dashboards slowly take more).
 TOTAL_MB=meminfo().get('MemTotal',0)
 LOW_MEMORY=os.getenv('CARACAL_LOW_MEMORY','auto').lower() in ('1','true','yes') or (os.getenv('CARACAL_LOW_MEMORY','auto').lower()=='auto' and 0<TOTAL_MB<=1536)
-def chromium_args(w,h):
- args=['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}','--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox',
+def chromium_args(w,h,rect=None):
+ # rect: the main area of a layout with zones (an ordinary window without a frame instead of the full screen)
+ place=[f'--window-position={rect[0]},{rect[1]}',f'--window-size={rect[2]},{rect[3]}'] if rect else ['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}']
+ args=place+['--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox',
   # nothing a signage screen needs: background downloads, updates of components, sync, extensions, translation
   '--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','--disable-default-apps','--disable-breakpad',f'--disk-cache-size={32 if LOW_MEMORY else 64}000000']
  features=['Translate','MediaRouter','OptimizationHints','AutofillServerCommunication','CalculateNativeWinOcclusion']
@@ -56,8 +58,10 @@ def display_size():
 # emulate a viewport: it then resizes the window to the viewport and current Chromium versions leave fullscreen
 # for that, which showed the page in an ordinary window on Docker nodes (Debian Chromium).
 CDP=None
+MAIN=None   # (x, y, w, h) of the main area when the screen has zones
 def fullscreen(check_only=False):
  # check_only (the periodic check): the window manager is only called when Chromium is not fullscreen
+ if MAIN:return place_main(check_only)
  if CDP is not None:
   try:
    wid=CDP.send('Browser.getWindowForTarget')['windowId']
@@ -73,6 +77,72 @@ def fullscreen(check_only=False):
  except Exception:pass
 
 
+
+# Zones (a side panel, a bar at the bottom) next to the playlist: each zone is a small Chromium window without a frame
+# showing a widget of the node; the player's own window takes the rest of the screen.
+XENV=lambda:dict(os.environ,DISPLAY=os.getenv('DISPLAY',':0'))
+zones={'layout':None,'procs':{}}
+def layout_rects(lay,w,h):
+ side,tick=lay.get('side'),lay.get('ticker')
+ th=int(h*tick['height']/100) if tick else 0
+ sw=int(w*side['width']/100) if side else 0
+ left=bool(side) and side.get('position')=='left'
+ out=[]
+ if side:out.append(('side',(0 if left else w-sw,0,sw,h-th),side['widget']))
+ if tick:out.append(('ticker',(0,h-th,w,th),tick['widget']))
+ return (sw if left else 0,0,w-sw,h-th),out
+def undecorate(wid,rect):
+ # no frame (Motif hints, honoured by Openbox), at its place and above the player
+ env=XENV()
+ for cmd in (['xprop','-id',wid,'-f','_MOTIF_WM_HINTS','32c','-set','_MOTIF_WM_HINTS','2, 0, 0, 0, 0'],
+             ['wmctrl','-i','-r',wid,'-b','remove,fullscreen,maximized_vert,maximized_horz'],
+             ['wmctrl','-i','-r',wid,'-e','0,%d,%d,%d,%d'%rect]):
+  subprocess.run(cmd,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def windows(cls):
+ try:return subprocess.check_output(['xdotool','search','--onlyvisible','--class',cls],text=True,env=XENV(),stderr=subprocess.DEVNULL).split()
+ except Exception:return []
+def place_main(check_only=False):
+ if CDP is not None:
+  try:
+   wid=CDP.send('Browser.getWindowForTarget')['windowId'];b=CDP.send('Browser.getWindowBounds',{'windowId':wid})['bounds']
+   if b.get('windowState')!='normal':CDP.send('Browser.setWindowBounds',{'windowId':wid,'bounds':{'windowState':'normal'}})
+   if (b.get('left'),b.get('top'),b.get('width'),b.get('height'))!=MAIN:CDP.send('Browser.setWindowBounds',{'windowId':wid,'bounds':dict(zip(('left','top','width','height'),MAIN))})
+   elif check_only:return
+  except Exception as e:print('layout',e,flush=True)
+ for wid in windows('^chromium$|^Chromium$'):undecorate(wid,MAIN)
+def start_zones(lay,w,h):
+ global MAIN
+ stop_zones()
+ if not lay:MAIN=None;return
+ MAIN,specs=layout_rects(lay,w,h)
+ for name,rect,widget in specs:
+  args=['/usr/bin/chromium','--app='+BASE+'/widgets?'+widget,'--class=caracal-zone-'+name,'--user-data-dir=/tmp/caracal-zone-'+name,
+        '--window-position=%d,%d'%rect[:2],'--window-size=%d,%d'%rect[2:],'--force-device-scale-factor=1','--no-first-run','--noerrdialogs',
+        '--disable-infobars','--no-sandbox','--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-sync']
+  zones['procs'][name]=(subprocess.Popen(args,env=XENV(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL),rect,args)
+ zones['layout']=lay
+def stop_zones():
+ for proc,_r,_a in zones['procs'].values():
+  try:proc.terminate()
+  except Exception:pass
+ zones['procs'].clear()
+def watch_zones():
+ for name,(proc,rect,args) in list(zones['procs'].items()):
+  if proc.poll() is not None:   # a zone that closed comes back
+   zones['procs'][name]=(subprocess.Popen(args,env=XENV(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL),rect,args)
+  for wid in windows('caracal-zone-'+name):undecorate(wid,rect)
+ for wid in windows('caracal-zone'):subprocess.run(['wmctrl','-i','-r',wid,'-b','add,above'],env=XENV(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+# A page that does not load (no network, the site is down): a quiet card instead of a broken page, the playlist goes on.
+OFFLINE_PAGE='''<body style="margin:0;height:100vh;display:grid;place-items:center;background:#10131a;color:#f4f6fa;font-family:DejaVu Sans,sans-serif">
+<div style="text-align:center"><div id="t" style="font-size:22vh;font-weight:700;font-variant-numeric:tabular-nums"></div>
+<div style="font-size:3.4vh;color:#9aa3b5;margin-top:3vh">%s</div></div>
+<script>const t=()=>document.getElementById('t').textContent=new Date().toLocaleTimeString('cs-CZ',{hour:'2-digit',minute:'2-digit'});t();setInterval(t,1000)</script></body>'''
+def offline(page,a,error):
+ import html
+ print('Item',a.get('name'),'did not load:',str(error)[:200],flush=True)
+ try:page.set_content(OFFLINE_PAGE%html.escape(str(a.get('name') or '')))
+ except Exception:pass
 
 # CARACAL_COOKIE_ACCEPT_V2
 COOKIE_ACCEPT_EXACT={
@@ -192,8 +262,8 @@ def start_cameras(a):
  cam=get('/api/player/camera/'+str(a['id']))
  if not cam or not cam.get('streams'):return 'Kamera nemá žádný stream'
  if not shutil.which('mpv'):return 'Pro kamery chybí přehrávač mpv'
- w,h=display_size();env=dict(os.environ,DISPLAY=os.getenv('DISPLAY',':0'))
- cells=camera_grid(len(cam['streams']),w,h,cam.get('layout','auto'))
+ ox,oy,w,h=MAIN or (0,0)+display_size();env=dict(os.environ,DISPLAY=os.getenv('DISPLAY',':0'))
+ cells=[(cw,ch,x+ox,y+oy) for cw,ch,x,y in camera_grid(len(cam['streams']),w,h,cam.get('layout','auto'))]
  specs=[camera_args(s['url'],cells[i],cam.get('audio') and i==0) for i,s in enumerate(cam['streams'])]
  cameras.update(item=a['id'],specs=specs,procs=[subprocess.Popen(x,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) for x in specs])
  return ''
@@ -208,7 +278,12 @@ def show(page,a):
  if cameras['procs']:stop_cameras()
  apply_dark(page,a.get('dark') if a['kind']=='web' else 'off')
  if a['kind']=='takeover':   # an emergency message from CARACAL Fleet
-  page.goto(BASE+'/takeover',wait_until='domcontentloaded',timeout=45000);return
+  page.goto(BASE+'/takeover',wait_until='domcontentloaded',timeout=45000)
+  if MAIN:   # the whole screen: the zones step aside
+   try:CDP.send('Browser.setWindowBounds',{'windowId':CDP.send('Browser.getWindowForTarget')['windowId'],'bounds':{'left':0,'top':0,'width':display_size()[0],'height':display_size()[1]}})
+   except Exception:pass
+   stop_zones()
+  return
  if a['kind']=='camera':
   error=start_cameras(a)
   page.set_content('<body style="margin:0;background:#000;color:#94a3b8;display:grid;place-items:center;height:100vh;font:26px DejaVu Sans,sans-serif">'+(error or '')+'</body>')
@@ -228,8 +303,11 @@ def show(page,a):
      except Exception:pass
      page.wait_for_timeout(1500)
     except Exception as e:print('Login',pr.get('name'),'failed:',e,flush=True)
-   page.goto(pr['target_url'],wait_until='domcontentloaded',timeout=45000)
-  else:page.goto(a['source'],wait_until='domcontentloaded',timeout=45000)
+   try:page.goto(pr['target_url'],wait_until='domcontentloaded',timeout=45000)
+   except Exception as e:offline(page,a,e);return
+  else:
+   try:page.goto(a['source'],wait_until='domcontentloaded',timeout=45000)
+   except Exception as e:offline(page,a,e);return
   z=float(a.get('scale') or 1);page.evaluate("z=>{document.documentElement.style.zoom=String(z);document.body.style.zoom=String(z)}",z)
   auto_accept_all_cookies(page)
  elif a['kind']=='image':page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><img src="{BASE+a["source"]}" style="width:100vw;height:100vh;object-fit:contain"></body>')
@@ -239,13 +317,20 @@ def run():
  global CDP,resume_index,dark_applied
  CDP=None;dark_applied=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
  stop_cameras();subprocess.run(['pkill','-f','--title='+CAMERA_TAG],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)   # left over by a restart
+ subprocess.run(['pkill','-f','--class=caracal-zone-'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  with sync_playwright() as pw:
-  ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=chromium_args(w,h))
+  layout=get('/api/player/layout',{}) or {}
+  start_zones(layout,w,h)
+  ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=chromium_args(w,h,MAIN))
   if LOW_MEMORY:print(f'Small memory ({TOTAL_MB} MB): Chromium runs in its low-end mode',flush=True)
   page=ctx.pages[0] if ctx.pages else ctx.new_page();CDP=ctx.new_cdp_session(page);time.sleep(2);fullscreen();idx=resume_index;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None;items=[];items_at=0
   while True:
    # the playlist changes rarely: every 5 s (and right after a command); commands are checked every second
-   if time.time()-items_at>=5:items=get('/api/player/playlist-expanded',items) or [];items_at=time.time()
+   if time.time()-items_at>=5:
+    items=get('/api/player/playlist-expanded',items) or [];items_at=time.time()
+    takeover=any(x.get('kind')=='takeover' for x in items)
+    if not takeover and (get('/api/player/layout',layout) or {})!=layout:raise RuntimeError('screen layout changed')
+    if MAIN and not takeover and not zones['procs']:raise RuntimeError('emergency message ended, zones come back')
    cmd=get('/api/v6/player/command',{}) or {};cid=int(cmd.get('command_id') or 0)
    # a restart requested from the admin UI (Docker: the container restarts the player after it exits)
    if restart_id is None:restart_id=cmd.get('restart_id',0)
@@ -278,6 +363,7 @@ def run():
    frozen=mode=='single-freeze';collection_frozen=mode in ('collection-freeze','collection-temporary')
    post('/api/v2/player/heartbeat',{'current_id':cur['id'],'current_name':cur['name'],'frozen':frozen,'collection_frozen':collection_frozen,'collection_id':collection_id,'remaining':None if frozen else remaining,'duration':duration})
    if time.time()-last_fs>4:
+    if zones['procs']:watch_zones()
     if cameras['procs']:watch_cameras()
     else:fullscreen(True)
     last_fs=time.time()
