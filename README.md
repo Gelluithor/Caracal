@@ -1,26 +1,98 @@
-# CARACAL
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/hero-dark.svg">
+    <img src="docs/brand/hero-light.svg" width="860" alt="CARACAL">
+  </picture>
+</p>
 
-Digital signage for Raspberry Pi 4/5 and PCs: a fullscreen Chromium player for web pages, Grafana dashboards,
-images and videos with a web admin. Many screens can be managed centrally with
-[CARACAL Fleet](https://github.com/Gelluithor/Caracal-Fleet). Website: [gelluithor.github.io/caracal](https://gelluithor.github.io/caracal/)
+<p align="center">
+  Digital signage for Raspberry Pi 4/5 and PCs: a fullscreen player for web pages, Grafana dashboards, images,
+  videos and IP cameras, with a web admin. Many screens are managed centrally with
+  <a href="https://github.com/Gelluithor/Caracal-Fleet">CARACAL Fleet</a>.
+</p>
 
-![CARACAL web administration: the screen now, freezing an item, what the TV shows, the playlist, the notification look
-and a test notification on the screen](docs/caracal.gif)
+<p align="center">
+  <a href="https://github.com/Gelluithor/Caracal/releases/latest"><img src="https://img.shields.io/github/v/release/Gelluithor/Caracal?label=release&color=f98a12" alt="Latest release"></a>
+  <a href="https://github.com/users/Gelluithor/packages/container/package/caracal-node"><img src="https://img.shields.io/badge/docker-ghcr.io%2Fgelluithor%2Fcaracal--node-2496ed?logo=docker&logoColor=white" alt="Docker image"></a>
+  <img src="https://img.shields.io/badge/Raspberry%20Pi%204%2F5%20%C2%B7%20PC-supported-555?logo=raspberrypi&logoColor=white" alt="Raspberry Pi 4/5 and PCs">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Gelluithor/Caracal?color=555" alt="License"></a>
+</p>
 
-- Czech and English admin UI with dark mode and built-in help, in the same look as CARACAL Fleet
-- web pages, images, videos and IP cameras (RTSP, HTTP; ONVIF search, a grid of up to 9 streams played by mpv) in one
-  playlist, drag-and-drop ordering
-- per-item duration and zoom (when adding, editing or live with a slider)
-- encrypted login profiles with automatic sign-in (log-in forms and HTTP Basic/Digest, the browser's pop-up), automatic acceptance of common cookie banners
-- Grafana collections: all dashboards with a tag, read through Grafana's guest access on every cycle
-- websites in dark mode for the whole device or per item: the sites' own dark look, or forced dark for every page
-- live control: show or freeze an item or a whole collection, skip to the next item, resume
-- smooth progress bar at the bottom of the screen, splash screen and boot screen with the IP address
-- fullscreen watchdog, player and device restart from the admin UI; a website that keeps the screen black for five
-  minutes gets the player restarted
-- on-screen pop-up notifications from other apps (Grafana, Alertmanager, Uptime Kuma, scripts, …) through a token
-  protected API, or watchers that ask an app's API for new items (Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub,
-  any JSON API), shown one at a time from a queue, see [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md)
+<p align="center">
+  <a href="https://gelluithor.github.io/caracal/">Website</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#small-boards-raspberry-pi-4-with-1-gb">Small boards</a> ·
+  <a href="docs/NOTIFICATIONS.md">Notifications</a> ·
+  <a href="#security">Security</a> ·
+  <a href="https://github.com/Gelluithor/Caracal-Fleet">CARACAL Fleet</a>
+</p>
+
+<p align="center">
+  <img src="docs/caracal.gif" width="900" alt="CARACAL web administration: the screen now, freezing an item, what the TV shows, the playlist, the notification look and a test notification on the screen">
+</p>
+
+---
+
+## How it fits together
+
+```
+ browser ──HTTP :8080──▶ CARACAL web admin (FastAPI, SQLite)
+                              │ playlist, settings, notifications
+                              ▼
+ TV ◀──HDMI── Chromium player (fullscreen)  +  overlay (countdown bar, notifications)  +  mpv (cameras)
+                              ▲
+ Grafana, Alertmanager,  ─────┘ notification API (token)      watchers ──▶ Jira, GitLab, Zammad… (new items)
+ Uptime Kuma, scripts
+
+ optional: Fleet Agent ──local Fleet API──▶ the node, managed from CARACAL Fleet with many other screens
+```
+
+The device runs Docker and the X display; the web admin, the player and the overlay run in containers (or directly
+on the system with the classic installation). Logins of websites are stored encrypted on the device only.
+
+## Features
+
+### Put anything on the screen
+
+- **One playlist** of web pages, images, videos and IP cameras (RTSP, HTTP; ONVIF search, a grid of up to 9 streams
+  played by mpv), in drag-and-drop order
+- **Duration and zoom** per item, when adding, editing or live with a slider
+- **Grafana collections:** all dashboards with a tag, read through Grafana's guest access on every cycle, so new
+  dashboards show up by themselves
+- **Websites behind a sign-in:** encrypted login profiles with automatic sign-in (log-in forms and HTTP
+  Basic/Digest, the browser's pop-up), and automatic acceptance of common cookie banners
+- **Dark mode** for the whole device or per item: the sites' own dark look, or forced dark for every page
+
+### Control it live
+
+- **Show or freeze** an item or a whole collection, skip to the next item, resume
+- **Progress bar** at the bottom of the screen, a splash screen and a boot screen with the IP address
+- **Restart** the player or the device from the admin UI
+
+### Tell the room what's happening
+
+- **On-screen notifications** from Grafana, Alertmanager, Uptime Kuma or your scripts through a token-protected API,
+  shown one at a time from a queue, with your own look and sound per level
+- **Watchers** that ask an app's API for new items: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub or any JSON API
+- Details and examples in [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md)
+
+### Keep running
+
+- **Fullscreen watchdog**, and a website that keeps the screen black for five minutes gets the player restarted
+- **Small boards:** runs on a Raspberry Pi 4 with 1 GB (see [below](#small-boards-raspberry-pi-4-with-1-gb))
+- **Czech and English** admin UI with dark mode and built-in help, in the same look as CARACAL Fleet
+
+## Quick start
+
+On Raspberry Pi OS Lite (64-bit), DietPi, Debian or Ubuntu (arm64, amd64), one command installs Docker, the X
+display and the CARACAL containers:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Gelluithor/Caracal/main/docker/install.sh | sudo bash
+```
+
+Open `http://<device-ip>:8080` and create the administrator. Options, updates and removal:
+[docker/README.md](docker/README.md).
 
 ## Installation
 
@@ -29,30 +101,24 @@ and a test notification on the screen](docs/caracal.gif)
 The app, the player and the overlay run as containers from `ghcr.io/gelluithor/caracal-node` (arm64 and amd64).
 The device only runs Docker, the X display and, optionally, the CARACAL Fleet Agent.
 
+- **Without Fleet:** the one command above ([docker/install.sh](docker/install.sh)).
 - **With CARACAL Fleet:** prepare an SD card in Fleet (zero-touch) or let Fleet install a Raspberry Pi over SSH.
   Fleet also updates the nodes and can create the administrator of the admin UI during the installation.
-- **Without Fleet:** one command on Raspberry Pi OS Lite (64-bit), DietPi, Debian or Ubuntu installs Docker, the
-  X display and the CARACAL containers:
+  A node installed without Fleet joins it later with *Add device → Fleet Agent only*.
 
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/Gelluithor/Caracal/main/docker/install.sh | sudo bash
-  ```
+### Classic installation (without Docker)
 
-  Then open `http://<device-ip>:8080` and create the administrator. Details in [docker/README.md](docker/README.md).
-
-### Classic installation
-
-On Raspberry Pi OS Lite or DietPi (Raspberry Pi 4/5):
+Installs CARACAL straight into the system (apt and systemd), on Raspberry Pi OS Lite or DietPi (Raspberry Pi 4/5):
 
 ```bash
 git clone https://github.com/Gelluithor/Caracal.git
-cd caracal
+cd Caracal
 sudo bash install.sh
 ```
 
 Open `http://<device-ip>:8080` and create the administrator. Running `install.sh` again updates the application;
 the data in `/var/lib/caracal` are kept. To remove CARACAL: `sudo bash uninstall.sh` (`--purge` also removes the
-data).
+data). The Docker installation converts a classic one and keeps its data.
 
 ### Small boards (Raspberry Pi 4 with 1 GB)
 
