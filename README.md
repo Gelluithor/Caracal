@@ -31,7 +31,14 @@ The device only runs Docker, the X display and, optionally, the CARACAL Fleet Ag
 
 - **With CARACAL Fleet:** prepare an SD card in Fleet (zero-touch) or let Fleet install a Raspberry Pi over SSH.
   Fleet also updates the nodes and can create the administrator of the admin UI during the installation.
-- **Without Fleet:** see [docker/README.md](docker/README.md).
+- **Without Fleet:** one command on Raspberry Pi OS Lite (64-bit), DietPi, Debian or Ubuntu installs Docker, the
+  X display and the CARACAL containers:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Gelluithor/Caracal/main/docker/install.sh | sudo bash
+  ```
+
+  Then open `http://<device-ip>:8080` and create the administrator. Details in [docker/README.md](docker/README.md).
 
 ### Classic installation
 

@@ -24,9 +24,27 @@ the agent pulls the new image, checks that CARACAL runs, and restores the previo
 Existing classic installations (`/opt/caracal`) are converted with **Convert to Docker**. The data in
 `/var/lib/caracal` are kept.
 
+### One command (without Fleet)
+
+On Raspberry Pi OS Lite (64-bit), DietPi, Debian or Ubuntu:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Gelluithor/Caracal/main/docker/install.sh | sudo bash
+```
+
+`docker/install.sh` runs the node installer of CARACAL Fleet (`hub/bootstrap/install-node.sh`) without a hub:
+Docker, the user `caracal`, the X display, the KMS graphics driver on a Raspberry Pi (DietPi needs a reboot and a
+second run, the script says so), and the containers in `/opt/caracal-node`. A classic installation is converted and
+its data are kept. Options after `sudo bash -s --`: `--version 2026.10.25` (default `latest`), `--image`,
+`--docker-pool 10.200.0.0/16`, `--reinstall [--wipe-data]`. Open `http://<ip>:8080` and create the administrator.
+The node can join CARACAL Fleet later with *Add device → Fleet Agent only*.
+
+To remove it: `cd /opt/caracal-node && sudo docker compose down --rmi all`, then `sudo rm -rf /opt/caracal-node`
+(and `/var/lib/caracal` for the data).
+
 ### Manually (without Fleet)
 
-On Raspberry Pi OS Lite (64-bit) or DietPi:
+The same steps by hand, on Raspberry Pi OS Lite (64-bit) or DietPi:
 
 1. Install Docker: `curl -fsSL https://get.docker.com | sudo sh`
 2. Create the user and the X display. The same steps as `install-node.sh` in CARACAL Fleet, sections
