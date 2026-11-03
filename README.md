@@ -2,7 +2,7 @@
 
 Digital signage for Raspberry Pi 4/5 and PCs: a fullscreen Chromium player for web pages, Grafana dashboards,
 images and videos with a web admin. Many screens can be managed centrally with
-[CARACAL Fleet](https://github.com/Gelluithor/Caracal-Fleet).
+[CARACAL Fleet](https://github.com/Gelluithor/Caracal-Fleet). Website: [gelluithor.github.io/caracal](https://gelluithor.github.io/caracal/)
 
 ![CARACAL web administration: the screen now, freezing an item, what the TV shows, the playlist, the notification look
 and a test notification on the screen](docs/caracal.gif)
