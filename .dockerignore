@@ -7,5 +7,7 @@ Caracal fleet
 plymouth
 systemd
 system-config
+# the Chromium policy goes into the image (no translation bubble); the rest is for the classic installation
+!system-config/chromium-policy.json
 *.zip
 docs/*.gif
