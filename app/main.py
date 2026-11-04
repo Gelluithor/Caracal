@@ -764,7 +764,8 @@ def live_options(u=Depends(auth)):
 
 def _player_command(action, item_id=None, collection_id=None):
     """Validate a live control command and hand it to the player (used by the admin UI and by Fleet)."""
-    if action not in ('show', 'freeze', 'show_collection', 'freeze_collection', 'unfreeze', 'next'):
+    # reload: the item on the screen is loaded again (sign-in, zoom); the countdown and a freeze stay as they are
+    if action not in ('show', 'freeze', 'show_collection', 'freeze_collection', 'unfreeze', 'next', 'reload'):
         raise HTTPException(400, 'Neznámá akce')
     if action in ('show', 'freeze', 'show_collection', 'freeze_collection'):
         expanded = expanded_player_playlist()
@@ -940,7 +941,7 @@ def fleet_snapshot(req:Request):
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
  _fleet_auth(req);d=await req.json();action=str(d.get('action',''));item_id=d.get('item_id');collection_id=d.get('collection_id')
- if action not in ('show','freeze','show_collection','freeze_collection','unfreeze','next'):raise HTTPException(400,'Unknown action')
+ if action not in ('show','freeze','show_collection','freeze_collection','unfreeze','next','reload'):raise HTTPException(400,'Unknown action')
  if action in ('show','freeze','show_collection','freeze_collection'):
   expanded=expanded_player_playlist()
   if action in ('show','freeze'):
@@ -955,6 +956,15 @@ async def fleet_control(req:Request):
  # 'updated' is the player's liveness timestamp, so it is not touched here
  state=_cc2_read();state['v6_command_id']=int(state.get('v6_command_id',0))+1;state['v6_action']=action;state['v6_item_id']=item_id;state['v6_collection_id']=collection_id;_cc2_write(state)
  return {'ok':True,'command_id':state['v6_command_id']}
+
+# CARACAL 2026.11.04: the page on the screen loaded again, and watchers with any request (method, body, headers); the
+# agent learns from these two endpoints that the node has them
+@app.post('/api/fleet/v1/player/reload')
+def fleet_player_reload(req:Request):
+ _fleet_auth(req);return {'ok':True,'command_id':_player_command('reload')}
+@app.get('/api/fleet/v1/notify/watchers/options')
+def fleet_watcher_options(req:Request):
+ _fleet_auth(req);return {'methods':list(_WCH_METHODS),'auth':list(_WCH_AUTH),'placeholders':['secret','username','now'],'levels':list(_NTF_LEVELS)}
 
 @app.post('/api/fleet/v1/assets/web')
 async def fleet_add_web(req:Request):
@@ -1475,17 +1485,20 @@ async def fleet_notify(req:Request):
 # puts a notification into the queue for every item whose ID it has not seen yet. The first check only remembers
 # what is already there. Credentials are encrypted with the vault key and never returned by the API.
 _WCH_LOCK=threading.Lock()
-_WCH_AUTH=('none','bearer','basic','header','oauth2')
+# 'template': the username / secret only go where the request says, as {{username}} / {{secret}} in the body or a
+# header (e.g. Zabbix 6.0-7.0 wants "auth" inside its JSON-RPC body)
+_WCH_AUTH=('none','bearer','basic','header','oauth2','template')
+_WCH_METHODS=('GET','POST','PUT','PATCH')
 _WCH_GRANTS=('client_credentials','password','refresh_token')
 _WCH_SECRETS=('username','secret','client_secret','refresh_token')   # stored encrypted in credentials_enc
 _WCH_RESPONSE_MAX=5*1024**2;_WCH_SEEN_MAX=5000
 c=con();c.executescript("""CREATE TABLE IF NOT EXISTS notify_watchers(id INTEGER PRIMARY KEY,name TEXT,url TEXT,auth_type TEXT DEFAULT 'none',auth_header TEXT,credentials_enc BLOB,list_path TEXT,id_field TEXT,title_template TEXT,message_template TEXT,level TEXT DEFAULT 'info',level_field TEXT,interval INTEGER DEFAULT 60,verify_tls INTEGER DEFAULT 1,enabled INTEGER DEFAULT 1,
 seen TEXT DEFAULT '[]',initialized INTEGER DEFAULT 0,revision INTEGER DEFAULT 0,last_check REAL,last_error TEXT,last_count INTEGER,last_new INTEGER,created REAL);""")
 _wch_existing=[r[1] for r in c.execute('PRAGMA table_info(notify_watchers)').fetchall()]
-for _column in ('oauth_token_url','oauth_grant','oauth_client_id','oauth_scope','oauth_extra','oauth_client_auth'):
+for _column in ('oauth_token_url','oauth_grant','oauth_client_id','oauth_scope','oauth_extra','oauth_client_auth','method','body','content_type','headers','level_map'):
  if _column not in _wch_existing:c.execute(f'ALTER TABLE notify_watchers ADD COLUMN {_column} TEXT')
 c.commit();c.close()
-_WCH_COLUMNS='id,name,url,auth_type,auth_header,list_path,id_field,title_template,message_template,level,level_field,interval,verify_tls,enabled,initialized,last_check,last_error,last_count,last_new,oauth_token_url,oauth_grant,oauth_client_id,oauth_scope,oauth_extra,oauth_client_auth,credentials_enc IS NOT NULL AS has_credentials'
+_WCH_COLUMNS='id,name,url,auth_type,auth_header,list_path,id_field,title_template,message_template,level,level_field,interval,verify_tls,enabled,initialized,last_check,last_error,last_count,last_new,oauth_token_url,oauth_grant,oauth_client_id,oauth_scope,oauth_extra,oauth_client_auth,method,body,content_type,headers,level_map,credentials_enc IS NOT NULL AS has_credentials'
 
 def _wch_get(obj,path):
  # dot path into JSON: "data.tickets", "fields.summary", "items.0.id"
@@ -1501,6 +1514,32 @@ def _wch_render(template,item):
   v=_wch_get(item,match.group(1).strip())
   return '' if v is None else json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else str(v)
  return re.sub(r'\{([^{}]+)\}',value,str(template or ''))
+# the request of a watcher: {{secret}}, {{username}} and {{now}} (Unix time) in its body and headers; JSON-escaped
+# in a JSON body, so a password with quotes cannot break it
+_WCH_PLACEHOLDER=re.compile(r'\{\{\s*(secret|username|now)\s*\}\}')
+def _wch_fill(text,creds,json_escape=False):
+ values={'secret':str(creds.get('secret') or ''),'username':str(creds.get('username') or ''),'now':str(int(time.time()))}
+ return _WCH_PLACEHOLDER.sub(lambda m:json.dumps(values[m.group(1)])[1:-1] if json_escape else values[m.group(1)],str(text or ''))
+_WCH_HEADER=re.compile(r"^([!#$%&'*+.^_`|~0-9A-Za-z-]+)[ \t]*:[ \t]*(.*)$")
+def _wch_headers(text):
+ # "Name: value" per line; empty lines are skipped, anything else is an error
+ out=[]
+ for line in str(text or '').splitlines():
+  if not line.strip():continue
+  m=_WCH_HEADER.match(line.strip())
+  if not m:raise ValueError(f'Neplatná hlavička "{line.strip()[:60]}" (zapiš ji jako Název: hodnota)')
+  out.append((m.group(1),m.group(2)))
+ return out
+def _wch_level_map(text):
+ # "5=critical, 4=critical, 3=warning": a value of the level field -> a level (lower case, trimmed)
+ out={}
+ for part in re.split(r'[,;\n]',str(text or '')):
+  if not part.strip():continue
+  key,sep,level=part.partition('=')
+  level=level.strip().lower()
+  if not sep or not key.strip() or level not in _NTF_LEVELS:raise ValueError(f'Neplatný převod úrovně "{part.strip()[:40]}" (např. 5=critical, 3=warning)')
+  out[key.strip().lower()]=level
+ return out
 def _wch_credentials(row):
  try:return json.loads(vault.decrypt(row['credentials_enc']).decode()) if row and row['credentials_enc'] else {}
  except Exception:return {}
@@ -1574,7 +1613,13 @@ def _wch_fetch(w,creds,watcher_id=None):
   elif w['auth_type']=='basic':headers['Authorization']='Basic '+base64.b64encode(f"{creds.get('username') or ''}:{secret}".encode()).decode()
   elif w['auth_type']=='header':headers[w['auth_header'] or 'Authorization']=secret
   elif w['auth_type']=='oauth2':headers['Authorization']='Bearer '+_wch_oauth_token(w,creds,watcher_id,fresh)
-  with urllib.request.urlopen(urllib.request.Request(w['url'],headers=headers),timeout=20,context=context) as response:return response.read(_WCH_RESPONSE_MAX+1)
+  for name,value in _wch_headers(w.get('headers')):headers[name]=_wch_fill(value,creds)
+  data=None
+  if w.get('body'):
+   ctype=w.get('content_type') or 'application/json';headers.setdefault('Content-Type',ctype)
+   data=_wch_fill(w['body'],creds,'json' in ctype.lower()).encode()
+  request=urllib.request.Request(w['url'],data=data,headers=headers,method=w.get('method') or 'GET')
+  with urllib.request.urlopen(request,timeout=20,context=context) as response:return response.read(_WCH_RESPONSE_MAX+1)
  try:
   try:raw=get()
   except urllib.request.HTTPError as error:
@@ -1590,6 +1635,12 @@ def _wch_fetch(w,creds,watcher_id=None):
  items=_wch_get(data,w['list_path']) if w['list_path'] else data
  if isinstance(items,dict) and w['list_path']:items=list(items.values())
  if not isinstance(items,list):
+  # JSON-RPC and many REST APIs answer HTTP 200 with {"error": ...} (Zabbix: wrong token, unknown group)
+  error=data.get('error') or data.get('errors') if isinstance(data,dict) else None
+  if error:
+   if isinstance(error,list):error=error[0] if error else ''
+   text=' – '.join(dict.fromkeys(str(x) for x in ([error.get('message'),error.get('data')] if isinstance(error,dict) else [error]) if x))
+   raise ValueError('API vrátilo chybu: '+(text or json.dumps(error,ensure_ascii=False))[:300])
   keys=', '.join(list(data.keys())[:15]) if isinstance(data,dict) else type(data).__name__
   raise ValueError(f'Na cestě "{w["list_path"] or "(kořen)"}" není seznam. Klíče v odpovědi: {keys}')
  out=[]
@@ -1601,7 +1652,10 @@ def _wch_fetch(w,creds,watcher_id=None):
 
 def _wch_note(w,iid,item):
  title=_ntf_text(_wch_render(w['title_template'],item),120) or f"{w['name']}: {iid}"
- level=_ntf_level(_wch_get(item,w['level_field']),w['level']) if w['level_field'] else w['level']
+ level=w['level']
+ if w['level_field']:
+  raw=_wch_get(item,w['level_field'])
+  level=_wch_level_map(w.get('level_map')).get(str(raw if raw is not None else '').strip().lower()) or _ntf_level(raw,w['level'])
  return {'title':title,'message':_ntf_text(_wch_render(w['message_template'],item),600),'level':level,'key':_ntf_text(iid,180),'duration':None,'source':None,'sound':None}
 
 def _wch_check(w):
@@ -1647,6 +1701,14 @@ def _wch_fields(d,current=None):
   out[key]=str(d.get(key,current.get(key)) or '').strip()[:limit]
  for key,limit in (('oauth_token_url',4000),('oauth_client_id',500),('oauth_scope',1000),('oauth_extra',1000)):
   out[key]=str(d.get(key,current.get(key)) or '').strip()[:limit]
+ out['method']=str(d.get('method',current.get('method')) or 'GET').upper()
+ if out['method'] not in _WCH_METHODS:raise HTTPException(400,'Neplatná metoda (GET, POST, PUT nebo PATCH)')
+ out['body']=str(d.get('body',current.get('body')) or '').strip()[:20000]
+ for key,limit in (('content_type',200),('headers',4000),('level_map',500)):
+  out[key]=str(d.get(key,current.get(key)) or '').strip()[:limit]
+ if any(c in out['content_type'] for c in '\r\n'):raise HTTPException(400,'Neplatný Content-Type')
+ try:_wch_headers(out['headers']);_wch_level_map(out['level_map'])
+ except ValueError as error:raise HTTPException(400,str(error))
  out['oauth_grant']=str(d.get('oauth_grant',current.get('oauth_grant')) or 'client_credentials')
  out['oauth_client_auth']='basic' if d.get('oauth_client_auth',current.get('oauth_client_auth'))=='basic' else 'body'
  if out['oauth_grant'] not in _WCH_GRANTS:raise HTTPException(400,'Neplatný typ OAuth2 grantu')
@@ -1688,7 +1750,7 @@ def _wch_update(watcher_id,d,req,actor):
  if not r:raise HTTPException(404,'Hlídač nebyl nalezen')
  f=_wch_fields(d,r[0])
  # another URL or list means other items: start again without notifying about the existing ones
- reset=any(f[k]!=r[0][k] for k in ('url','list_path','id_field'))
+ reset=any(f[k]!=r[0][k] for k in ('url','list_path','id_field','method','body'))
  c=con();c.execute(f'UPDATE notify_watchers SET {",".join(k+"=?" for k in f)},revision=revision+1'+(",seen='[]',initialized=0,last_check=NULL" if reset else '')+' WHERE id=?',(*f.values(),watcher_id));c.commit();c.close()
  changed=[k for k in f if k!='credentials_enc' and f[k]!=r[0][k]]+(['přihlašovací údaje'] if f['credentials_enc']!=r[0]['credentials_enc'] and any(str(d.get(k) or '').strip() for k in _WCH_SECRETS) else [])
  if changed:_ntf_audit(req,actor,'Hlídač '+('zapnut' if changed==['enabled'] and f['enabled'] else 'vypnut' if changed==['enabled'] else 'upraven'),f"{f['name']}: "+', '.join(changed))

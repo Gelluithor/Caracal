@@ -421,3 +421,83 @@ def test_layout_and_qr(app_mod, client, local, fleet):
     assert local.get('/api/player/layout').json() == {}
     svg = client.get('/api/widgets/qr?text=https://example.com')
     assert svg.status_code == 200 and svg.headers['content-type'].startswith('image/svg') and b'<svg' in svg.content
+
+
+@pytest.fixture
+def api_stub():
+    """A small JSON API on 127.0.0.1 that records what the watcher sends and answers with the next prepared body."""
+    import http.server
+    import threading
+    seen, answers = [], []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _answer(self):
+            length = int(self.headers.get('Content-Length') or 0)
+            seen.append({'method': self.command, 'path': self.path, 'headers': dict(self.headers),
+                         'body': self.rfile.read(length).decode() if length else ''})
+            body = json.dumps(answers.pop(0) if answers else []).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        do_GET = do_POST = do_PUT = do_PATCH = _answer
+
+        def log_message(self, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f'http://127.0.0.1:{server.server_port}', seen, answers
+    server.shutdown()
+
+
+def test_watcher_with_any_request(client, fleet, api_stub):
+    """Watchers send any request: method, a body with {{secret}}, more headers; JSON-RPC errors and level mapping."""
+    url, seen, answers = api_stub
+    body = '{"jsonrpc": "2.0", "method": "problem.get", "params": {"groupids": ["7"]}, "auth": "{{secret}}", "id": 1}'
+    w = {'name': 'Zabbix', 'url': url + '/api_jsonrpc.php', 'method': 'POST', 'body': body, 'content_type': 'application/json-rpc',
+         'headers': 'X-Tenant: brno\nX-Time: {{now}}', 'auth_type': 'template', 'secret': 'to"ken', 'list_path': 'result',
+         'id_field': 'eventid', 'title_template': '{name}', 'level_field': 'severity',
+         'level_map': '5=critical, 4=critical, 3=warning, 2=warning'}
+    answers.append({'jsonrpc': '2.0', 'result': [{'eventid': '11', 'name': 'Disk full', 'severity': '4'},
+                                                 {'eventid': '12', 'name': 'Ping slow', 'severity': '2'},
+                                                 {'eventid': '13', 'name': 'Info', 'severity': '1'}], 'id': 1})
+    r = client.post('/api/notify/watchers/preview', json=w)
+    assert r.status_code == 200, r.text
+    assert [(x['title'], x['level']) for x in r.json()['samples']] == [('Disk full', 'critical'), ('Ping slow', 'warning'), ('Info', 'info')]
+    sent = seen[-1]
+    assert sent['method'] == 'POST' and sent['path'] == '/api_jsonrpc.php'
+    assert sent['headers']['Content-Type'] == 'application/json-rpc' and sent['headers']['X-Tenant'] == 'brno'
+    assert sent['headers']['X-Time'].isdigit() and 'Authorization' not in sent['headers']
+    assert json.loads(sent['body'])['auth'] == 'to"ken'   # JSON-escaped, the body stays valid JSON
+    # an API error inside HTTP 200 is shown as such (Zabbix: wrong token)
+    answers.append({'jsonrpc': '2.0', 'error': {'code': -32602, 'message': 'Invalid params.', 'data': 'Not authorized.'}, 'id': 1})
+    r = client.post('/api/notify/watchers/preview', json=w)
+    assert r.status_code == 400 and 'Invalid params. – Not authorized.' in r.json()['detail']
+    # bearer token (Zabbix 6.4+) and a plain GET keep working as before
+    answers.append([{'id': 1}])
+    assert client.post('/api/notify/watchers/preview', json={'name': 'G', 'url': url + '/items', 'auth_type': 'bearer', 'secret': 'abc'}).status_code == 200
+    assert seen[-1]['method'] == 'GET' and seen[-1]['headers']['Authorization'] == 'Bearer abc' and seen[-1]['body'] == ''
+    # bad input is refused before saving
+    assert client.post('/api/notify/watchers', json={**w, 'method': 'DELETE'}).status_code == 400
+    assert client.post('/api/notify/watchers', json={**w, 'headers': 'no colon here'}).status_code == 400
+    assert client.post('/api/notify/watchers', json={**w, 'level_map': '5=fatal'}).status_code == 400
+    # saved: the request is part of the watcher; a different body starts it again
+    wid = client.post('/api/notify/watchers', json=w).json()['id']
+    saved = next(x for x in client.get('/api/notify/watchers').json() if x['id'] == wid)
+    assert saved['method'] == 'POST' and saved['body'] == body and saved['level_map'].startswith('5=critical') and 'secret' not in saved
+    assert client.put(f'/api/notify/watchers/{wid}', json={'body': body.replace('"7"', '"8"')}).json()['reset'] is True
+    assert client.put(f'/api/notify/watchers/{wid}', json={'title_template': '{name}!'}).json()['reset'] is False
+    # Fleet learns from this endpoint that the node has it
+    opts = fleet.get('/api/fleet/v1/notify/watchers/options').json()
+    assert opts['methods'] == ['GET', 'POST', 'PUT', 'PATCH'] and 'template' in opts['auth'] and 'secret' in opts['placeholders']
+    client.delete(f'/api/notify/watchers/{wid}')
+
+
+def test_reload_command(client, local, fleet):
+    """The page on the screen loaded again: from the admin UI and from Fleet."""
+    cid = client.post('/api/v6/player/control', json={'action': 'reload'}).json()['command_id']
+    assert local.get('/api/v6/player/command').json()['action'] == 'reload'
+    r = fleet.post('/api/fleet/v1/player/reload').json()
+    assert r['ok'] and r['command_id'] == cid + 1
+    assert fleet.post('/api/fleet/v1/control', json={'action': 'reload'}).status_code == 200

@@ -39,7 +39,7 @@ def chromium_args(w,h,rect=None):
  args=place+['--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox',
   # nothing a signage screen needs: background downloads, updates of components, sync, extensions, translation
   '--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','--disable-default-apps','--disable-breakpad',f'--disk-cache-size={32 if LOW_MEMORY else 64}000000']
- features=['Translate','MediaRouter','OptimizationHints','AutofillServerCommunication','CalculateNativeWinOcclusion']
+ features=['Translate','TranslateUI','MediaRouter','OptimizationHints','AutofillServerCommunication','CalculateNativeWinOcclusion']
  if LOW_MEMORY:
   args+=['--enable-low-end-device-mode','--renderer-process-limit=2','--process-per-site']
   features+=['site-per-process','IsolateOrigins','BackForwardCache']
@@ -345,6 +345,9 @@ def run():
      collection_id=int(requested_collection);group=[x for x in items if x.get('parent_id')==collection_id]
      if group:collection_index=0;cur=group[0];show(page,cur);duration=max(5,int(cur.get('duration') or 30));remaining=duration;mode='collection-freeze' if action=='freeze_collection' else 'collection-temporary';fullscreen()
     elif action=='unfreeze':mode='normal';collection_id=None;cur=None;remaining=0
+    elif action=='reload':
+     # the same item again (a page that got stuck, new data); its time on the screen goes on
+     if cur:print('Reloading',cur.get('name'),flush=True);show(page,cur);fullscreen()
     elif action=='next':
      if mode=='collection-freeze' and collection_id:
       group=[x for x in items if x.get('parent_id')==collection_id]

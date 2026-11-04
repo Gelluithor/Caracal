@@ -65,7 +65,7 @@ on the system with the classic installation). Logins of websites are stored encr
 
 ### Control it live
 
-- **Show or freeze** an item or a whole collection, skip to the next item, resume
+- **Show or freeze** an item or a whole collection, skip to the next item, resume, or reload the page on the screen
 - **Progress bar** at the bottom of the screen, a splash screen and a boot screen with the IP address
 - **Restart** the player or the device from the admin UI
 
@@ -73,7 +73,8 @@ on the system with the classic installation). Logins of websites are stored encr
 
 - **On-screen notifications** from Grafana, Alertmanager, Uptime Kuma or your scripts through a token-protected API,
   shown one at a time from a queue, with your own look and sound per level
-- **Watchers** that ask an app's API for new items: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub or any JSON API
+- **Watchers** that ask an app's API for new items: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub, Zabbix (new
+  problems of a host group) or any JSON API, with any method, body and headers (JSON-RPC, GraphQL)
 - Details and examples in [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md)
 
 ### Keep running

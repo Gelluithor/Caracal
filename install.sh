@@ -38,6 +38,8 @@ install -m 644 /opt/caracal/system-config/Xwrapper.config /etc/X11/Xwrapper.conf
 install -m 644 /opt/caracal/system-config/99-vc4.conf /etc/X11/xorg.conf.d/99-vc4.conf
 install -m 755 -o caracal -g caracal /opt/caracal/system-config/xinitrc /home/caracal/.xinitrc
 install -m 644 -o caracal -g caracal /opt/caracal/system-config/openbox-rc.xml /home/caracal/.config/openbox/rc.xml
+# Chromium must not offer to translate the pages on the screen (the "Translate this page?" bubble)
+install -D -m 644 /opt/caracal/system-config/chromium-policy.json /etc/chromium/policies/managed/caracal.json
 
 echo '[6/10] Instaluji systemd služby...'
 for svc in caracal.service caracal-display.service caracal-player.service caracal-overlay.service caracal-boot-info.service; do

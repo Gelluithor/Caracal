@@ -428,12 +428,13 @@ function liveSelectChanged() {
 async function liveCommand(action, extra = {}) {
   await api('/api/v6/player/control', { json: { action, ...extra } });
   const msg = { show: T('Přepínám obrazovku', 'Switching the screen'), freeze: T('Položka zamražena', 'Item frozen'), show_collection: T('Spouštím kolekci', 'Playing the collection'),
-    freeze_collection: T('Kolekce zamražena', 'Collection frozen'), unfreeze: T('Přehrávání pokračuje', 'Playback resumed'), next: T('Další položka', 'Next item') }[action];
+    freeze_collection: T('Kolekce zamražena', 'Collection frozen'), unfreeze: T('Přehrávání pokračuje', 'Playback resumed'), next: T('Další položka', 'Next item'), reload: T('Stránka se načítá znovu', 'Reloading the page') }[action];
   toast(msg || T('Odesláno', 'Sent'));
   setTimeout(pollLive, 300);
 }
 Object.assign(ACT, {
   next: () => liveCommand('next'),
+  reloadPage: () => liveCommand('reload'),
   resume: () => liveCommand('unfreeze'),
   liveShow() { const [t, id] = $('#liveSelect').value.split(':'); return t === 'collection' ? liveCommand('show_collection', { collection_id: Number(id) }) : liveCommand('show', { item_id: Number(id) }); },
   liveFreeze() { const [t, id] = $('#liveSelect').value.split(':'); return t === 'collection' ? liveCommand('freeze_collection', { collection_id: Number(id) }) : liveCommand('freeze', { item_id: Number(id) }); },
@@ -479,7 +480,7 @@ VIEWS.dash = async (root, changed) => {
         <div class="screen" id="nowScreen">${icon('web')}<div class="screen-state"></div><div class="screen-name"></div><div class="screen-sub"></div><div class="prog"><i></i></div></div>
         <div class="now-side">
           <div class="now-count"><b id="nowCount">—</b><span class="muted" id="nowCountLabel"></span></div>
-          <div class="action-group"><button class="btn" id="liveResume" data-do="resume" hidden>${icon('play')}<span>${T('Pokračovat', 'Resume')}</span></button><button class="btn" data-do="next">${icon('next')}<span>${T('Další položka', 'Next item')}</span></button></div>
+          <div class="action-group"><button class="btn" id="liveResume" data-do="resume" hidden>${icon('play')}<span>${T('Pokračovat', 'Resume')}</span></button><button class="btn" data-do="next">${icon('next')}<span>${T('Další položka', 'Next item')}</span></button><button class="btn" data-do="reloadPage" title="${T('Načte položku na obrazovce znovu, její čas běží dál', 'Loads the item on the screen again, its time goes on')}">${icon('refresh')}<span>${T('Obnovit stránku', 'Reload page')}</span></button></div>
           <div class="pick"><span class="pick-label">${T('Zobrazit na obrazovce', 'Show on the screen')}</span>
             <div class="pick-row"><select id="liveSelect"></select><button class="btn primary" id="liveShow" data-do="liveShow"></button><button class="btn" id="liveFreeze" data-do="liveFreeze"></button></div>
             <small class="muted" id="liveHint"></small></div>
@@ -1280,7 +1281,11 @@ Object.assign(ACT, {
 });
 
 // watchers: CARACAL asks another app's API for new items (tickets, issues, e-mails) and announces each new one
-const W_AUTH = [['none', 'Bez přihlášení', 'None'], ['bearer', 'Bearer token', 'Bearer token'], ['basic', 'Jméno a heslo / API klíč (Basic)', 'User and password / API key (Basic)'], ['header', 'Vlastní hlavička', 'Custom header'], ['oauth2', 'OAuth2', 'OAuth2']];
+const W_AUTH = [['none', 'Bez přihlášení', 'None'], ['bearer', 'Bearer token', 'Bearer token'], ['basic', 'Jméno a heslo / API klíč (Basic)', 'User and password / API key (Basic)'], ['header', 'Vlastní hlavička', 'Custom header'], ['oauth2', 'OAuth2', 'OAuth2'], ['template', 'Jen v těle nebo hlavičce ({{secret}})', 'Only in the body or a header ({{secret}})']];
+const W_METHODS = ['GET', 'POST', 'PUT', 'PATCH'].map(m => [m, m, m]);
+// Zabbix JSON-RPC: active problems of a host group, newest first; each problem (eventid) is announced once
+const W_ZABBIX = (auth) => JSON.stringify({ jsonrpc: '2.0', method: 'problem.get', params: { groupids: ['<GROUP-ID>'], output: ['eventid', 'name', 'severity', 'clock', 'opdata'], recent: false, sortfield: ['eventid'], sortorder: 'DESC', limit: 100 }, ...(auth ? { auth: '{{secret}}' } : {}), id: 1 }, null, 2);
+const W_ZABBIX_COMMON = { url: 'https://zabbix.example.com/api_jsonrpc.php', method: 'POST', content_type: 'application/json-rpc', secret_hint: 'API token', list_path: 'result', id_field: 'eventid', title_template: '{name}', message_template: '{opdata}', level_field: 'severity', level_map: '5=critical, 4=critical, 3=warning, 2=warning, 1=info, 0=info' };
 const W_GRANTS = [['client_credentials', 'Client credentials (server–server)', 'Client credentials (server to server)'], ['password', 'Password (technický uživatel)', 'Password (service user)'], ['refresh_token', 'Refresh token', 'Refresh token']];
 const W_CLIENT = [['body', 'V těle požadavku (client_secret_post)', 'In the request body (client_secret_post)'], ['basic', 'Basic hlavička (client_secret_basic)', 'Basic header (client_secret_basic)']];
 const W_PRESETS = {
@@ -1293,9 +1298,12 @@ const W_PRESETS = {
   github: { label: ['GitHub – nové issues', 'GitHub – new issues'], url: 'https://api.github.com/repos/OWNER/REPO/issues?state=open&sort=created&per_page=50', auth_type: 'bearer', secret_hint: 'Personal access token', list_path: '', id_field: 'id', title_template: '#{number}: {title}', message_template: '{user.login}', level_field: '' },
   graph: { label: ['Microsoft 365 – nové e-maily ve schránce (OAuth2)', 'Microsoft 365 – new e-mails in a mailbox (OAuth2)'], url: 'https://graph.microsoft.com/v1.0/users/helpdesk@example.com/mailFolders/inbox/messages?$top=25&$orderby=receivedDateTime%20desc&$select=subject,from,receivedDateTime,importance', auth_type: 'oauth2', oauth_token_url: 'https://login.microsoftonline.com/<TENANT-ID>/oauth2/v2.0/token', oauth_grant: 'client_credentials', oauth_scope: 'https://graph.microsoft.com/.default', oauth_client_auth: 'body', oauth_extra: '', list_path: 'value', id_field: 'id', title_template: '{subject}', message_template: '{from.emailAddress.name}', level_field: '' },
   servicenow: { label: ['ServiceNow – nové incidenty (OAuth2)', 'ServiceNow – new incidents (OAuth2)'], url: 'https://example.service-now.com/api/now/table/incident?sysparm_query=active%3Dtrue%5EORDERBYDESCsys_created_on&sysparm_limit=50&sysparm_fields=sys_id,number,short_description,priority,category', auth_type: 'oauth2', oauth_token_url: 'https://example.service-now.com/oauth_token.do', oauth_grant: 'password', oauth_scope: '', oauth_client_auth: 'body', oauth_extra: '', username_hint: 'service user', list_path: 'result', id_field: 'sys_id', title_template: '{number}: {short_description}', message_template: '{category}', level_field: '' },
+  zabbix: { label: ['Zabbix 6.4 a novější – problémy ve skupině hostitelů', 'Zabbix 6.4 and newer – problems in a host group'], ...W_ZABBIX_COMMON, auth_type: 'bearer', body: W_ZABBIX(false) },
+  zabbix6: { label: ['Zabbix 6.0–7.0 – problémy ve skupině hostitelů (auth v těle)', 'Zabbix 6.0–7.0 – problems in a host group (auth in the body)'], ...W_ZABBIX_COMMON, auth_type: 'template', body: W_ZABBIX(true) },
   oauth: { label: ['Vlastní API s OAuth2', 'Custom API with OAuth2'], url: '', auth_type: 'oauth2', oauth_token_url: 'https://login.example.com/realms/example/protocol/openid-connect/token', oauth_grant: 'client_credentials', oauth_scope: '', oauth_client_auth: 'body', oauth_extra: '', list_path: '', id_field: 'id', title_template: '', message_template: '', level_field: '' },
 };
-const W_FIELDS = ['url', 'auth_type', 'auth_header', 'list_path', 'id_field', 'title_template', 'message_template', 'level_field', 'oauth_token_url', 'oauth_grant', 'oauth_scope', 'oauth_client_auth', 'oauth_extra'];
+const W_FIELDS = ['url', 'auth_type', 'auth_header', 'list_path', 'id_field', 'title_template', 'message_template', 'level_field', 'oauth_token_url', 'oauth_grant', 'oauth_scope', 'oauth_client_auth', 'oauth_extra', 'method', 'body', 'content_type', 'headers', 'level_map'];
+const W_REQUEST_DEFAULTS = { method: 'GET', body: '', content_type: '', headers: '', level_map: '' };   // a preset without them
 function watcherPayload(form, id) {
   const out = Object.fromEntries(new FormData(form).entries());
   delete out.preset;
@@ -1313,10 +1321,10 @@ function watchersTab(body, list) {
         ${w.last_count != null && !w.last_error ? `<span class="tag">${w.last_count} ${T('položek', 'items')}</span>` : ''}${w.last_error ? `<span class="tag bad" title="${esc(w.last_error)}">${T('Chyba', 'Error')}: ${esc(w.last_error.slice(0, 80))}</span>` : ''}</div></div>
       <div class="row-actions"><button class="btn sm" data-do="watcherCheck" data-id="${w.id}">${T('Zkontrolovat', 'Check now')}</button><button class="btn sm" data-do="watcherToggle" data-id="${w.id}" data-on="${w.enabled ? 0 : 1}">${w.enabled ? T('Vypnout', 'Turn off') : T('Zapnout', 'Turn on')}</button>
         <button class="icon-btn" data-do="watcherEdit" data-id="${w.id}" title="${T('Upravit', 'Edit')}">${icon('edit')}</button><button class="icon-btn danger" data-do="watcherDelete" data-id="${w.id}" title="${T('Smazat', 'Delete')}">${icon('trash')}</button></div></li>`).join('')
-      || `<li>${emptyState('eye', T('Zatím žádný hlídač', 'No watcher yet'), T('Přidejte hlídač a vyberte předvolbu: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub, Microsoft 365, ServiceNow nebo vlastní API.', 'Add a watcher and pick a preset: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub, Microsoft 365, ServiceNow or a custom API.'), `<button class="btn primary" data-do="watcherAdd">${icon('plus')}${T('Nový hlídač', 'New watcher')}</button>`)}</li>`}</ul></section>`;
+      || `<li>${emptyState('eye', T('Zatím žádný hlídač', 'No watcher yet'), T('Přidejte hlídač a vyberte předvolbu: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub, Microsoft 365, ServiceNow, Zabbix nebo vlastní API.', 'Add a watcher and pick a preset: Zammad, Jira, Redmine, Freshdesk, GitLab, GitHub, Microsoft 365, ServiceNow, Zabbix or a custom API.'), `<button class="btn primary" data-do="watcherAdd">${icon('plus')}${T('Nový hlídač', 'New watcher')}</button>`)}</li>`}</ul></section>`;
 }
 function watcherDialog(w = null) {
-  const v = { auth_type: 'none', id_field: 'id', level: 'info', interval: 60, oauth_grant: 'client_credentials', oauth_client_auth: 'body', ...(w || {}) };
+  const v = { auth_type: 'none', id_field: 'id', level: 'info', interval: 60, oauth_grant: 'client_credentials', oauth_client_auth: 'body', method: 'GET', ...(w || {}) };
   const keep = w && w.has_credentials ? T('Prázdné = beze změny', 'Empty = unchanged') : '';
   const field = (name, label, attrs = '', cls = '') => `<label ${cls}>${label}<input name="${name}" value="${esc(v[name] || '')}" ${attrs}></label>`;
   modal({
@@ -1324,15 +1332,19 @@ function watcherDialog(w = null) {
     body: `<div class="form">${w ? '' : `<label>${T('Předvolba', 'Preset')}<select name="preset">${Object.entries(W_PRESETS).map(([k, p]) => `<option value="${k}">${esc(T(...p.label))}</option>`).join('')}</select></label>`}
       <div class="row2">${field('name', T('Název (zobrazí se u oznámení)', 'Name (shown on notifications)'), 'required placeholder="Helpdesk"')}
         <label>${T('Přihlášení', 'Authentication')}<select name="auth_type">${opts(W_AUTH, v.auth_type)}</select></label></div>
-      ${field('url', T('URL API (vrací JSON)', 'API URL (returns JSON)'), 'type="url" required placeholder="https://…"')}
+      <div class="row2"><label>${T('Metoda', 'Method')}<select name="method">${opts(W_METHODS, v.method || 'GET')}</select></label>
+        ${field('url', T('URL API (vrací JSON)', 'API URL (returns JSON)'), 'type="url" required placeholder="https://…"')}</div>
+      <div data-method="POST PUT PATCH">${field('content_type', 'Content-Type', 'placeholder="application/json"')}
+        <label>${T('Tělo požadavku', 'Request body')}<textarea name="body" rows="7" spellcheck="false" style="font-family:var(--mono,monospace);font-size:13px" placeholder='{"query": "…"}'>${esc(v.body || '')}</textarea></label></div>
+      <label>${T('Další hlavičky (jedna na řádek)', 'More headers (one per line)')}<textarea name="headers" rows="2" spellcheck="false" style="font-family:var(--mono,monospace);font-size:13px" placeholder="X-Tenant: brno">${esc(v.headers || '')}</textarea></label>
       <div class="row2">${field('auth_header', T('Název hlavičky', 'Header name'), 'placeholder="X-API-Key"', 'data-auth="header"')}
         ${field('oauth_token_url', 'Token URL', 'placeholder="https://login…/oauth2/token"', 'data-auth="oauth2"')}
         <label data-auth="oauth2">${T('Způsob získání tokenu', 'Grant type')}<select name="oauth_grant">${opts(W_GRANTS, v.oauth_grant)}</select></label>
         ${field('oauth_client_id', 'Client ID', 'autocomplete="off"', 'data-auth="oauth2"')}
         <label data-auth="oauth2">Client Secret<input name="client_secret" type="password" autocomplete="new-password" placeholder="${keep}"></label>
         ${field('oauth_scope', 'Scope', `placeholder="${T('nepovinné', 'optional')}"`, 'data-auth="oauth2"')}
-        <label data-auth="basic oauth2" data-grant="password">${T('Uživatel / API klíč', 'User / API key')}<input name="username" autocomplete="off" placeholder="${keep}"></label>
-        <label data-auth="bearer basic header oauth2" data-grant="password">${T('Heslo / token / hodnota hlavičky', 'Password / token / header value')}<input name="secret" type="password" autocomplete="new-password" placeholder="${keep}"></label>
+        <label data-auth="basic oauth2 template" data-grant="password">${T('Uživatel / API klíč', 'User / API key')}<input name="username" autocomplete="off" placeholder="${keep}"></label>
+        <label data-auth="bearer basic header oauth2 template" data-grant="password">${T('Heslo / token / hodnota hlavičky', 'Password / token / header value')}<input name="secret" type="password" autocomplete="new-password" placeholder="${keep}"></label>
         <label data-auth="oauth2" data-grant="refresh_token">Refresh token<input name="refresh_token" type="password" autocomplete="new-password" placeholder="${keep || T('vložte jednou, CARACAL si ho obnovuje sám', 'paste once, CARACAL renews it')}"></label>
         <label data-auth="oauth2">${T('Předání Client Secret', 'Client authentication')}<select name="oauth_client_auth">${opts(W_CLIENT, v.oauth_client_auth)}</select></label>
         ${field('oauth_extra', T('Další parametry tokenu', 'Extra token parameters'), 'placeholder="audience=https://api.example.com"', 'data-auth="oauth2"')}</div>
@@ -1342,20 +1354,24 @@ function watcherDialog(w = null) {
       ${field('message_template', T('Text oznámení', 'Notification text'), 'placeholder="{customer.name} · {group}"')}
       <div class="row3"><label>${T('Úroveň', 'Level')}<select name="level">${opts(LEVELS.map(l => l.slice(0, 3)), v.level)}</select></label>
         ${field('level_field', T('Úroveň podle pole', 'Level from field'), 'placeholder="priority.name"')}
+        ${field('level_map', T('Převod hodnot pole na úrovně', 'Field values to levels'), 'placeholder="5=critical, 3=warning, 1=info"')}
         <label>${T('Kontrolovat každých (s)', 'Check every (s)')}<input name="interval" type="number" min="15" max="86400" value="${v.interval}"></label></div>
       <label class="check"><input type="checkbox" class="switch" name="verify_tls" ${v.verify_tls === 0 ? '' : 'checked'}>${T('Ověřovat HTTPS certifikát', 'Verify the HTTPS certificate')}</label>
       <p class="hint">${T('V nadpisu a textu jde použít pole položky ve složených závorkách, i vnořená: {id}, {subject}, {fields.summary}. První kontrola si jen zapamatuje, co v systému už je; oznámí až položky, které přibudou potom.', 'Title and text can use item fields in braces, nested too: {id}, {subject}, {fields.summary}. The first check only remembers what is already there; only items that appear later are announced.')}</p>
+      <p class="hint">${T('V těle a hlavičkách jde použít {{secret}} (heslo nebo token z přihlášení, uložené šifrovaně), {{username}} a {{now}} (čas v sekundách). U Zabbixu doplňte do těla ID skupiny hostitelů: najdete ho v Data collection → Host groups v adrese skupiny (groupid=…).', 'The body and the headers can use {{secret}} (the password or token from the authentication, stored encrypted), {{username}} and {{now}} (time in seconds). For Zabbix, put the ID of the host group into the body: it is in Data collection → Host groups, in the address of the group (groupid=…).')}</p>
       <div class="form-actions start"><button type="button" class="btn sm" data-do="watcherTry" data-id="${w ? w.id : ''}">${icon('check')}${T('Vyzkoušet', 'Try it')}</button></div><div class="result-box" id="watcherResult"></div></div>`,
     onOpen: form => {
       const sync = () => {
         const type = form.auth_type.value, grant = form.oauth_grant.value;
         $$('[data-auth]', form).forEach(x => { x.hidden = !x.dataset.auth.split(' ').includes(type) || (type === 'oauth2' && x.dataset.grant !== undefined && !x.dataset.grant.split(' ').includes(grant)); });
+        $$('[data-method]', form).forEach(x => { x.hidden = !x.dataset.method.split(' ').includes(form.method.value) && !form.body.value.trim(); });
       };
-      form.auth_type.onchange = form.oauth_grant.onchange = sync;
+      form.auth_type.onchange = form.oauth_grant.onchange = form.method.onchange = sync;
       if (form.preset) form.preset.onchange = () => {
         const p = W_PRESETS[form.preset.value];
         if (!p || form.preset.value === 'custom') return;
-        for (const k of W_FIELDS) if (p[k] !== undefined && form[k]) form[k].value = p[k];
+        const preset = { ...W_REQUEST_DEFAULTS, ...p };
+        for (const k of W_FIELDS) if (preset[k] !== undefined && form[k]) form[k].value = preset[k];
         if (!form.name.value) form.name.value = T(...p.label).split(' – ')[0];
         form.username.placeholder = p.username_hint || '';
         form.secret.placeholder = p.secret_hint || '';

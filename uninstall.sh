@@ -5,7 +5,7 @@ PURGE=0
 case "${1:-}" in '') ;; --purge) PURGE=1 ;; *) echo 'Použití: sudo bash uninstall.sh [--purge]'; exit 2;; esac
 systemctl disable --now caracal-boot-info.service caracal-overlay.service caracal-player.service caracal-display.service caracal.service 2>/dev/null || true
 pkill -u caracal -f '/usr/bin/chromium' 2>/dev/null || true
-rm -f /etc/systemd/system/caracal-boot-info.service /etc/systemd/system/caracal-overlay.service /etc/systemd/system/caracal-player.service /etc/systemd/system/caracal-display.service /etc/systemd/system/caracal.service /etc/sudoers.d/caracal
+rm -f /etc/systemd/system/caracal-boot-info.service /etc/systemd/system/caracal-overlay.service /etc/systemd/system/caracal-player.service /etc/systemd/system/caracal-display.service /etc/systemd/system/caracal.service /etc/sudoers.d/caracal /etc/chromium/policies/managed/caracal.json
 rm -rf /opt/caracal
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true

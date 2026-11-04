@@ -135,28 +135,35 @@ compose file too. A TV usually plays HDMI audio only when it is not muted and HD
 
 ## Watchers
 
-A watcher calls a JSON API (GET) at a fixed interval (15 s to 24 h, 60 s by default), finds the list of items in
+A watcher calls a JSON API at a fixed interval (15 s to 24 h, 60 s by default), finds the list of items in
 the response and remembers their IDs. Every item with an ID it has not seen before becomes a notification. The first
 check only remembers what is already there, so existing tickets are not announced. More than 5 new items in one check
 become a single notification, e.g. after the app was unreachable. Watcher notifications go through the same queue and
 limits as any other.
 
 Set them up under **Notifications → Watchers**. Presets fill in the fields for **Zammad, Jira, Redmine, Freshdesk,
-GitLab and GitHub**: replace the server address, the project and the filter, and enter the API key. **Try it** shows
+GitLab, GitHub and Zabbix**: replace the server address, the project and the filter, and enter the API key. **Try it** shows
 how many items were found and how the first notifications would look, without saving or sending anything. When it
 fails, it shows the HTTP error, or the keys found in the response so that the right path can be picked.
 
 | Field | Meaning |
 |---|---|
-| API URL | GET address returning JSON, ideally only open or new items, newest first |
-| Authentication | none, `Bearer` token, Basic (user + password or API key), a custom header (`X-API-Key: …`) or OAuth2 |
+| Method, API URL | `GET`, `POST`, `PUT` or `PATCH` to an address returning JSON, ideally only open or new items, newest first |
+| Content-Type, request body | sent with any method when the body is filled in (`application/json` by default), e.g. a JSON-RPC or GraphQL query |
+| More headers | `Name: value`, one per line |
+| Authentication | none, `Bearer` token, Basic (user + password or API key), a custom header (`X-API-Key: …`), OAuth2, or only where the body or a header says `{{secret}}` |
 | Path to the list | where the list is in the response, e.g. `issues`, `data.tickets`; empty when the response is the list |
 | Item ID field | `id` by default; nested paths work (`ticket.id`) |
 | Title, text | templates with item fields in braces: `New ticket #{id}: {subject}`, `{fields.reporter.displayName}` |
 | Level | fixed level, or a field whose value sets it (`priority.name`: Urgent/High → critical, Major → warning) |
+| Field values to levels | your own mapping of that field, e.g. `5=critical, 4=critical, 3=warning, 2=warning, 1=info` |
+
+The body and the headers can use `{{secret}}` and `{{username}}` (the stored credentials, inserted only when the
+request is sent; in a JSON body they are escaped, so quotes in a password do not break it) and `{{now}}` (Unix time).
+APIs that answer HTTP 200 with `{"error": …}` (JSON-RPC, GraphQL) show that error on the watcher.
 
 Credentials are encrypted with the node's vault key (the same as login profiles) and are never returned by the API.
-Leaving them empty when editing keeps the stored ones. Changing the URL, the list path or the ID field starts the watcher
+Leaving them empty when editing keeps the stored ones. Changing the URL, the method, the body, the list path or the ID field starts the watcher
 again without announcing the existing items.
 
 ### OAuth2
@@ -186,6 +193,29 @@ in the local network and most providers accept only HTTPS redirect addresses.
 
 Presets with OAuth2: **Microsoft 365** (new e-mails in a shared mailbox through Microsoft Graph; the app registration
 needs the `Mail.Read` application permission) and **ServiceNow** (new incidents, password grant).
+
+### Zabbix (6.0 and newer)
+
+The Zabbix presets watch the **active problems of a host group** through the JSON-RPC API (`problem.get`) and announce
+every new problem once, with its severity as the level. Put the ID of the host group into the body instead of
+`<GROUP-ID>` (Zabbix: *Data collection → Host groups*, the `groupid=` in the address of the group; several IDs work
+too) and create an API token (*Users → API tokens*) for a user that can read the group.
+
+| Zabbix | Preset | Token |
+|---|---|---|
+| 6.4, 7.0 and newer | *Zabbix 6.4 and newer* | `Authorization: Bearer` (the authentication *Bearer token*) |
+| 6.0 to 7.0 | *Zabbix 6.0–7.0 (auth in the body)* | `"auth": "{{secret}}"` in the body (7.2 removed this) |
+
+```json
+{"jsonrpc": "2.0", "method": "problem.get",
+ "params": {"groupids": ["<GROUP-ID>"], "output": ["eventid", "name", "severity", "clock", "opdata"],
+            "recent": false, "sortfield": ["eventid"], "sortorder": "DESC", "limit": 100},
+ "id": 1}
+```
+
+Address `https://zabbix.example.com/api_jsonrpc.php`, method `POST`, Content-Type `application/json-rpc`, list
+`result`, ID `eventid`, title `{name}`, level from `severity` with `5=critical, 4=critical, 3=warning, 2=warning,
+1=info, 0=info`. More filters go into `params` the same way, e.g. `"severities": [3, 4, 5]` or `"hostids": [...]`.
 
 API (administrator session): `GET/POST /api/notify/watchers`, `PUT/DELETE /api/notify/watchers/{id}`,
 `POST /api/notify/watchers/{id}/check` (check now), `POST /api/notify/watchers/preview` (try a configuration).

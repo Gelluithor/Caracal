@@ -24,6 +24,8 @@ RUN python3 -m venv /opt/caracal/.venv \
 
 COPY app app
 COPY player player
+# Chromium must not offer to translate the pages on the screen (the "Translate this page?" bubble)
+COPY system-config/chromium-policy.json /etc/chromium/policies/managed/caracal.json
 COPY docker/entrypoint-player.sh docker/entrypoint-overlay.sh /usr/local/bin/
 COPY VERSION .
 RUN chmod 755 /usr/local/bin/entrypoint-*.sh player/*.sh player/*.py
