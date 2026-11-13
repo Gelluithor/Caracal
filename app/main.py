@@ -104,7 +104,7 @@ def rows(q, a=()):
 
 
 # every column of the playlist items except the encrypted credentials of cameras
-_ASSETS_QUERY = 'SELECT id,name,kind,source,duration,position,auth_profile_id,scale,dark,valid_from,valid_until FROM assets ORDER BY position,id'
+_ASSETS_QUERY = 'SELECT id,name,kind,source,duration,position,auth_profile_id,scale,dark,valid_from,valid_until,scroll_x,scroll_y FROM assets ORDER BY position,id'
 
 
 def _columns(c, table):
@@ -131,7 +131,8 @@ CREATE TABLE IF NOT EXISTS plays(id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id 
         c.execute('ALTER TABLE assets ADD COLUMN dark TEXT')
     if 'secret_enc' not in _columns(c, 'assets'):    # encrypted credentials of a camera's streams
         c.execute('ALTER TABLE assets ADD COLUMN secret_enc BLOB')
-    for col in ('valid_from', 'valid_until'):         # an item shown only from / until a time (Unix time)
+    # an item shown only from / until a time (Unix time); where a website starts, scrolled down (CSS px)
+    for col in ('valid_from', 'valid_until', 'scroll_x', 'scroll_y'):
         if col not in _columns(c, 'assets'):
             c.execute(f'ALTER TABLE assets ADD COLUMN {col} REAL')
     # login profiles: 'form' fills in the page's log-in form, 'http' answers the browser's HTTP Basic/Digest pop-up
@@ -397,6 +398,115 @@ async def save_scale(asset_id: int, request: Request, u=Depends(auth)):
     return {'ok': True, 'asset_id': asset_id, 'scale': scale}
 
 
+def _scroll_value(value):
+    try:
+        v = round(float(value or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, 'Posun musí být číslo')
+    if not 0 <= v <= 200000:
+        raise HTTPException(400, 'Posun musí být 0 až 200 000 px')
+    return v
+
+
+def _save_scroll(asset_id, d):
+    """Where a website starts: {x, y} in CSS pixels of the page (0 = the top); a cell of a multi view by its index."""
+    a = rows('SELECT kind, source FROM assets WHERE id=?', (asset_id,))
+    if not a:
+        raise HTTPException(404, 'Položka nebyla nalezena')
+    x, y = _scroll_value(d.get('x')), _scroll_value(d.get('y'))
+    c = con()
+    if a[0]['kind'] in ('web', 'grafana-tag'):
+        c.execute('UPDATE assets SET scroll_x=?, scroll_y=? WHERE id=?', (x or None, y or None, asset_id))
+    elif a[0]['kind'] == 'multi':
+        multi = json.loads(a[0]['source'] or '{}')
+        try:
+            cell = multi['cells'][int(d.get('cell'))]
+        except (KeyError, IndexError, TypeError, ValueError):
+            c.close()
+            raise HTTPException(400, 'Vyber pole obrazovky')
+        cell['scroll_x'], cell['scroll_y'] = x, y
+        c.execute('UPDATE assets SET source=? WHERE id=?', (json.dumps(multi, ensure_ascii=False), asset_id))
+    else:
+        c.close()
+        raise HTTPException(400, 'Posun jde nastavit jen u webu, Grafana kolekce nebo více věcí na obrazovce')
+    c.commit()
+    c.close()
+    return {'ok': True, 'asset_id': asset_id, 'x': x, 'y': y}
+
+
+@app.put('/api/assets/{asset_id}/scroll')
+async def save_scroll(asset_id: int, request: Request, u=Depends(auth)):
+    return _save_scroll(asset_id, await request.json())
+
+
+# Several things on one screen: 2 to 4 websites or widgets side by side, each in a window of its own on the TV
+# (they share the browser profile, so logins work). source = {"layout", "cells": [{source, auth_profile_id, scale,
+# dark, scroll_x, scroll_y}]}; a widget cell is "caracal-widget:<query of /widgets>".
+MULTI_LAYOUTS = {'2': 2, '2v': 2, '3': 3, '1+2': 3, '2x2': 4}
+WIDGET_PREFIX = 'caracal-widget:'
+
+
+def _multi_value(d):
+    layout = str(d.get('layout') or '2x2')
+    if layout not in MULTI_LAYOUTS:
+        raise HTTPException(400, 'Neznámé rozvržení obrazovky')
+    cells = d.get('cells')
+    if not isinstance(cells, list) or len(cells) != MULTI_LAYOUTS[layout]:
+        raise HTTPException(400, f'Rozvržení potřebuje {MULTI_LAYOUTS[layout]} polí')
+    out = []
+    for i, cell in enumerate(cells, 1):
+        cell = cell if isinstance(cell, dict) else {}
+        source = str(cell.get('source') or '').strip()[:4000]
+        widget = source.startswith(WIDGET_PREFIX)
+        if not widget and not source.startswith(('http://', 'https://')):
+            raise HTTPException(400, f'Pole {i}: zadej adresu webu (http:// nebo https://) nebo vyber widget')
+        out.append({'source': source, 'auth_profile_id': None if widget else _profile_ref(cell.get('auth_profile_id')),
+                    'scale': _scale(cell.get('scale', 1)), 'dark': None if widget else _dark_value(cell.get('dark')),
+                    'scroll_x': _scroll_value(cell.get('scroll_x')), 'scroll_y': _scroll_value(cell.get('scroll_y'))})
+    return {'layout': layout, 'cells': out}
+
+
+def _add_multi(d):
+    name = str(d.get('name', '')).strip()[:200]
+    if not name:
+        raise HTTPException(400, 'Vyplň název')
+    multi, duration = _multi_value(d), _duration(d.get('duration'), 30)
+    c = con()
+    asset_id = c.execute('INSERT INTO assets(name,kind,source,duration,position) VALUES(?,?,?,?,?)',
+                         (name, 'multi', json.dumps(multi, ensure_ascii=False), duration, _next_position(c))).lastrowid
+    _set_validity(c, asset_id, d)
+    c.commit()
+    c.close()
+    return {'ok': True, 'id': asset_id}
+
+
+def _update_multi(asset_id, d):
+    current = rows("SELECT * FROM assets WHERE id=? AND kind='multi'", (asset_id,))
+    if not current:
+        raise HTTPException(404, 'Položka nebyla nalezena')
+    old = json.loads(current[0]['source'] or '{}')
+    multi = _multi_value({'layout': d.get('layout', old.get('layout')), 'cells': d.get('cells', old.get('cells'))})
+    name = str(d.get('name', current[0]['name'])).strip()[:200] or current[0]['name']
+    c = con()
+    c.execute('UPDATE assets SET name=?, source=?, duration=? WHERE id=?',
+              (name, json.dumps(multi, ensure_ascii=False), _duration(d.get('duration', current[0]['duration']), 30), asset_id))
+    if 'valid_from' in d or 'valid_until' in d:
+        _set_validity(c, asset_id, d)
+    c.commit()
+    c.close()
+    return {'ok': True, 'id': asset_id}
+
+
+@app.post('/api/assets/multi')
+async def add_multi(request: Request, u=Depends(auth)):
+    return _add_multi(await request.json())
+
+
+@app.put('/api/assets/multi/{asset_id}')
+async def update_multi(asset_id: int, request: Request, u=Depends(auth)):
+    return _update_multi(asset_id, await request.json())
+
+
 @app.delete('/api/assets/{i}')
 def delete(i: int, u=Depends(auth)):
     r = rows('SELECT source FROM assets WHERE id=?', (i,))
@@ -584,6 +694,14 @@ def expanded_player_playlist():
         if asset.get('kind') != 'grafana-tag':
             if asset.get('kind') == 'web':
                 asset['dark'] = _dark_of(asset, web_dark)
+            elif asset.get('kind') == 'multi':
+                try:
+                    multi = json.loads(asset.get('source') or '{}')
+                except ValueError:
+                    continue
+                for cell in multi.get('cells') or []:
+                    cell['dark'] = _dark_of(cell, web_dark) if not str(cell.get('source', '')).startswith(WIDGET_PREFIX) else 'off'
+                asset.update(layout=multi.get('layout'), cells=multi.get('cells') or [])
             output.append(asset)
             continue
         dark = _dark_of(asset, web_dark)
@@ -597,7 +715,8 @@ def expanded_player_playlist():
                 output.append({'id': int(asset['id']) * 100000 + index, 'parent_id': asset['id'],
                                'name': asset['name'] + ' · ' + dashboard['title'], 'kind': 'web', 'source': url,
                                'duration': asset['duration'], 'position': asset['position'], 'auth_profile_id': None,
-                               'scale': asset.get('scale') or 1.0, 'dark': 'dark' if dark == 'force' else dark})
+                               'scale': asset.get('scale') or 1.0, 'dark': 'dark' if dark == 'force' else dark,
+                               'scroll_x': asset.get('scroll_x'), 'scroll_y': asset.get('scroll_y')})
         except Exception as error:
             print('Grafana collection error', asset.get('id'), error, flush=True)
     return output
@@ -733,7 +852,8 @@ async def player_heartbeat(req: Request):
     state = _cc2_read()
     now = time.time()
     _record_play(state, d, now)
-    for k in ('current_id', 'current_name', 'frozen', 'remaining', 'duration'):
+    # scroll: where the page (or each cell of a multi view) is scrolled now, reported while it is being set
+    for k in ('current_id', 'current_name', 'frozen', 'remaining', 'duration', 'scroll'):
         if k in d:
             state[k] = d[k]
     state['updated'] = now
@@ -762,11 +882,21 @@ def live_options(u=Depends(auth)):
     return options
 
 
-def _player_command(action, item_id=None, collection_id=None):
+def _player_command(action, item_id=None, collection_id=None, extra=None):
     """Validate a live control command and hand it to the player (used by the admin UI and by Fleet)."""
     # reload: the item on the screen is loaded again (sign-in, zoom); the countdown and a freeze stay as they are
-    if action not in ('show', 'freeze', 'show_collection', 'freeze_collection', 'unfreeze', 'next', 'reload'):
+    # scroll / scroll_to: the page on the screen moves by dy or to y (CSS px), a cell of a multi view by its index
+    if action not in ('show', 'freeze', 'show_collection', 'freeze_collection', 'unfreeze', 'next', 'reload', 'scroll', 'scroll_to'):
         raise HTTPException(400, 'Neznámá akce')
+    if action in ('scroll', 'scroll_to'):
+        extra = extra or {}
+        try:
+            extra = {'dy': max(-20000, min(20000, round(float(extra.get('dy') or 0)))), 'y': _scroll_value(extra.get('y')),
+                     'x': _scroll_value(extra.get('x')), 'cell': max(0, min(3, int(extra.get('cell') or 0)))}
+        except (TypeError, ValueError):
+            raise HTTPException(400, 'Neplatný posun')
+    else:
+        extra = None
     if action in ('show', 'freeze', 'show_collection', 'freeze_collection'):
         expanded = expanded_player_playlist()
         if action in ('show', 'freeze'):
@@ -788,7 +918,7 @@ def _player_command(action, item_id=None, collection_id=None):
     # 'updated' is the player's liveness timestamp, so it is not touched here
     state = _cc2_read()
     state['v6_command_id'] = int(state.get('v6_command_id', 0)) + 1
-    state.update(v6_action=action, v6_item_id=item_id, v6_collection_id=collection_id)
+    state.update(v6_action=action, v6_item_id=item_id, v6_collection_id=collection_id, v6_extra=extra)
     _cc2_write(state)
     return state['v6_command_id']
 
@@ -796,7 +926,7 @@ def _player_command(action, item_id=None, collection_id=None):
 @app.post('/api/v6/player/control')
 async def player_control(req: Request, u=Depends(auth)):
     d = await req.json()
-    return {'ok': True, 'command_id': _player_command(str(d.get('action', '')), d.get('item_id'), d.get('collection_id'))}
+    return {'ok': True, 'command_id': _player_command(str(d.get('action', '')), d.get('item_id'), d.get('collection_id'), d)}
 
 
 @app.get('/api/v6/player/command')
@@ -805,7 +935,7 @@ def player_command(req: Request):
     _takeover()   # an emergency message whose time is up ends here (the player asks every second)
     s = _cc2_read()
     return {'command_id': s.get('v6_command_id', 0), 'action': s.get('v6_action', ''), 'item_id': s.get('v6_item_id'),
-            'collection_id': s.get('v6_collection_id'), 'restart_id': s.get('restart_player_request', 0)}
+            'collection_id': s.get('v6_collection_id'), 'extra': s.get('v6_extra'), 'restart_id': s.get('restart_player_request', 0)}
 
 
 @app.post('/api/v3/player/restart')
@@ -931,7 +1061,7 @@ def _fleet_collections():
 @app.get('/api/fleet/v1/snapshot')
 def fleet_snapshot(req:Request):
  _fleet_auth(req);state=_cc2_read();state['player_online']=(time.time()-float(state.get('updated') or 0))<8
- player={k:state.get(k) for k in ('current_id','current_name','frozen','collection_frozen','collection_id','remaining','duration','updated','player_online')}
+ player={k:state.get(k) for k in ('current_id','current_name','frozen','collection_frozen','collection_id','remaining','duration','updated','player_online','scroll')}
  requests={'reboot':int(state.get('reboot_request',0)),'restart_player':int(state.get('restart_player_request',0))}
  return {'api_version':2,'runtime':RUNTIME,'version':_caracal_version(),'requests':requests,'assets':rows(_ASSETS_QUERY),'profiles':rows(_FLEET_PROFILE_COLUMNS+' ORDER BY name COLLATE NOCASE,id'),'player':player,'notifications':_fleet_notifications(),
   'admin':_fleet_admin_state(),'overlay':{'enabled':bool(state.get('overlay_enabled',True)),'size':int(state.get('overlay_size',16))},
@@ -941,6 +1071,7 @@ def fleet_snapshot(req:Request):
 @app.post('/api/fleet/v1/control')
 async def fleet_control(req:Request):
  _fleet_auth(req);d=await req.json();action=str(d.get('action',''));item_id=d.get('item_id');collection_id=d.get('collection_id')
+ if action in ('scroll','scroll_to'):return {'ok':True,'command_id':_player_command(action,extra=d)}
  if action not in ('show','freeze','show_collection','freeze_collection','unfreeze','next','reload'):raise HTTPException(400,'Unknown action')
  if action in ('show','freeze','show_collection','freeze_collection'):
   expanded=expanded_player_playlist()
@@ -959,6 +1090,17 @@ async def fleet_control(req:Request):
 
 # CARACAL 2026.11.04: the page on the screen loaded again, and watchers with any request (method, body, headers); the
 # agent learns from these two endpoints that the node has them
+# CARACAL 2026.11.13: where a website starts (scrolled down) and several things on one screen
+@app.put('/api/fleet/v1/assets/{asset_id}/scroll')
+async def fleet_asset_scroll(asset_id:int,req:Request):
+ _fleet_auth(req);return _save_scroll(asset_id,await _fleet_json(req))
+@app.post('/api/fleet/v1/assets/multi')
+async def fleet_add_multi(req:Request):
+ _fleet_auth(req);return _add_multi(await _fleet_json(req))
+@app.put('/api/fleet/v1/assets/multi/{asset_id}')
+async def fleet_update_multi(asset_id:int,req:Request):
+ _fleet_auth(req);return _update_multi(asset_id,await _fleet_json(req))
+
 @app.post('/api/fleet/v1/player/reload')
 def fleet_player_reload(req:Request):
  _fleet_auth(req);return {'ok':True,'command_id':_player_command('reload')}

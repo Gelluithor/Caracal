@@ -67,6 +67,12 @@ const ICONS = {
   list: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
   shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z',
   screen: 'M4 5h16v11H4zM8 20h8M12 16v4',
+  grid: 'M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8h-8z',
+  widget: 'M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z',
+  up: 'M12 19V5M5 12l7-7 7 7',
+  down: 'M12 5v14M19 12l-7 7-7-7',
+  top: 'M5 4h14M12 20V8M6 14l6-6 6 6',
+  start: 'M4 4h16M4 9h16M8 14h8M12 14v7',
 };
 const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[n] || ICONS.web}"/></svg>`;
 
@@ -199,10 +205,10 @@ function buildChrome() {
   $('#menuBtn').innerHTML = icon('menu');
   $('#menuBtn').setAttribute('aria-label', T('Menu', 'Menu'));
   $('#topActions').innerHTML = `<span class="live-dot ${S.ok ? 'ok' : 'bad'}" id="liveDot" title="${S.ok ? T('Zařízení odpovídá', 'The device answers') : T('Zařízení neodpovídá', 'The device does not answer')}"></span>
-    <button class="icon-btn" data-do="refresh" title="${T('Obnovit', 'Refresh')}">${icon('refresh')}</button>
-    <button class="btn" data-do="restartPlayer">${icon('restart')}<span>${T('Restart přehrávače', 'Restart player')}</span></button>
-    <div class="menu"><button class="icon-btn" data-do="menu" aria-haspopup="menu" title="${T('Další', 'More')}">${icon('more')}</button>
+    <button class="icon-btn" data-do="refresh" title="${T('Obnovit', 'Refresh')}" aria-label="${T('Obnovit', 'Refresh')}">${icon('refresh')}</button>
+    <div class="menu"><button class="icon-btn bordered" data-do="menu" aria-haspopup="menu" title="${T('Další', 'More')}" aria-label="${T('Další', 'More')}">${icon('more')}</button>
       <div class="menu-pop" role="menu" hidden>
+        <button class="mi" data-do="restartPlayer">${icon('restart')}${T('Restart přehrávače', 'Restart player')}</button>
         <button class="mi" data-do="help">${icon('help')}${T('Nápověda', 'Help')}</button>
         <button class="mi" data-do="logout">${icon('logout')}${T('Odhlásit', 'Sign out')}</button><hr>
         <button class="mi danger" data-do="reboot">${icon('power')}${T('Restartovat zařízení', 'Restart the device')}</button>
@@ -299,7 +305,14 @@ async function loadPlayer() {
 
 const ACT = {
   refresh() { loadSystem().catch(() => {}); render(true); },
-  menu(b) { const pop = b.nextElementSibling; const open = pop.hidden; closeMenus(); pop.hidden = !open; },
+  menu(b) {
+    const pop = b._pop || b.nextElementSibling, open = pop.hidden;
+    b._pop = pop;
+    closeMenus();
+    pop.hidden = !open;
+    // an open menu lives in <body>: a card that clips its overflow (or animates) cannot cut it
+    if (open) { pop._home = b.parentNode; document.body.append(pop); placeMenu(b, pop); }
+  },
   async restartPlayer() {
     try { await api('/api/v3/player/restart', { method: 'POST' }); toast(T('Přehrávač se restartuje', 'The player restarts')); } catch (e) { fail(e); }
   },
@@ -321,10 +334,21 @@ const ACT = {
     }).finally(() => toast(T('Zkopírováno', 'Copied')));
   },
 };
-function closeMenus() { $$('.menu-pop').forEach(p => { p.hidden = true; }); }
+function closeMenus() { $$('.menu-pop').forEach(p => { p.hidden = true; if (p._home && p.parentNode !== p._home) p._home.append(p); }); }
+// a menu opens next to its button and stays on the screen (above the button near the bottom); fixed, so a list
+// that clips its overflow does not cut it
+function placeMenu(btn, pop) {
+  const r = btn.getBoundingClientRect();
+  Object.assign(pop.style, { position: 'fixed', right: 'auto', left: '0px', top: '0px' });
+  const w = pop.offsetWidth, h = pop.offsetHeight;
+  const left = Math.max(8, Math.min(r.right - w, innerWidth - w - 8));
+  const top = r.bottom + 6 + h > innerHeight - 8 ? Math.max(8, r.top - h - 6) : r.bottom + 6;
+  Object.assign(pop.style, { left: left + 'px', top: top + 'px' });
+}
+addEventListener('scroll', closeMenus, true);
 document.addEventListener('click', async e => {
   const b = e.target.closest('[data-do]');
-  if (!e.target.closest('.menu')) closeMenus();
+  if (!e.target.closest('.menu') || (b && b.classList.contains('mi'))) closeMenus();   // a chosen item closes its menu
   if (b && ACT[b.dataset.do] && !b.disabled) {
     e.preventDefault();
     try { await ACT[b.dataset.do](b, e); } catch (err) { fail(err); }
@@ -371,8 +395,8 @@ function kindOf(id) {
   if (a) return a.kind;
   return Number(id) >= 100000 ? 'grafana-tag' : 'web';
 }
-const kindIcon = k => icon(k === 'grafana-tag' ? 'grafana' : k === 'image' ? 'image' : k === 'video' ? 'video' : k === 'camera' ? 'camera' : 'web');
-const kindLabel = k => ({ web: T('Webová stránka', 'Web page'), image: T('Obrázek', 'Picture'), video: 'Video', camera: T('Kamera', 'Camera'), 'grafana-tag': T('Kolekce Grafany', 'Grafana collection') }[k] || k);
+const kindIcon = k => icon(k === 'grafana-tag' ? 'grafana' : k === 'image' ? 'image' : k === 'video' ? 'video' : k === 'camera' ? 'camera' : k === 'multi' ? 'grid' : 'web');
+const kindLabel = k => ({ web: T('Webová stránka', 'Web page'), image: T('Obrázek', 'Picture'), video: 'Video', camera: T('Kamera', 'Camera'), 'grafana-tag': T('Kolekce Grafany', 'Grafana collection'), multi: T('Více na obrazovce', 'Several on the screen') }[k] || k);
 
 function liveSelectHtml() {
   let html = '', open = false;
@@ -584,6 +608,10 @@ const hostOf = u => { try { return new URL(u).host; } catch (e) { return u; } };
 function sourceText(a) {
   if (a.kind === 'grafana-tag') { const c = grafanaCfg(a); return `${T('tag', 'tag')} ${c.tag || '?'} · ${hostOf(c.grafana_url || '')}`; }
   if (a.kind === 'web') return a.source;
+  if (a.kind === 'multi') {
+    const m = multiCfg(a);
+    return `${layoutName(m.layout)} · ${m.cells.map(c => isWidget(c.source) ? widgetName(c.source) : hostOf(c.source)).join(', ')}`;
+  }
   if (a.kind === 'camera') {
     let c = {};
     try { c = JSON.parse(a.source || '{}'); } catch { /* ignore */ }
@@ -622,13 +650,19 @@ function plRow(a, i) {
     <span class="idx">${i + 1}</span><span class="kind k-${k}">${kindIcon(a.kind)}</span>
     <div class="pl-main"><b>${esc(a.name)}</b><small>${esc(sourceText(a))}</small>
       <div class="row-tags">${validityTag(a)}${scalable ? `<button class="tag" data-do="toggleScale" data-id="${a.id}" title="${T('Velikost obsahu', 'Content size')}">${pct(a.scale)} %</button>` : ''}
+        ${scrollTag(a)}
         ${scalable && a.dark ? `<span class="tag" title="${T('Tmavý režim', 'Dark mode')}">${icon('moon')}${(DARK_MODES().find(([m]) => m === a.dark) || [])[1] || ''}</span>` : ''}
         ${a.auth_profile_id ? `<span class="tag accent">${icon('lock')}${esc(prof ? prof.name : T('Přihlášení', 'Login'))}</span>` : ''}
         ${a.kind === 'grafana-tag' ? `<button class="expand ${open ? 'open' : ''}" data-do="toggleDash" data-id="${a.id}">${icon('chev')}${dashes.length} ${T('dashboardů', 'dashboards')}</button>` : ''}</div></div>
     <span class="pl-dur">${a.duration} s</span>
-    <span class="pl-actions">${a.kind !== 'grafana-tag' ? `<button class="icon-btn" data-do="showItem" data-id="${a.id}" title="${T('Zobrazit teď', 'Show now')}">${icon('play')}</button><button class="icon-btn" data-do="freezeItem" data-id="${a.id}" title="${T('Zamrazit', 'Freeze')}">${icon('snow')}</button>` : ''}
-      <button class="icon-btn" data-do="editItem" data-id="${a.id}" title="${T('Upravit', 'Edit')}">${icon('edit')}</button>
-      <button class="icon-btn danger" data-do="deleteItem" data-id="${a.id}" title="${T('Smazat', 'Delete')}">${icon('trash')}</button></span></li>`;
+    <span class="pl-actions">${a.kind !== 'grafana-tag' ? `<button class="icon-btn" data-do="showItem" data-id="${a.id}" title="${T('Zobrazit teď', 'Show now')}" aria-label="${T('Zobrazit teď', 'Show now')}">${icon('play')}</button>` : ''}
+      <button class="icon-btn" data-do="editItem" data-id="${a.id}" title="${T('Upravit', 'Edit')}" aria-label="${T('Upravit', 'Edit')}">${icon('edit')}</button>
+      <span class="menu"><button class="icon-btn" data-do="menu" aria-haspopup="menu" title="${T('Další akce', 'More actions')}" aria-label="${T('Další akce', 'More actions')}">${icon('more')}</button>
+        <span class="menu-pop" role="menu" hidden>
+          ${a.kind !== 'grafana-tag' ? `<button class="mi" data-do="freezeItem" data-id="${a.id}">${icon('snow')}${T('Zamrazit na obrazovce', 'Freeze on the screen')}</button>` : ''}
+          ${scalable ? `<button class="mi" data-do="toggleScale" data-id="${a.id}">${icon('search')}${T('Velikost obsahu', 'Content size')}</button>` : ''}
+          ${a.kind === 'web' || a.kind === 'grafana-tag' || a.kind === 'multi' ? `<button class="mi" data-do="pickScroll" data-id="${a.id}">${icon('start')}${T('Začátek stránky…', 'Where the page starts…')}</button>` : ''}
+          <hr><button class="mi danger" data-do="deleteItem" data-id="${a.id}">${icon('trash')}${T('Smazat', 'Delete')}</button></span></span></span></li>`;
   if (scalable && scaleOpen) {
     html += `<li class="pl-sub" data-for="${a.id}"><div class="slider-row"><span>${T('Velikost obsahu', 'Content size')}</span><input type="range" min="50" max="300" step="5" value="${pct(a.scale)}" data-scale-range="${a.id}"><input type="number" min="50" max="300" step="5" value="${pct(a.scale)}" data-scale-num="${a.id}"></div>
       <div class="presets">${[75, 100, 125, 150].map(v => `<button class="btn sm" data-do="scalePreset" data-id="${a.id}" data-v="${v}">${v} %</button>`).join('')}<button class="btn sm primary" data-do="saveScale" data-id="${a.id}">${T('Uložit velikost', 'Save size')}</button></div></li>`;
@@ -650,7 +684,11 @@ function drawPlaylist() {
   const list = $('#plList');
   if (!list) return;
   $('#plCount').textContent = S.assets.length;
-  list.innerHTML = S.assets.map(plRow).join('') || `<li>${emptyState('playlist', T('Playlist je prázdný', 'The playlist is empty'), T('Přidejte webovou stránku, obrázek, video nebo všechny dashboardy Grafany s jedním tagem.', 'Add a web page, a picture, a video or all Grafana dashboards with one tag.'),
+  const html = S.assets.map(plRow).join('');
+  // the view refreshes every few seconds: the list is drawn again only when it changed, never under an open menu
+  if ((html && list.dataset.html === html) || $('body > .menu-pop:not([hidden])')) return markPlaying();
+  list.dataset.html = html;
+  list.innerHTML = html || `<li>${emptyState('playlist', T('Playlist je prázdný', 'The playlist is empty'), T('Přidejte webovou stránku, obrázek, video nebo všechny dashboardy Grafany s jedním tagem.', 'Add a web page, a picture, a video or all Grafana dashboards with one tag.'),
     `<button class="btn primary" data-do="addWeb">${icon('plus')}${T('Přidat web', 'Add website')}</button><button class="btn" data-do="upload">${icon('upload')}${T('Nahrát médium', 'Upload media')}</button>`)}</li>`;
   markPlaying();
   bindDrag(list);
@@ -693,16 +731,19 @@ VIEWS.playlist = async (root, changed) => {
   S.profiles = await api('/api/profiles').catch(() => []);
   if (changed || !$('#plList')) {
     root.innerHTML = `<section class="card flush"><div class="toolbar"><h2 class="grow">Playlist <span class="badge" id="plCount"></span></h2>
-        <button class="btn" data-do="addGrafana">${icon('grafana')}<span>${T('Grafana podle tagu', 'Grafana by tag')}</span></button>
-        <button class="btn" data-do="addCamera">${icon('camera')}<span>${T('Kamera', 'Camera')}</span></button>
-        <button class="btn" data-do="upload">${icon('upload')}<span>${T('Nahrát médium', 'Upload media')}</span></button>
-        <button class="btn primary" data-do="addWeb">${icon('plus')}<span>${T('Přidat web', 'Add website')}</span></button></div>
+        <div class="menu"><button class="btn primary" data-do="menu" aria-haspopup="menu">${icon('plus')}<span>${T('Přidat', 'Add')}</span>${icon('chev')}</button>
+          <div class="menu-pop" role="menu" hidden>
+            <button class="mi" data-do="addWeb">${icon('web')}<span>${T('Webová stránka', 'Web page')}</span></button>
+            <button class="mi" data-do="addMulti">${icon('grid')}<span>${T('Více na jedné obrazovce', 'Several on one screen')}</span></button>
+            <button class="mi" data-do="addGrafana">${icon('grafana')}<span>${T('Grafana podle tagu', 'Grafana by tag')}</span></button>
+            <button class="mi" data-do="addCamera">${icon('camera')}<span>${T('Kamera', 'Camera')}</span></button>
+            <button class="mi" data-do="upload">${icon('upload')}<span>${T('Obrázek nebo video', 'Picture or video')}</span></button></div></div></div>
       <ol class="list" id="plList"></ol></section>
       <section class="card" id="darkCard" hidden><div class="setting"><span><b>${T('Weby v tmavém režimu', 'Websites in dark mode')}</b>
         <small>${T('Platí pro všechny weby a dashboardy Grafany, u položky jde nastavit jinak.', 'Applies to every website and Grafana dashboard; an item can have its own choice.')}</small></span>
         <select id="webDark" style="width:auto;min-width:220px">${DARK_MODES().map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
         <small class="muted" id="webDarkHint"></small></section>
-      <p class="muted" style="font-size:13px">${T('Pořadí změníte přetažením za úchyt vlevo. Tlačítkem s procenty upravíte velikost stránky, ikonou ▶ položku hned zobrazíte.', 'Drag the handle on the left to change the order. The button with the percentage changes the size of the page; ▶ shows the item right away.')}</p>`;
+      <p class="muted" style="font-size:13px">${T('Pořadí změníte přetažením za úchyt vlevo.', 'Drag the handle on the left to change the order.')}</p>`;
   }
   drawPlaylist();
   bindWebDark();
@@ -799,6 +840,7 @@ Object.assign(ACT, {
     if (!a) return;
     if (a.kind === 'grafana-tag') return grafanaDialog(a);
     if (a.kind === 'camera') return cameraDialog(a);
+    if (a.kind === 'multi') return multiDialog(a);
     const web = a.kind === 'web';
     modal({
       title: T('Upravit položku', 'Edit item'),
@@ -826,7 +868,7 @@ Object.assign(ACT, {
     render(true);
   },
   toggleDash(b) { const id = b.dataset.id; S.open.has(id) ? S.open.delete(id) : S.open.add(id); drawPlaylist(); },
-  toggleScale(b) { const id = b.dataset.id; S.openScale.has(id) ? S.openScale.delete(id) : S.openScale.add(id); drawPlaylist(); },
+  toggleScale(b) { const id = b.dataset.id; closeMenus(); S.openScale.has(id) ? S.openScale.delete(id) : S.openScale.add(id); drawPlaylist(); },
   scalePreset(b) { $(`[data-scale-range="${b.dataset.id}"]`).value = b.dataset.v; $(`[data-scale-num="${b.dataset.id}"]`).value = b.dataset.v; },
   async saveScale(b) {
     const v = Number($(`[data-scale-num="${b.dataset.id}"]`).value);
@@ -837,6 +879,190 @@ Object.assign(ACT, {
     toast(T(`Velikost ${pct(r.scale)} % uložena`, `Size ${pct(r.scale)} % saved`));
     drawPlaylist();
   },
+});
+
+// Several things on one screen: 2 to 4 websites or widgets side by side; each cell is a window of its own on the TV.
+const MULTI_LAYOUTS = () => [['2', 2, T('Dvě vedle sebe', 'Two side by side')], ['2v', 2, T('Dvě pod sebou', 'Two stacked')],
+  ['3', 3, T('Tři vedle sebe', 'Three side by side')], ['1+2', 3, T('Velká a dvě malé', 'One large, two small')], ['2x2', 4, T('Čtyři', 'Four')]];
+const LAYOUT_RECTS = { '2': [[0, 0, 12, 16], [12, 0, 12, 16]], '2v': [[0, 0, 24, 8], [0, 8, 24, 8]], '3': [[0, 0, 8, 16], [8, 0, 8, 16], [16, 0, 8, 16]],
+  '1+2': [[0, 0, 16, 16], [16, 0, 8, 8], [16, 8, 8, 8]], '2x2': [[0, 0, 12, 8], [12, 0, 12, 8], [0, 8, 12, 8], [12, 8, 12, 8]] };
+const layoutSvg = (l, mark = -1) => `<svg viewBox="-1 -1 26 18" class="layout-svg" aria-hidden="true">${(LAYOUT_RECTS[l] || []).map(([x, y, w, h], i) => `<rect x="${x + .6}" y="${y + .6}" width="${w - 1.2}" height="${h - 1.2}" rx="1.2" class="${i === mark ? 'on' : ''}"/>`).join('')}</svg>`;
+const layoutName = l => (MULTI_LAYOUTS().find(x => x[0] === l) || [, , l])[2];
+const WIDGET_PREFIX = 'caracal-widget:';
+const isWidget = src => String(src || '').startsWith(WIDGET_PREFIX);
+const WIDGETS = () => [['clock', T('Hodiny', 'Clock'), ''], ['weather', T('Počasí', 'Weather'), 'city'], ['rss', T('Zprávy z RSS', 'News from RSS'), 'url'], ['text', T('Text', 'Text'), 'text']];
+const widgetParams = src => new URLSearchParams(String(src || '').slice(WIDGET_PREFIX.length));
+const widgetName = src => (WIDGETS().find(w => w[0] === widgetParams(src).get('type')) || [, T('Widget', 'Widget')])[1];
+function multiCfg(a) {
+  let m = {};
+  try { m = JSON.parse(a.source || '{}'); } catch { /* broken */ }
+  return { layout: m.layout || '2x2', cells: Array.isArray(m.cells) ? m.cells : [] };
+}
+const scrollTag = a => {
+  const y = a.kind === 'multi' ? Math.max(0, ...multiCfg(a).cells.map(c => c.scroll_y || 0)) : a.scroll_y;
+  return y ? `<button class="tag" data-do="pickScroll" data-id="${a.id}" title="${T('Stránka začíná posunutá', 'The page starts scrolled down')}">${icon('start')}${a.kind === 'multi' ? T('posunuto', 'scrolled') : Math.round(y) + ' px'}</button>` : '';
+};
+
+function cellEditor(i, c = {}) {
+  const widget = isWidget(c.source), wp = widgetParams(c.source), wtype = wp.get('type') || 'clock';
+  return `<fieldset class="cell-edit" data-cell="${i}"><legend>${layoutSvg(S.multiLayout, i)}${T('Pole', 'Cell')} ${i + 1}</legend>
+    <div class="seg" role="radiogroup"><label><input type="radio" name="kind${i}" value="web" ${widget ? '' : 'checked'}><span>${icon('web')}${T('Web', 'Website')}</span></label><label><input type="radio" name="kind${i}" value="widget" ${widget ? 'checked' : ''}><span>${icon('widget')}${T('Widget', 'Widget')}</span></label></div>
+    <div data-show="web"><label>URL<input name="url${i}" type="url" placeholder="https://" value="${widget ? '' : esc(c.source || '')}"></label>
+      <div class="row3"><label>${T('Přihlášení', 'Login')}<select name="profile${i}">${S.profileOpts(c.auth_profile_id)}</select></label>
+        <label>${T('Velikost', 'Size')}<input name="scale${i}" inputmode="decimal" value="${String(Number(c.scale || 1)).replace('.', S.lang === 'cs' ? ',' : '.')}"></label>
+        <label>${T('Tmavý režim', 'Dark mode')}<select name="dark${i}"><option value="">${T('Podle zařízení', 'As the device')}</option>${DARK_MODES().map(([m, l]) => `<option value="${m}" ${c.dark === m ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div></div>
+    <div data-show="widget" class="row2"><label>${T('Widget', 'Widget')}<select name="wtype${i}">${WIDGETS().map(([v, l]) => `<option value="${v}" ${v === wtype ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label data-wparam>${T('Nastavení', 'Setting')}<input name="wparam${i}" value="${esc(wp.get('city') || wp.get('url') || wp.get('text') || '')}"></label></div></fieldset>`;
+}
+function readCells(form, n, old = []) {
+  return Array.from({ length: n }, (_, i) => {
+    const kind = form.querySelector(`[name="kind${i}"]:checked`).value, keep = old[i] || {};
+    if (kind === 'widget') {
+      const type = form[`wtype${i}`].value, param = (WIDGETS().find(w => w[0] === type) || [])[2], q = new URLSearchParams({ type });
+      if (param) q.set(param, form[`wparam${i}`].value.trim());
+      return { source: WIDGET_PREFIX + q.toString() };
+    }
+    return { source: form[`url${i}`].value.trim(), auth_profile_id: form[`profile${i}`].value || null, scale: parseScale(form[`scale${i}`].value),
+      dark: form[`dark${i}`].value || null, scroll_x: keep.scroll_x || 0, scroll_y: keep.source === form[`url${i}`].value.trim() ? keep.scroll_y || 0 : 0 };
+  });
+}
+async function multiDialog(a = null) {
+  const cfg = a ? multiCfg(a) : { layout: '2x2', cells: [] };
+  S.multiLayout = cfg.layout;
+  const profiles = await profileOptions();
+  S.profileOpts = sel => profiles.replace(`value="${sel}"`, `value="${sel}" selected`);
+  const count = l => (MULTI_LAYOUTS().find(x => x[0] === l) || [, 4])[1];
+  modal({
+    title: a ? T('Upravit obrazovku', 'Edit the screen') : T('Více na jedné obrazovce', 'Several on one screen'), wide: true,
+    submit: a ? T('Uložit', 'Save') : T('Přidat', 'Add'),
+    body: `<div class="form"><div class="row2"><label>${T('Název', 'Name')}<input name="name" required value="${esc(a ? a.name : '')}" placeholder="${T('např. Výroba – přehled', 'e.g. Production overview')}"></label>
+        <label>${T('Doba zobrazení (s)', 'Display time (s)')}<input name="duration" type="number" min="5" value="${a ? a.duration : 60}" required></label></div>
+      <div class="layout-pick" role="radiogroup" aria-label="${T('Rozvržení', 'Layout')}">${MULTI_LAYOUTS().map(([v, n, l]) => `<label class="layout-tile"><input type="radio" name="layout" value="${v}" ${v === cfg.layout ? 'checked' : ''}>${layoutSvg(v)}<span>${l}</span></label>`).join('')}</div>
+      <div id="cells"></div>
+      <p class="hint">${T('Každé pole je samostatné okno na televizi se stejným přihlášením jako ostatní weby. Na Raspberry Pi s 1 GB paměti dávejte přednost dvěma polím.', 'Every cell is a window of its own on the TV with the same logins as other websites. On a Raspberry Pi with 1 GB of memory prefer two cells.')}</p>
+      ${validityFields(a || {})}</div>`,
+    onOpen: form => {
+      const draw = () => {
+        const n = count(S.multiLayout), old = $('#cells', form).children.length ? readCellsSafe(form) : cfg.cells;
+        $('#cells', form).innerHTML = Array.from({ length: n }, (_, i) => cellEditor(i, old[i] || {})).join('');
+        syncCells(form);
+      };
+      const readCellsSafe = f => $$('.cell-edit', f).map((_, i) => { try { return readCells(f, i + 1, cfg.cells)[i]; } catch { return {}; } });
+      $$('[name="layout"]', form).forEach(r => { r.onchange = () => { S.multiLayout = r.value; draw(); }; });
+      form.addEventListener('change', e => { if (e.target.name && /^(kind|wtype)\d/.test(e.target.name)) syncCells(form); });
+      draw();
+    },
+    onSubmit: async (f, form) => {
+      const n = count(S.multiLayout);
+      const body = { name: f.get('name').trim(), duration: Number(f.get('duration')), layout: S.multiLayout, cells: readCells(form, n, cfg.cells), ...validityBody(f) };
+      if (a) await api('/api/assets/multi/' + a.id, { method: 'PUT', json: body });
+      else await api('/api/assets/multi', { json: body });
+      toast(a ? T('Obrazovka uložena', 'Screen saved') : T('Přidáno do playlistu', 'Added to the playlist'));
+      render(true);
+    },
+  });
+}
+function syncCells(form) {
+  $$('.cell-edit', form).forEach(fs => {
+    const i = fs.dataset.cell, kind = fs.querySelector(`[name="kind${i}"]:checked`).value;
+    $$('[data-show]', fs).forEach(x => { x.hidden = x.dataset.show !== kind; });
+    const w = WIDGETS().find(x => x[0] === fs.querySelector(`[name="wtype${i}"]`).value) || [];
+    const param = $('[data-wparam]', fs), input = fs.querySelector(`[name="wparam${i}"]`);
+    param.hidden = !w[2];
+    input.placeholder = { city: T('Praha', 'Prague'), url: 'https://…/rss', text: T('Vítejte', 'Welcome') }[w[2]] || '';
+    fs.querySelector(`[name="url${i}"]`).required = kind === 'web';
+  });
+}
+
+// Where a page starts: the item stays frozen on the TV, a picture of the screen shows it, the wheel or the buttons
+// scroll the real page (logins and all), and the position is saved.
+async function scrollPicker(a) {
+  const multi = a.kind === 'multi', cells = multi ? multiCfg(a).cells : [];
+  const target = a.kind === 'grafana-tag' ? (dashboardsOf(a.id)[0] || {}).id : a.id;
+  if (!target) return fail(new Error(T('Kolekce zatím nemá žádný dashboard.', 'The collection has no dashboard yet.')));
+  const st = { cell: 0, y: 0, max: 0, pending: 0, busy: false, alive: true, timer: null };
+  const d = modal({
+    title: T('Začátek stránky', 'Where the page starts'), wide: true, submit: T('Uložit tuto pozici', 'Save this position'),
+    body: `<div class="form"><p class="muted">${T('Položka je teď zamrazená na televizi. Posuňte ji kolečkem myši nad obrázkem nebo tlačítky a uložte místo, od kterého se má zobrazovat.', 'The item is frozen on the TV now. Scroll it with the mouse wheel over the picture or with the buttons, then save where it should start.')}</p>
+      ${multi ? `<div class="seg" role="radiogroup">${cells.map((c, i) => `<label><input type="radio" name="pcell" value="${i}" ${i ? '' : 'checked'} ${isWidget(c.source) ? 'disabled' : ''}><span>${layoutSvg(multiCfg(a).layout, i)}${T('Pole', 'Cell')} ${i + 1}</span></label>`).join('')}</div>` : ''}
+      <div class="shot picker" id="pickShot" tabindex="0" aria-label="${T('Obrazovka zařízení', 'Device screen')}"><span>${T('Zobrazuji položku na televizi…', 'Showing the item on the TV…')}</span></div>
+      <div class="picker-bar"><div class="action-group">
+        <button type="button" class="btn sm" data-dy="top" title="${T('Na začátek', 'To the top')}">${icon('top')}</button>
+        <button type="button" class="btn sm" data-dy="-page" title="${T('O obrazovku nahoru', 'One screen up')}">${icon('up')}${icon('up')}</button>
+        <button type="button" class="btn sm" data-dy="-80" title="${T('Kousek nahoru', 'A little up')}">${icon('up')}</button>
+        <button type="button" class="btn sm" data-dy="80" title="${T('Kousek dolů', 'A little down')}">${icon('down')}</button>
+        <button type="button" class="btn sm" data-dy="page" title="${T('O obrazovku dolů', 'One screen down')}">${icon('down')}${icon('down')}</button></div>
+        <span class="muted" id="pickPos" aria-live="polite"></span></div></div>`,
+    onOpen: form => {
+      const box = $('#pickShot', form), pos = $('#pickPos', form);
+      const show = () => { pos.textContent = st.max ? T(`Posun ${st.y} px z ${st.max} px`, `Scrolled ${st.y} px of ${st.max} px`) : T(`Posun ${st.y} px`, `Scrolled ${st.y} px`); };
+      const picture = async () => {
+        try {
+          const url = await window.caracalScreenshot();
+          if (!st.alive) return;
+          box.innerHTML = `<img src="${url}" alt="${T('Obrazovka zařízení', 'Device screen')}">`;
+        } catch (e) { box.innerHTML = `<span>${esc(e.message)}</span>`; }
+      };
+      const position = async () => {
+        const s = await api('/api/v2/player/status').catch(() => ({}));
+        if (s.scroll && Number(s.scroll.cell) === st.cell) { st.y = s.scroll.y; st.max = s.scroll.max; show(); }
+      };
+      // scroll steps queue up while the player and the picture catch up
+      const send = async (body) => {
+        if (st.busy) { st.next = body; return; }
+        st.busy = true;
+        try {
+          await api('/api/v6/player/control', { json: { cell: st.cell, ...body } });
+          await new Promise(r => setTimeout(r, 1300));
+          await position();
+          await picture();
+        } catch (e) { fail(e); }
+        st.busy = false;
+        if (st.next) { const n = st.next; st.next = null; send(n); }
+      };
+      const page = () => Math.round((multi ? 0.45 : 0.85) * 1080);
+      $$('[data-dy]', form).forEach(b => {
+        b.onclick = () => {
+          const v = b.dataset.dy;
+          if (v === 'top') return send({ action: 'scroll_to', y: 0 });
+          send({ action: 'scroll', dy: v === 'page' ? page() : v === '-page' ? -page() : Number(v) });
+        };
+      });
+      box.addEventListener('wheel', e => {
+        e.preventDefault();
+        st.pending += e.deltaY;
+        clearTimeout(st.timer);
+        st.timer = setTimeout(() => { const dy = Math.round(st.pending); st.pending = 0; if (dy) send({ action: 'scroll', dy }); }, 250);
+      }, { passive: false });
+      box.addEventListener('keydown', e => {
+        const k = { ArrowDown: 80, ArrowUp: -80, PageDown: page(), PageUp: -page() }[e.key];
+        if (k) { e.preventDefault(); send({ action: 'scroll', dy: k }); }
+        if (e.key === 'Home') { e.preventDefault(); send({ action: 'scroll_to', y: 0 }); }
+      });
+      $$('[name="pcell"]', form).forEach(r => { r.onchange = () => { st.cell = Number(r.value); send({ action: 'scroll', dy: 0 }); }; });
+      (async () => {
+        await api('/api/v6/player/control', { json: { action: 'freeze', item_id: target } });
+        // the player loads the item (sign-in, saved position) before the first picture
+        const until = Date.now() + 45000;
+        while (st.alive && Date.now() < until) {
+          const s = await api('/api/v2/player/status').catch(() => ({}));
+          if (String(s.current_id) === String(target)) break;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        await new Promise(r => setTimeout(r, 2500));
+        if (st.alive) send({ action: 'scroll', dy: 0 });
+      })();
+    },
+    onSubmit: async () => {
+      const r = await api(`/api/assets/${a.id}/scroll`, { method: 'PUT', json: { x: 0, y: st.y, cell: st.cell } });
+      toast(r.y ? T(`Stránka začne ${r.y} px od začátku`, `The page starts ${r.y} px down`) : T('Stránka začne od začátku', 'The page starts at the top'));
+    },
+  });
+  d.addEventListener('close', () => { st.alive = false; api('/api/v6/player/control', { json: { action: 'unfreeze' } }).catch(() => {}); render(true); }, { once: true });
+}
+Object.assign(ACT, {
+  addMulti() { multiDialog(); },
+  pickScroll(b) { const a = S.assets.find(x => String(x.id) === b.dataset.id); if (a) scrollPicker(a); },
 });
 
 // A camera: one or more streams (RTSP, HTTP) shown as a grid; ONVIF cameras can be found and asked for their streams.

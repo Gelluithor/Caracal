@@ -501,3 +501,43 @@ def test_reload_command(client, local, fleet):
     r = fleet.post('/api/fleet/v1/player/reload').json()
     assert r['ok'] and r['command_id'] == cid + 1
     assert fleet.post('/api/fleet/v1/control', json={'action': 'reload'}).status_code == 200
+
+
+def test_scroll_and_multi_view(client, local, fleet):
+    """Where a website starts, several things on one screen, and the live scrolling commands."""
+    web = client.post('/api/v9/assets/web', json={'name': 'Long', 'source': 'https://e.com/long', 'duration': 30}).json()['id']
+    assert client.put(f'/api/assets/{web}/scroll', json={'y': 1200}).json()['y'] == 1200
+    assert client.put(f'/api/assets/{web}/scroll', json={'y': -5}).status_code == 400
+    item = next(x for x in local.get('/api/player/playlist-expanded').json() if x['id'] == web)
+    assert item['scroll_y'] == 1200
+    # 2 to 4 cells, websites or the node's widgets
+    assert client.post('/api/assets/multi', json={'name': 'M', 'layout': '2', 'cells': [{'source': 'https://a.e.com'}]}).status_code == 400
+    assert client.post('/api/assets/multi', json={'name': 'M', 'layout': '9', 'cells': []}).status_code == 400
+    assert client.post('/api/assets/multi', json={'name': 'M', 'layout': '2', 'cells': [{'source': 'ftp://x'}, {'source': 'https://b.e.com'}]}).status_code == 400
+    mid = client.post('/api/assets/multi', json={'name': 'M', 'layout': '2', 'duration': 40, 'cells': [
+        {'source': 'https://a.e.com', 'dark': 'force', 'scale': 1.5}, {'source': 'caracal-widget:type=clock'}]}).json()['id']
+    multi = next(x for x in local.get('/api/player/playlist-expanded').json() if x['id'] == mid)
+    assert multi['kind'] == 'multi' and multi['layout'] == '2' and multi['duration'] == 40
+    assert multi['cells'][0]['dark'] == 'force' and multi['cells'][0]['scale'] == 1.5 and multi['cells'][1]['dark'] == 'off'
+    assert client.put(f'/api/assets/{mid}/scroll', json={'cell': 0, 'y': 300}).json()['y'] == 300
+    assert client.put(f'/api/assets/{mid}/scroll', json={'cell': 7, 'y': 300}).status_code == 400
+    assert json.loads(next(a for a in client.get('/api/assets').json() if a['id'] == mid)['source'])['cells'][0]['scroll_y'] == 300
+    # an edit keeps what it does not send
+    assert client.put(f'/api/assets/multi/{mid}', json={'name': 'M2'}).status_code == 200
+    stored = next(a for a in client.get('/api/assets').json() if a['id'] == mid)
+    assert stored['name'] == 'M2' and json.loads(stored['source'])['layout'] == '2'
+    # the same from CARACAL Fleet
+    fid = fleet.post('/api/fleet/v1/assets/multi', json={'name': 'F', 'layout': '2v', 'cells': [{'source': 'https://a.e.com'}, {'source': 'https://b.e.com'}]}).json()['id']
+    assert fleet.put(f'/api/fleet/v1/assets/{fid}/scroll', json={'cell': 1, 'y': 50}).json()['y'] == 50
+    assert fleet.put(f'/api/fleet/v1/assets/multi/{fid}', json={'layout': '2'}).status_code == 200
+    # scrolling live: the player gets dy / y and the cell, and reports where it is
+    client.post('/api/v6/player/control', json={'action': 'scroll', 'dy': 400, 'cell': 1})
+    cmd = local.get('/api/v6/player/command').json()
+    assert cmd['action'] == 'scroll' and cmd['extra']['dy'] == 400 and cmd['extra']['cell'] == 1
+    fleet.post('/api/fleet/v1/control', json={'action': 'scroll_to', 'y': 0})
+    assert local.get('/api/v6/player/command').json()['action'] == 'scroll_to'
+    local.post('/api/v2/player/heartbeat', json={'current_id': web, 'current_name': 'Long', 'scroll': {'item_id': web, 'cell': 0, 'x': 0, 'y': 900, 'max': 4000}})
+    assert client.get('/api/v2/player/status').json()['scroll']['y'] == 900
+    assert fleet.get('/api/fleet/v1/snapshot').json()['player']['scroll']['max'] == 4000
+    for a in (web, mid, fid):
+        client.delete(f'/api/assets/{a}')

@@ -471,3 +471,47 @@ details.onvif .form-actions, details.onvif .row2 { margin-top: 8px; }
 .cam-preview { display: block; max-width: 100%; border-radius: 10px; margin: 8px 0; background: #000; }
 .cam-preview-box:empty { display: none; }
 .validity summary { cursor: pointer; font-weight: 500; }
+
+/* Scroll bars: thin and quiet, in the colours of the theme; the track stays invisible until the pointer is over it */
+* { scrollbar-width: thin; scrollbar-color: rgb(118 118 128 / .45) transparent; }
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgb(118 118 128 / .38); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: rgb(118 118 128 / .6); }
+::-webkit-scrollbar-corner { background: transparent; }
+
+.icon-btn.bordered { box-shadow: 0 0 0 .5px var(--line-strong); color: var(--ink-2); }
+.btn > .ic:last-child:not(:first-child) { width: 14px; height: 14px; margin-left: -2px; opacity: .8; }
+
+/* a choice of a few options as one control (cells, kinds) */
+.seg:has(label) { gap: 2px; width: max-content; max-width: 100%; flex-wrap: wrap; }
+.seg label { display: block; cursor: pointer; }
+.seg label input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label span { display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px; border-radius: 6px; font-size: 13px; font-weight: 500; color: var(--muted); }
+.seg label input:checked + span { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / .12); }
+.seg label input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+.seg label input:disabled + span { opacity: .4; cursor: default; }
+[data-theme="dark"] .seg label input:checked + span { background: #48484a; }
+.seg .ic { width: 15px; height: 15px; }
+
+/* several on one screen: the layouts and the cells */
+.layout-svg { width: 34px; height: 24px; flex: none; }
+.layout-svg rect { fill: var(--fill); stroke: var(--line-strong); stroke-width: .6; }
+.layout-svg rect.on { fill: var(--accent); stroke: var(--accent); }
+.layout-pick { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.layout-tile { position: relative; display: grid; justify-items: center; gap: 6px; padding: 12px 8px 10px; border-radius: var(--r); background: var(--fill-2); cursor: pointer; text-align: center; font-size: 12.5px; font-weight: 500; color: var(--ink-2); }
+.layout-tile input { position: absolute; opacity: 0; pointer-events: none; }
+.layout-tile .layout-svg { width: 56px; height: 38px; }
+.layout-tile:has(input:checked) { background: var(--accent-soft); box-shadow: inset 0 0 0 1.5px var(--accent); color: var(--ink); }
+.layout-tile:has(input:checked) rect { stroke: var(--accent); }
+.layout-tile:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.cell-edit { display: grid; gap: 10px; margin: 0; padding: 12px 14px 14px; border: 0; border-radius: var(--r); background: var(--panel-2); }
+.cell-edit + .cell-edit { margin-top: 10px; }
+.cell-edit legend { display: flex; align-items: center; gap: 8px; float: left; width: 100%; padding: 0; font-weight: 600; }
+.cell-edit legend + * { clear: both; }
+
+/* where a page starts: the picture of the screen and the buttons under it */
+.shot.picker { max-width: none; cursor: ns-resize; outline-offset: 3px; }
+.shot.picker img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.picker-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.picker-bar .btn .ic + .ic { margin-left: -9px; }

@@ -62,6 +62,11 @@ on the system with the classic installation). Logins of websites are stored encr
 - **Websites behind a sign-in:** encrypted login profiles with automatic sign-in (log-in forms and HTTP
   Basic/Digest, the browser's pop-up), and automatic acceptance of common cookie banners
 - **Dark mode** for the whole device or per item: the sites' own dark look, or forced dark for every page
+- **Several on one screen:** 2 to 4 websites or widgets side by side (two, three, four, or one large and two small),
+  each in a window of its own with the same logins as any other website
+- **Where a page starts:** a website or a Grafana dashboard can start scrolled down. Set it on a live picture of the
+  screen: the item stays on the TV, the wheel or the buttons scroll the real page, *Save this position*. Pages that
+  scroll an inner panel (Grafana, web apps) work too, and the TV never shows a scroll bar
 
 ### Control it live
 

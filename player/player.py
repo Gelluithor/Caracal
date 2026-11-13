@@ -38,7 +38,9 @@ def chromium_args(w,h,rect=None):
  place=[f'--window-position={rect[0]},{rect[1]}',f'--window-size={rect[2]},{rect[3]}'] if rect else ['--kiosk','--start-fullscreen','--start-maximized','--window-position=0,0',f'--window-size={w},{h}']
  args=place+['--force-device-scale-factor=1','--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check','--noerrdialogs','--disable-infobars','--disable-session-crashed-bubble','--autoplay-policy=no-user-gesture-required','--password-store=basic','--use-mock-keychain','--disable-dev-shm-usage','--no-sandbox',
   # nothing a signage screen needs: background downloads, updates of components, sync, extensions, translation
-  '--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','--disable-default-apps','--disable-breakpad',f'--disk-cache-size={32 if LOW_MEMORY else 64}000000']
+  '--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','--disable-default-apps','--disable-breakpad',f'--disk-cache-size={32 if LOW_MEMORY else 64}000000',
+  # a page longer than the screen still scrolls (where it starts, see SCROLL_JS), only its scroll bar is not drawn
+  '--hide-scrollbars']
  features=['Translate','TranslateUI','MediaRouter','OptimizationHints','AutofillServerCommunication','CalculateNativeWinOcclusion']
  if LOW_MEMORY:
   args+=['--enable-low-end-device-mode','--renderer-process-limit=2','--process-per-site']
@@ -73,6 +75,7 @@ def fullscreen(check_only=False):
  env=dict(os.environ,DISPLAY=':0',XAUTHORITY='/home/caracal/.Xauthority')
  try:
   for wid in subprocess.check_output(['xdotool','search','--onlyvisible','--class','chromium'],text=True,env=env,stderr=subprocess.DEVNULL).split():
+   if wid in cells['wids']:continue   # the cells of a multi view keep their places
    subprocess.run(['wmctrl','-i','-r',wid,'-b','remove,above,hidden'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);subprocess.run(['wmctrl','-i','-r',wid,'-b','add,fullscreen'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  except Exception:pass
 
@@ -109,7 +112,8 @@ def place_main(check_only=False):
    if (b.get('left'),b.get('top'),b.get('width'),b.get('height'))!=MAIN:CDP.send('Browser.setWindowBounds',{'windowId':wid,'bounds':dict(zip(('left','top','width','height'),MAIN))})
    elif check_only:return
   except Exception as e:print('layout',e,flush=True)
- for wid in windows('^chromium$|^Chromium$'):undecorate(wid,MAIN)
+ for wid in windows('^chromium$|^Chromium$'):
+  if wid not in cells['wids']:undecorate(wid,MAIN)
 def start_zones(lay,w,h):
  global MAIN
  stop_zones()
@@ -162,8 +166,8 @@ def _cookie_click_shadow(frame):
  try:
   return bool(frame.evaluate(r"""({exact,positive,negative})=>{const norm=s=>(s||'').toLowerCase().replace(/\s+/g,' ').trim();const scan=root=>{for(const el of root.querySelectorAll('*')){if(el.shadowRoot){const x=scan(el.shadowRoot);if(x)return x}const role=el.getAttribute&&el.getAttribute('role');const tag=(el.tagName||'').toLowerCase();if(!(tag==='button'||tag==='a'||tag==='input'||role==='button'))continue;const t=norm(el.innerText||el.value||el.getAttribute('aria-label')||el.title);if(!t||negative.some(x=>t.includes(x)))continue;if(exact.includes(t)||positive.some(x=>t.includes(x))){const r=el.getBoundingClientRect();if(r.width>0&&r.height>0){el.click();return true}}}return false};return scan(document)}""",{'exact':list(COOKIE_ACCEPT_EXACT),'positive':list(COOKIE_POSITIVE),'negative':list(COOKIE_NEGATIVE)}))
  except Exception:return False
-def auto_accept_all_cookies(page):
- deadline=time.time()+8.0
+def auto_accept_all_cookies(page,wait=8.0):
+ deadline=time.time()+wait
  while time.time()<deadline:
   for frame in list(page.frames):
    for selector in COOKIE_SELECTORS:
@@ -221,17 +225,36 @@ def show_http_auth(page,a,pr):
 # Dark mode of websites (item 'dark' from the playlist): 'dark' asks the page for its own dark look
 # (prefers-color-scheme), 'force' also darkens pages without one (Chromium's automatic dark mode). Applied only when
 # it changes; a new browser starts without it.
-dark_applied=None
-def apply_dark(page,mode):
- global dark_applied
+dark_applied={}   # page -> the mode it has now
+def apply_dark(page,mode,cdp=None):
+ cdp=cdp if cdp is not None else CDP
  mode=mode if mode in ('dark','force') else 'off'
- if mode==dark_applied:return
+ if mode==dark_applied.get(page):return
  try:page.emulate_media(color_scheme='dark' if mode!='off' else 'light')
  except Exception as e:print('dark mode',e,flush=True)
  try:
-  if CDP is not None:CDP.send('Emulation.setAutoDarkModeOverride',{'enabled':True} if mode=='force' else {})
+  if cdp is not None:cdp.send('Emulation.setAutoDarkModeOverride',{'enabled':True} if mode=='force' else {})
  except Exception as e:print('automatic dark mode',e,flush=True)
- dark_applied=mode
+ dark_applied[page]=mode
+
+# Where a website starts. The element that scrolls is the one under the middle of the screen (Grafana and many web
+# apps scroll an inner container, not the page), otherwise the page itself. Returns [x, y, the most y can be].
+SCROLL_JS=r"""a=>{const can=e=>{if(!e||e===document.body||e===document.documentElement)return false;const s=getComputedStyle(e);return /(auto|scroll|overlay)/.test(s.overflowY+s.overflowX)&&(e.scrollHeight>e.clientHeight+2||e.scrollWidth>e.clientWidth+2)};
+let el=document.elementFromPoint(innerWidth/2,innerHeight/2);while(el&&!can(el))el=el.parentElement;const t=el||document.scrollingElement||document.documentElement;
+if(a.to){t.scrollTop=a.y;t.scrollLeft=a.x}else{t.scrollTop+=a.dy}
+return [Math.round(t.scrollLeft),Math.round(t.scrollTop),Math.max(0,t.scrollHeight-t.clientHeight)]}"""
+def scroll(page,dy=0,y=None,x=0):
+ try:return page.evaluate(SCROLL_JS,{'to':y is not None,'y':y or 0,'x':x or 0,'dy':dy})
+ except Exception as e:print('scroll',e,flush=True);return None
+def apply_scroll(page,a):
+ # pages that load their content later (dashboards, lists) are not long enough at once: tried again for a while
+ x,y=int(a.get('scroll_x') or 0),int(a.get('scroll_y') or 0)
+ if not x and not y:return
+ for wait in (0,1500,2500,4000):
+  if wait:page.wait_for_timeout(wait)
+  got=scroll(page,y=y,x=x)
+  if got and got[1]>=y-2:return
+ print('Scroll: the page is shorter than the saved position',got,flush=True)
 # Cameras: the streams of a camera item play in mpv windows over the browser, as a grid (Chromium cannot play RTSP).
 # They stay for the item's display time; a stream that drops is started again.
 CAMERA_TAG='caracal-camera'
@@ -274,8 +297,76 @@ def watch_cameras():
   if p.poll() is not None:
    print('camera stream ended, starting it again',flush=True)
    cameras['procs'][i]=subprocess.Popen(cameras['specs'][i],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+# Several things on one screen: every cell is an app window of the same browser (a second Chromium started with the
+# same profile only asks the running one to open it), so the cells share its logins. The window manager keeps
+# Chromium windows full screen: a cell leaves full screen over DevTools first, then gets its place.
+WIDGET_PREFIX='caracal-widget:'
+cells={'pages':[],'cdps':[],'wids':[],'rects':[],'item':None}
+def multi_rects(layout,area):
+ x,y,w,h=area;hw,hh,tw=w//2,h//2,w//3;bw=w*2//3
+ return {'2':[(x,y,hw,h),(x+hw,y,w-hw,h)],'2v':[(x,y,w,hh),(x,y+hh,w,h-hh)],
+         '3':[(x,y,tw,h),(x+tw,y,tw,h),(x+2*tw,y,w-2*tw,h)],
+         '1+2':[(x,y,bw,h),(x+bw,y,w-bw,hh),(x+bw,y+hh,w-bw,h-hh)],
+         '2x2':[(x,y,hw,hh),(x+hw,y,w-hw,hh),(x,y+hh,hw,h-hh),(x+hw,y+hh,w-hw,h-hh)]}.get(layout,[])
+def place_cell(i):
+ rect=cells['rects'][i]
+ try:
+  cdp=cells['cdps'][i];wid=cdp.send('Browser.getWindowForTarget')['windowId']
+  if cdp.send('Browser.getWindowBounds',{'windowId':wid})['bounds'].get('windowState')!='normal':cdp.send('Browser.setWindowBounds',{'windowId':wid,'bounds':{'windowState':'normal'}})
+  cdp.send('Browser.setWindowBounds',{'windowId':wid,'bounds':dict(zip(('left','top','width','height'),rect))})
+ except Exception as e:print('cell',i,e,flush=True)
+ if cells['wids'][i]:
+  undecorate(cells['wids'][i],rect)
+  subprocess.run(['wmctrl','-i','-r',cells['wids'][i],'-b','add,above'],env=XENV(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def open_cells(ctx,n):
+ while len(cells['pages'])<n:
+  i=len(cells['pages'])
+  with ctx.expect_page(timeout=15000) as info:
+   subprocess.Popen(['/usr/bin/chromium','--user-data-dir='+PROFILE,'--no-sandbox',f'--app=data:text/html,<title>caracal-cell-{i}</title>'],env=XENV(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  p=info.value;cells['pages'].append(p);cells['cdps'].append(p.context.new_cdp_session(p));cells['wids'].append('')
+ while len(cells['pages'])>n:close_cell(len(cells['pages'])-1)
+ # the X window of each cell, found by its title before a website replaces it
+ for i,p in enumerate(cells['pages']):
+  if cells['wids'][i]:continue
+  try:p.goto(f'data:text/html,<title>caracal-cell-{i}</title><body style="background:#000">')
+  except Exception:pass
+  for _ in range(30):
+   found=windows_named(f'caracal-cell-{i}( |$)')
+   if found:cells['wids'][i]=found[0];break
+   time.sleep(.1)
+def windows_named(pattern):
+ try:return subprocess.check_output(['xdotool','search','--onlyvisible','--name',pattern],text=True,env=XENV(),stderr=subprocess.DEVNULL).split()
+ except Exception:return []
+def close_cell(i):
+ p=cells['pages'].pop(i);cells['cdps'].pop(i);cells['wids'].pop(i);dark_applied.pop(p,None)
+ try:p.close()
+ except Exception:pass
+def close_cells():
+ while cells['pages']:close_cell(len(cells['pages'])-1)
+ cells.update(rects=[],item=None)
+def watch_cells():
+ # a cell that the window manager or Chromium moved goes back to its place
+ for i,cdp in enumerate(cells['cdps']):
+  try:
+   b=cdp.send('Browser.getWindowBounds',{'windowId':cdp.send('Browser.getWindowForTarget')['windowId']})['bounds']
+   if (b.get('left'),b.get('top'),b.get('width'),b.get('height'))!=cells['rects'][i] or b.get('windowState')!='normal':place_cell(i)
+  except Exception as e:print('cell watch',e,flush=True)
+def show_multi(page,a):
+ rects=multi_rects(a.get('layout'),MAIN or (0,0)+display_size());specs=(a.get('cells') or [])[:len(rects)]
+ page.set_content('<body style="margin:0;background:#000"></body>')
+ open_cells(page.context,len(specs));cells.update(rects=rects[:len(specs)],item=a.get('id'))
+ for i in range(len(specs)):place_cell(i)
+ time.sleep(.5)
+ for i in range(len(specs)):place_cell(i)   # the window manager settles after the first move
+ for i,cell in enumerate(specs):
+  try:show_web(cells['pages'][i],{**cell,'name':f"{a.get('name')} · {i+1}"},cells['cdps'][i],cookie_wait=3.0)
+  except Exception as e:print('cell',i,'did not load:',e,flush=True);offline(cells['pages'][i],{'name':a.get('name')},e)
+ watch_cells()
+def scroll_target(page,cell):
+ return cells['pages'][cell] if cells['pages'] and cell<len(cells['pages']) else page
 def show(page,a):
  if cameras['procs']:stop_cameras()
+ if a['kind']!='multi' and cells['pages']:close_cells()
  apply_dark(page,a.get('dark') if a['kind']=='web' else 'off')
  if a['kind']=='takeover':   # an emergency message from CARACAL Fleet
   page.goto(BASE+'/takeover',wait_until='domcontentloaded',timeout=45000)
@@ -288,34 +379,43 @@ def show(page,a):
   error=start_cameras(a)
   page.set_content('<body style="margin:0;background:#000;color:#94a3b8;display:grid;place-items:center;height:100vh;font:26px DejaVu Sans,sans-serif">'+(error or '')+'</body>')
   return
- if a['kind']=='web':
-  pid=a.get('auth_profile_id');pr=get('/api/player/profile/'+str(pid)) if pid else None
-  if pr and pr.get('auth_type')=='http':show_http_auth(page,a,pr)
-  elif pr:
-   page.goto(pr['login_url'],wait_until='domcontentloaded',timeout=45000);pw=page.locator(pr['pass_selector'])
-   if pw.count():
-    # a wrong selector must not stop the player: the target page is shown anyway and the error is logged
-    try:
-     page.locator(pr['user_selector']).first.fill(pr['username'],timeout=10000);pw.first.fill(pr['password'],timeout=10000)
-     try:pw.first.press('Enter',timeout=5000)
-     except Exception:page.locator(pr['submit_selector']).first.click(force=True,timeout=5000)
-     try:page.wait_for_load_state('domcontentloaded',timeout=15000)
-     except Exception:pass
-     page.wait_for_timeout(1500)
-    except Exception as e:print('Login',pr.get('name'),'failed:',e,flush=True)
-   try:page.goto(pr['target_url'],wait_until='domcontentloaded',timeout=45000)
-   except Exception as e:offline(page,a,e);return
-  else:
-   try:page.goto(a['source'],wait_until='domcontentloaded',timeout=45000)
-   except Exception as e:offline(page,a,e);return
-  z=float(a.get('scale') or 1);page.evaluate("z=>{document.documentElement.style.zoom=String(z);document.body.style.zoom=String(z)}",z)
-  auto_accept_all_cookies(page)
+ if a['kind']=='multi':return show_multi(page,a)
+ if a['kind']=='web':show_web(page,a)
  elif a['kind']=='image':page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><img src="{BASE+a["source"]}" style="width:100vw;height:100vh;object-fit:contain"></body>')
  else:page.set_content(f'<body style="margin:0;background:#000;overflow:hidden"><video src="{BASE+a["source"]}" autoplay muted loop style="width:100vw;height:100vh;object-fit:contain"></video></body>')
+def show_web(page,a,cdp=None,cookie_wait=8.0):
+ # a website (or a widget of this node) with its login, size, dark mode and where it starts
+ apply_dark(page,a.get('dark'),cdp)
+ if str(a.get('source','')).startswith(WIDGET_PREFIX):
+  try:page.goto(BASE+'/widgets?'+a['source'][len(WIDGET_PREFIX):],wait_until='domcontentloaded',timeout=45000)
+  except Exception as e:offline(page,a,e)
+  return
+ pid=a.get('auth_profile_id');pr=get('/api/player/profile/'+str(pid)) if pid else None
+ if pr and pr.get('auth_type')=='http':show_http_auth(page,a,pr)
+ elif pr:
+  page.goto(pr['login_url'],wait_until='domcontentloaded',timeout=45000);pw=page.locator(pr['pass_selector'])
+  if pw.count():
+   # a wrong selector must not stop the player: the target page is shown anyway and the error is logged
+   try:
+    page.locator(pr['user_selector']).first.fill(pr['username'],timeout=10000);pw.first.fill(pr['password'],timeout=10000)
+    try:pw.first.press('Enter',timeout=5000)
+    except Exception:page.locator(pr['submit_selector']).first.click(force=True,timeout=5000)
+    try:page.wait_for_load_state('domcontentloaded',timeout=15000)
+    except Exception:pass
+    page.wait_for_timeout(1500)
+   except Exception as e:print('Login',pr.get('name'),'failed:',e,flush=True)
+  try:page.goto(pr['target_url'],wait_until='domcontentloaded',timeout=45000)
+  except Exception as e:offline(page,a,e);return
+ else:
+  try:page.goto(a['source'],wait_until='domcontentloaded',timeout=45000)
+  except Exception as e:offline(page,a,e);return
+ z=float(a.get('scale') or 1);page.evaluate("z=>{document.documentElement.style.zoom=String(z);document.body.style.zoom=String(z)}",z)
+ auto_accept_all_cookies(page,cookie_wait)
+ apply_scroll(page,a)
 resume_index=0   # where the playlist continues after the browser was restarted
 def run():
- global CDP,resume_index,dark_applied
- CDP=None;dark_applied=None;w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
+ global CDP,resume_index
+ CDP=None;dark_applied.clear();cells.update(pages=[],cdps=[],wids=[],rects=[],item=None);w,h=display_size();os.makedirs(PROFILE,exist_ok=True)
  stop_cameras();subprocess.run(['pkill','-f','--title='+CAMERA_TAG],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)   # left over by a restart
  subprocess.run(['pkill','-f','--class=caracal-zone-'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  with sync_playwright() as pw:
@@ -323,7 +423,7 @@ def run():
   start_zones(layout,w,h)
   ctx=pw.chromium.launch_persistent_context(PROFILE,headless=False,executable_path='/usr/bin/chromium',ignore_default_args=['--enable-automation'],no_viewport=True,ignore_https_errors=True,args=chromium_args(w,h,MAIN))
   if LOW_MEMORY:print(f'Small memory ({TOTAL_MB} MB): Chromium runs in its low-end mode',flush=True)
-  page=ctx.pages[0] if ctx.pages else ctx.new_page();CDP=ctx.new_cdp_session(page);time.sleep(2);fullscreen();idx=resume_index;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None;items=[];items_at=0
+  page=ctx.pages[0] if ctx.pages else ctx.new_page();CDP=ctx.new_cdp_session(page);time.sleep(2);fullscreen();idx=resume_index;cur=None;mode='normal';collection_id=None;collection_index=0;remaining=0;duration=0;last_cmd=-1;last_fs=0;restart_id=None;items=[];items_at=0;adjust_until=0;scroll_cell=0
   while True:
    # the playlist changes rarely: every 5 s (and right after a command); commands are checked every second
    if time.time()-items_at>=5:
@@ -345,6 +445,10 @@ def run():
      collection_id=int(requested_collection);group=[x for x in items if x.get('parent_id')==collection_id]
      if group:collection_index=0;cur=group[0];show(page,cur);duration=max(5,int(cur.get('duration') or 30));remaining=duration;mode='collection-freeze' if action=='freeze_collection' else 'collection-temporary';fullscreen()
     elif action=='unfreeze':mode='normal';collection_id=None;cur=None;remaining=0
+    elif action in ('scroll','scroll_to'):
+     # set from the admin UI: the page moves while a picture of the screen shows where; its position is reported
+     ex=cmd.get('extra') or {};scroll_cell=int(ex.get('cell') or 0);adjust_until=time.time()+300
+     scroll(scroll_target(page,scroll_cell),dy=int(ex.get('dy') or 0)) if action=='scroll' else scroll(scroll_target(page,scroll_cell),y=int(ex.get('y') or 0),x=int(ex.get('x') or 0))
     elif action=='reload':
      # the same item again (a page that got stuck, new data); its time on the screen goes on
      if cur:print('Reloading',cur.get('name'),flush=True);show(page,cur);fullscreen()
@@ -364,9 +468,14 @@ def run():
     post('/api/v2/player/heartbeat',{'current_id':None,'current_name':'','frozen':False,'collection_frozen':False,'remaining':None,'duration':None});time.sleep(1);continue
    if cur is None:cur=items[idx%len(items)];show(page,cur);duration=max(5,int(cur.get('duration') or 30));remaining=duration;fullscreen()
    frozen=mode=='single-freeze';collection_frozen=mode in ('collection-freeze','collection-temporary')
-   post('/api/v2/player/heartbeat',{'current_id':cur['id'],'current_name':cur['name'],'frozen':frozen,'collection_frozen':collection_frozen,'collection_id':collection_id,'remaining':None if frozen else remaining,'duration':duration})
+   beat={'current_id':cur['id'],'current_name':cur['name'],'frozen':frozen,'collection_frozen':collection_frozen,'collection_id':collection_id,'remaining':None if frozen else remaining,'duration':duration}
+   if time.time()<adjust_until:   # only while the position is being set: one small script a second
+    got=scroll(scroll_target(page,scroll_cell),dy=0)
+    if got:beat['scroll']={'item_id':cur['id'],'cell':scroll_cell,'x':got[0],'y':got[1],'max':got[2]}
+   post('/api/v2/player/heartbeat',beat)
    if time.time()-last_fs>4:
     if zones['procs']:watch_zones()
+    if cells['pages']:watch_cells()
     if cameras['procs']:watch_cameras()
     else:fullscreen(True)
     last_fs=time.time()
